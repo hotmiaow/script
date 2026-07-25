@@ -1,0 +1,12 @@
+Project Notes - QSearch Engine Architecture
+
+1. Background Indexer:
+   Continuously scans the ./content directory for .csv, .txt, and .log files.
+   Uses SQLite FTS5 with trigram tokenization for instant substring searches.
+
+2. Fuzzy Search Fallback:
+   Integrates difflib SequenceMatcher for typo tolerance (e.g. Frcnk -> Frank).
+
+3. Text File Scrolling & Highlighting:
+   Allows users to preview full text files in a scrollable view.
+   Clicking a search result auto-scrolls directly to the matched line number.

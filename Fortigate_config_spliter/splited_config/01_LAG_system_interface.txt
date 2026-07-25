@@ -1,0 +1,5 @@
+config system interface
+    edit "lag1"
+        set type aggregate
+    next
+end

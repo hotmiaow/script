@@ -1,0 +1,106 @@
+#!/usr/bin/env python3
+import sys
+import os
+import re
+import argparse
+
+EXCLUDE_PATTERNS = {
+    "cert": [
+        r"^config vpn certificate",
+        r"^config firewall ssl local-key",
+    ],
+    "iface": [
+        r"^config system interface",
+        r"^config system virtual-switch",
+        r"^config system physical-switch",
+        r"^config system sdwan",
+    ],
+    "storage": [
+        r"^config system storage",
+        r"^config log disk",
+    ],
+    "ha": [
+        r"^config system ha",
+    ],
+}
+
+def sanitize_filename(name: str) -> str:
+    name = name.strip().replace(" ", "_")
+    name = re.sub(r"[^a-zA-Z0-9_.-]", "", name)
+    return name.lower()
+
+def should_exclude(block_name: str, args) -> bool:
+    for key, patterns in EXCLUDE_PATTERNS.items():
+        if getattr(args, f"no_{key}"):
+            for p in patterns:
+                if re.match(p, block_name):
+                    return True
+    return False
+
+def split_fortigate_config(input_file: str, args):
+    output_dir = "splited"
+    os.makedirs(output_dir, exist_ok=True)
+
+    with open(input_file, "r", encoding="utf-8", errors="ignore") as f:
+        lines = f.readlines()
+
+    blocks = []
+    current_block = []
+    current_name = None
+    inside_block = False
+
+    for line in lines:
+        stripped = line.strip()
+
+        if stripped.startswith("config "):
+            inside_block = True
+            current_block = [line]
+            current_name = stripped
+            continue
+
+        if inside_block:
+            current_block.append(line)
+
+            if stripped == "end":
+                blocks.append((current_name, current_block))
+                inside_block = False
+                current_block = []
+                current_name = None
+
+    index = 1
+    skipped = 0
+
+    for name, content in blocks:
+        if should_exclude(name, args):
+            skipped += 1
+            continue
+
+        fname = sanitize_filename(name)
+        outfile = f"{index:02d}_{fname}.txt"
+        outpath = os.path.join(output_dir, outfile)
+
+        with open(outpath, "w", encoding="utf-8") as f:
+            f.writelines(content)
+
+        index += 1
+
+    print(f"Split completed.")
+    print(f"  Written : {index - 1} files")
+    print(f"  Skipped : {skipped} blocks")
+    print(f"  Output  : ./{output_dir}/")
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Split FortiGate config into executable blocks"
+    )
+    parser.add_argument("config", help="FortiGate config text file")
+    parser.add_argument("--no-cert", action="store_true", help="Exclude certificates and SSL keys")
+    parser.add_argument("--no-iface", action="store_true", help="Exclude interfaces / SD-WAN / switches")
+    parser.add_argument("--no-storage", action="store_true", help="Exclude system storage and disk log")
+    parser.add_argument("--no-ha", action="store_true", help="Exclude HA configuration")
+
+    args = parser.parse_args()
+    split_fortigate_config(args.config, args)
+
+if __name__ == "__main__":
+    main()

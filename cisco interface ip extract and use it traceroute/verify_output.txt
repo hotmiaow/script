@@ -1,0 +1,37 @@
+Testing content with mixed flat zone config and standard interface block:
+--------------------
+DEBUG_TIMING: Start parsing Fortigate interfaces for file 'test.conf' (len: 485)
+DEBUG_TIMING: Extracting zones...
+DEBUG_TIMING: extract_fortigate_zones -> extract_vdom_zones
+    Debug: No 'config vdom' sections found
+DEBUG_TIMING: extract_fortigate_zones -> extract_global_zones_flexible
+DEBUG_TIMING: Progress: [test.conf] Processed: 0 / Total: 16 (0.0%)
+DEBUG_TIMING: extract_fortigate_zones -> extract_all_zone_configs
+DEBUG_TIMING: extract_all_zone_configs state machine search starting (len: 485)...
+DEBUG_TIMING: extract_all_zone_configs search complete. Found 0 new associations.
+    Debug: Total interface-to-zone mappings: 0
+DEBUG_TIMING: Zones extracted (total: 0)
+    Debug: Interface section length: 190 characters
+    Debug: Found 2 interface blocks
+      Debug: Processing interface 'LAG1.333'
+        Debug: Looking for zone mapping for interface 'LAG1.333' in VDOM 'root'
+        Debug: Available zone mappings: []
+        Debug: Key 'root::LAG1.333' not found in zones
+        Debug: Key 'root::LAG1.333' not found in zones
+        Debug: Key 'unknown::LAG1.333' not found in zones
+        Found IP: 10.1.1.1/24 on LAG1.333 (Zone: No Zone, VDOM: root)
+      Debug: Processing interface 'LAG1.334'
+        Debug: Looking for zone mapping for interface 'LAG1.334' in VDOM 'root'
+        Debug: Available zone mappings: []
+        Debug: Key 'root::LAG1.334' not found in zones
+        Debug: Key 'root::LAG1.334' not found in zones
+        Debug: Key 'unknown::LAG1.334' not found in zones
+        Found IP: 10.2.2.1/24 on LAG1.334 (Zone: No Zone, VDOM: root)
+
+Extracted Interfaces:
+Interface: LAG1.333, Zone: No Zone, IP: 10.1.1.1/24
+Interface: LAG1.334, Zone: No Zone, IP: 10.2.2.1/24
+
+FAILURE: Zones NOT extracted correctly.
+Expected: LAG1.333: outside_zone, LAG1.334: inside_zone
+Got:      LAG1.333: No Zone, LAG1.334: No Zone

@@ -1,0 +1,297 @@
+import csv
+import subprocess
+import tempfile
+import os
+import shutil
+import datetime
+import re
+import pacparser  # Requires: pip install pacparser
+
+PAC_LIST = "all_pac.csv"
+# Expected CSV columns: pac_name,pac_path
+TEST_LIST = "pac_test.csv"
+# Expected CSV columns: pac_name,pac_path,test_url
+BACKUP_DIR = "backup"
+MAX_BACKUPS = 10
+TIMEOUT = 10
+
+def run(cmd):
+    return subprocess.run(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+    )
+
+def extract_domains_from_pac(pac_file):
+    domains = set()
+    try:
+        with open(pac_file, "r", errors="ignore") as f:
+            content = f.read()
+            
+        # Match quoted domains like "apple.com" or 'www.apple.com'
+        pattern = re.compile(r"""['"]([a-zA-Z0-9-]+\.[a-zA-Z0-9.-]+)['"]""")
+        
+        for match in pattern.findall(content):
+            domain = match.lower()
+            if domain.startswith(".") or domain.startswith("*") or "*." in domain:
+                continue
+            if domain.count(".") >= 1:
+                domains.add(domain)
+    except Exception as e:
+        print(f"Error reading PAC file {pac_file}: {e}")
+        
+    return sorted(domains)
+
+def generate_suggested_test_csv():
+    pac_cache = {}
+    suggested_file = "suggested_pac_test.csv"
+    active_test_file = "pac_test.csv"
+    rows = []
+
+    if not os.path.exists(PAC_LIST):
+        print(f"Error: {PAC_LIST} not found.")
+        return
+
+    with open(PAC_LIST) as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            pac_name = row["pac_name"]
+            pac_url = row["pac_path"]
+
+            if pac_url not in pac_cache:
+                tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pac")
+                tmp.close() # Close file handle so curl can write to it
+                print(f"Downloading {pac_name}...")
+                r = run(["curl", "-fsSL", pac_url, "-o", tmp.name])
+                pac_cache[pac_url] = tmp.name if r.returncode == 0 else None
+
+            pac_file = pac_cache[pac_url]
+            if not pac_file:
+                print(f"Failed to download {pac_name}, skipping")
+                continue
+
+            domains = extract_domains_from_pac(pac_file)
+            for d in domains:
+                rows.append([pac_name, pac_url, f"https://{d}"])
+
+    # Cleanup cache
+    for f in pac_cache.values():
+        if f and os.path.exists(f):
+            os.unlink(f)
+
+    if not rows:
+        print("No explicit domains found in PAC files.\n")
+        return
+
+    # Write suggested file
+    with open(suggested_file, "w", newline="") as out:
+        writer = csv.writer(out)
+        writer.writerow(["pac_name", "pac_path", "test_url"])
+        writer.writerows(rows)
+
+    # Copy to active test file
+    shutil.copyfile(suggested_file, active_test_file)
+    print(f"\nSuggested test cases generated successfully.")
+    print(f"- Suggested file : {suggested_file}")
+    print(f"- Active test file updated : {active_test_file}")
+
+# ---------- BACKUP ----------
+def backup_pac_files():
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    if not os.path.exists(PAC_LIST):
+        print(f"Error: {PAC_LIST} not found.")
+        return
+
+    with open(PAC_LIST) as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            pac_name = row["pac_name"]
+            pac_url = row["pac_path"]
+
+            name_dir = os.path.join(BACKUP_DIR, pac_name)
+            os.makedirs(name_dir, exist_ok=True)
+
+            filename = f"{pac_name}_{timestamp}.pac"
+            filepath = os.path.join(name_dir, filename)
+
+            print(f"Backing up {pac_name} ...")
+            r = run(["curl", "-fsSL", pac_url, "-o", filepath])
+            if r.returncode != 0:
+                print(f"  FAILED to download {pac_url}")
+                continue
+
+            # Rotation logic
+            backups = sorted(os.listdir(name_dir))
+            while len(backups) > MAX_BACKUPS:
+                os.remove(os.path.join(name_dir, backups.pop(0)))
+
+    print("Backup completed.\n")
+
+# ---------- TEST ----------
+def evaluate_pac(pac_file, url):
+    """
+    Uses pacparser to evaluate the PAC file logic against the URL.
+    Returns the proxy string (e.g., "PROXY 10.0.0.1:8080" or "DIRECT").
+    """
+    try:
+        pacparser.init()
+        pacparser.parse_pac_file(pac_file)
+        # FindProxyForURL is the standard JS function in PAC files
+        proxy_string = pacparser.find_proxy(url)
+        pacparser.cleanup()
+        return proxy_string
+    except Exception as e:
+        return f"ERROR: {str(e)}"
+
+def check_connectivity(proxy_decision, url):
+    """
+    If decision is DIRECT, curl directly.
+    If decision is PROXY host:port, curl via that proxy.
+    """
+    cmd = ["curl", "-I", "-s", "--connect-timeout", str(TIMEOUT), "--max-time", str(TIMEOUT), url]
+    
+    if "DIRECT" in proxy_decision:
+        # No extra args needed
+        pass
+    elif "PROXY" in proxy_decision:
+        # Extract first proxy if multiple are returned (e.g., "PROXY a:80; PROXY b:80")
+        # Simple regex to grab the first host:port
+        match = re.search(r"PROXY\s+([a-zA-Z0-9.-]+:\d+)", proxy_decision)
+        if match:
+            proxy_address = match.group(1)
+            cmd.extend(["-x", f"http://{proxy_address}"])
+        else:
+            return "PARSE_ERROR"
+    else:
+        # SOCKS or other types not handled in this simple snippet
+        return "UNSUPPORTED_TYPE"
+
+    r = run(cmd)
+    return "YES" if r.returncode == 0 else "NO"
+
+def run_test(output_file):
+    pac_cache = {}
+    
+    if not os.path.exists(TEST_LIST):
+        print(f"Error: {TEST_LIST} not found. Please generate it first.")
+        return
+
+    with open(output_file, "w", newline="") as out:
+        writer = csv.writer(out)
+        writer.writerow([
+            "pac_name", "pac_path", "test_url",
+            "pac_decision", "reachable"
+        ])
+
+        with open(TEST_LIST) as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                pac_path = row["pac_path"]
+                pac_name = row["pac_name"]
+                test_url = row["test_url"]
+
+                # Cache PAC download
+                if pac_path not in pac_cache:
+                    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pac")
+                    tmp.close()
+                    r = run(["curl", "-fsSL", pac_path, "-o", tmp.name])
+                    pac_cache[pac_path] = tmp.name if r.returncode == 0 else None
+
+                pac_file = pac_cache[pac_path]
+                if not pac_file:
+                    writer.writerow([pac_name, pac_path, test_url, "PAC_DOWNLOAD_FAILED", "NO"])
+                    continue
+
+                # 1. Evaluate PAC logic
+                decision = evaluate_pac(pac_file, test_url)
+                
+                # 2. Test actual connectivity based on decision
+                reachable = check_connectivity(decision, test_url)
+
+                writer.writerow([pac_name, pac_path, test_url, decision, reachable])
+                print(f"Tested {pac_name}: {test_url} -> {decision} [{reachable}]")
+
+    # Cleanup
+    for f in pac_cache.values():
+        if f and os.path.exists(f):
+            os.unlink(f)
+
+    print(f"Test completed → {output_file}\n")
+
+# ---------- COMPARE ----------
+def compare_results(before, after, output):
+    if not os.path.exists(before) or not os.path.exists(after):
+        print("Error: Missing before/after result files.")
+        return
+
+    before_map = {}
+    with open(before) as f:
+        for r in csv.DictReader(f):
+            key = (r["pac_name"], r["test_url"])
+            before_map[key] = r
+
+    with open(output, "w", newline="") as out:
+        writer = csv.writer(out)
+        writer.writerow([
+            "pac_name", "test_url",
+            "before_decision", "after_decision",
+            "before_reachable", "after_reachable",
+            "change"
+        ])
+
+        with open(after) as f:
+            for r in csv.DictReader(f):
+                key = (r["pac_name"], r["test_url"])
+                b = before_map.get(key)
+
+                if not b:
+                    change = "NEW_ENTRY"
+                # Check for decision change OR reachability change
+                elif (b["pac_decision"] != r["pac_decision"]) or (b["reachable"] != r["reachable"]):
+                    change = "CHANGED"
+                else:
+                    change = "NO_CHANGE"
+
+                writer.writerow([
+                    r["pac_name"], r["test_url"],
+                    b["pac_decision"] if b else "N/A",
+                    r["pac_decision"],
+                    b["reachable"] if b else "N/A",
+                    r["reachable"],
+                    change
+                ])
+
+    print(f"Comparison report generated → {output}\n")
+
+# ---------- MENU ----------
+def menu():
+    while True:
+        print("""
+1) Backup current PAC files
+2) Extract explicit domains from PAC and generate test CSV
+3) Run BEFORE-PAC test
+4) Run AFTER-PAC test and compare
+0) Exit
+""")
+        choice = input("Select: ").strip()
+
+        if choice == "1":
+            backup_pac_files()
+        elif choice == "3":
+            run_test("before_pac_result.csv")
+        elif choice == "4":
+            run_test("after_pac_result.csv")
+            compare_results(
+                "before_pac_result.csv",
+                "after_pac_result.csv",
+                "pac_comparison_report.csv"
+            )
+        elif choice == "2":
+            generate_suggested_test_csv()
+        elif choice == "0":
+            break
+        else:
+            print("Invalid selection\n")
+
+if __name__ == "__main__":
+    menu()

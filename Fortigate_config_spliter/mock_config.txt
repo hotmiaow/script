@@ -1,0 +1,20 @@
+config system interface
+    edit "lag1"
+        set type aggregate
+    next
+    edit "port1"
+        set type physical
+    next
+end
+config system zone
+    edit "trust"
+    next
+end
+config firewall address
+    edit "addr1"
+    next
+end
+config firewall non_existent
+    edit "test"
+    next
+end

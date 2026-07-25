@@ -1,0 +1,4 @@
+config firewall address
+    edit "addr1"
+    next
+end

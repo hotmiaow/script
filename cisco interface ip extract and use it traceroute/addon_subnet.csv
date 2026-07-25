@@ -1,0 +1,4 @@
+subnet,behind_device,info
+10.50.0.0/24,core-firewall-01,PROD_DMZ
+192.168.99.0/24,lab-gateway-01,NON-PROD_LAB
+8.8.8.0/24,internet-edge,PUBLIC_DNS

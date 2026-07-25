@@ -1,0 +1,4 @@
+config system zone
+    edit "trust"
+    next
+end

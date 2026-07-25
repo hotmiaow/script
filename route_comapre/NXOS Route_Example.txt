@@ -1,0 +1,84 @@
+NXOS-SW# sh ip ro vrf RED
+IP Route Table for VRF "default"
+'*' denotes best ucast next-hop
+'**' denotes best mcast next-hop
+'[x/y]' denotes [preference/metric]
+'%<string>' in via output denotes VRF <string>
+
+0.0.0.0/0, ubest/mbest: 1/0
+ *via 172.16.196.170, [1/0], 2d04h, static
+10.0.0.66/32, ubest/mbest: 1/0
+ *via 10.17.255.41, Vlan666, [90/130816], 2d04h, eigrp-1, internal
+10.0.0.67/32, ubest/mbest: 2/0, attached
+ *via 10.0.0.67, Lo666, [0/0], 3d04h, local
+ *via 10.0.0.67, Lo666, [0/0], 3d04h, direct
+10.17.3.0/24, ubest/mbest: 1/0
+ *via 10.17.255.34, [1/0], 2d04h, static
+10.17.4.0/24, ubest/mbest: 1/0
+ *via 10.17.255.34, [1/0], 2d04h, static
+10.17.255.32/29, ubest/mbest: 1/0, attached
+ *via 10.17.255.33, Eth3/12, [0/0], 2d04h, direct
+10.17.255.33/32, ubest/mbest: 1/0, attached
+ *via 10.17.255.33, Eth3/12, [0/0], 2d04h, local
+10.17.255.40/29, ubest/mbest: 1/0, attached
+ *via 10.17.255.42, Vlan666, [0/0], 2d04h, direct
+10.17.255.42/32, ubest/mbest: 1/0, attached
+ *via 10.17.255.42, Vlan666, [0/0], 2d04h, local
+172.16.196.168/30, ubest/mbest: 1/0
+ *via 10.17.255.41, Vlan666, [90/28416], 2d04h, eigrp-1, internal
+
+IP Route Table for VRF "red"
+'*' denotes best ucast next-hop
+'**' denotes best mcast next-hop
+'[x/y]' denotes [preference/metric]
+'%<string>' in via output denotes VRF <string>
+
+0.0.0.0/0, ubest/mbest: 1/0
+ *via 172.16.196.170, [1/0], 2d04h, static
+10.0.0.66/32, ubest/mbest: 1/0
+ *via 10.17.255.41, Vlan666, [90/130816], 2d04h, eigrp-1, internal
+10.0.0.67/32, ubest/mbest: 2/0, attached
+ *via 10.0.0.67, Lo666, [0/0], 3d04h, local
+ *via 10.0.0.67, Lo666, [0/0], 3d04h, direct
+10.17.3.0/24, ubest/mbest: 1/0
+ *via 10.17.255.34, [1/0], 2d04h, static
+10.17.4.0/24, ubest/mbest: 1/0
+ *via 10.17.255.34, [1/0], 2d04h, static
+10.17.255.32/29, ubest/mbest: 1/0, attached
+ *via 10.17.255.33, Eth3/12, [0/0], 2d04h, direct
+10.17.255.33/32, ubest/mbest: 1/0, attached
+ *via 10.17.255.33, Eth3/12, [0/0], 2d04h, local
+10.17.255.40/29, ubest/mbest: 1/0, attached
+ *via 10.17.255.42, Vlan666, [0/0], 2d04h, direct
+10.17.255.42/32, ubest/mbest: 1/0, attached
+ *via 10.17.255.42, Vlan666, [0/0], 2d04h, local
+172.16.196.168/30, ubest/mbest: 1/0
+ *via 10.17.255.41, Vlan666, [90/28416], 2d04h, eigrp-1, internal
+ 
+ IP Route Table for VRF "BLUE"
+'*' denotes best ucast next-hop
+'**' denotes best mcast next-hop
+'[x/y]' denotes [preference/metric]
+'%<string>' in via output denotes VRF <string>
+
+0.0.0.0/0, ubest/mbest: 1/0
+ *via 172.16.196.170, [1/0], 2d04h, static
+10.0.0.66/32, ubest/mbest: 1/0
+ *via 10.17.255.41, Vlan666, [90/130816], 2d04h, eigrp-1, internal
+10.0.0.67/32, ubest/mbest: 2/0, attached
+ *via 10.0.0.67, Lo666, [0/0], 3d04h, local
+ *via 10.0.0.67, Lo666, [0/0], 3d04h, direct
+10.17.3.0/24, ubest/mbest: 1/0
+ *via 10.17.255.34, [1/0], 2d04h, static
+10.17.4.0/24, ubest/mbest: 1/0
+ *via 10.17.255.34, [1/0], 2d04h, static
+10.17.255.32/29, ubest/mbest: 1/0, attached
+ *via 10.17.255.33, Eth3/12, [0/0], 2d04h, direct
+10.17.255.33/32, ubest/mbest: 1/0, attached
+ *via 10.17.255.33, Eth3/12, [0/0], 2d04h, local
+10.17.255.40/29, ubest/mbest: 1/0, attached
+ *via 10.17.255.42, Vlan666, [0/0], 2d04h, direct
+10.17.255.42/32, ubest/mbest: 1/0, attached
+ *via 10.17.255.42, Vlan666, [0/0], 2d04h, local
+172.16.196.168/30, ubest/mbest: 1/0
+ *via 10.17.255.41, Vlan666, [90/28416], 2d04h, eigrp-1, internal

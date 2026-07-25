@@ -1,0 +1,4 @@
+config firewall non_existent
+    edit "test"
+    next
+end

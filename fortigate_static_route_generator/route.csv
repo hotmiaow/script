@@ -1,0 +1,3 @@
+subnet,subnet_mask,interface,gateway,comment
+113.12.11.0,255.255.255.0,LAG2.200,163.124.88.1,ZCC_Route
+113.12.12.0/24,,LAG2.200,163.124.88.1,ZCC_Route

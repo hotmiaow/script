@@ -1,0 +1,3 @@
+pac_name,test_url,before_decision,after_decision,before_reachable,after_reachable,change
+Corp-PAC,http://intranet.company.local,DIRECT,PROXY,YES,NO,CHANGED
+Corp-PAC,https://google.com,PROXY,PROXY,YES,YES,NO_CHANGE

@@ -1,0 +1,29 @@
+config router prefix-list
+    edit "apple"
+        config rule
+            edit 1
+                set prefix 113.12.11.0 255.255.255.0
+                unset ge
+                unset le
+            next
+            edit 2
+                set prefix 113.12.12.0 255.255.255.0
+                unset ge
+                unset le
+            next
+        end
+    next
+end
+
+config router static
+    edit 10
+        set dst 113.12.11.0 255.255.255.0
+        set device "LAG2.200"
+        set comment "ZCC_Route"
+    next
+    edit 11
+        set dst 113.12.12.0 255.255.255.0
+        set device "LAG2.200"
+        set comment "ZCC_Route"
+    next
+end

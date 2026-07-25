@@ -1,0 +1,415 @@
+#!/usr/bin/env python3
+"""
+Enhanced Cisco Network Traceroute Mapper
+• Runs on Python 3.8
+• Accepts hostname *or* IP from the command line (non-interactive)  
+  $ python3 CiscoTracerouteMapper.py 10.1.1.10
+  $ python3 CiscoTracerouteMapper.py core-switch-01
+• Falls back to the interactive menu when no target is supplied
+• Performs forward (A) and reverse (PTR) DNS look-ups
+• Groups inventory by security zone
+"""
+
+import argparse
+import csv
+import ipaddress
+import os
+import platform
+import re
+import socket
+import subprocess
+import sys
+import time
+from typing import Dict, List, Optional, Tuple
+
+# ──────────────────────────────────────────────────────────────────────────────
+# DNS helpers
+# ──────────────────────────────────────────────────────────────────────────────
+def resolve_target(target: str) -> str:
+    """
+    Accepts 'host.example.com' or '10.1.1.1'.
+    Returns a validated IPv4 address ready for traceroute,
+    raises ValueError if resolution fails.
+    """
+    try:                                   # already an IP?
+        ipaddress.IPv4Address(target)
+        return target
+    except ipaddress.AddressValueError:
+        pass
+
+    try:                                   # hostname → IP
+        ip = socket.gethostbyname(target)
+        ipaddress.IPv4Address(ip)          # validate resolver output
+        print(f"✓ Resolved {target} → {ip}")
+        return ip
+    except Exception as exc:
+        raise ValueError(f"DNS resolution failed for '{target}': {exc}") from None
+
+
+def get_reverse_dns(ip: str) -> Optional[str]:
+    """Best-effort PTR lookup – returns hostname or None."""
+    try:
+        hostname, _aliases, _ips = socket.gethostbyaddr(ip)
+        return hostname
+    except Exception:
+        return None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Core class
+# ──────────────────────────────────────────────────────────────────────────────
+class CiscoTracerouteMapper:
+    # ───── initialisation ────────────────────────────────────────────────────
+    def __init__(self, csv_file: str = "cisco_interfaces.csv") -> None:
+        self.csv_file: str = csv_file
+        self.device_inventory: Dict[str, List[Tuple[str, str, str]]] = {}
+        self.ip_to_device_map: Dict[str, Tuple[str, str, str]] = {}
+        self.device_zones: Dict[str, str] = {}
+        # traceroute settings (menu-configurable):
+        self.max_hops: int = 64
+        self.timeout_base: int = 3
+        self.max_retries: int = 2
+
+    # ───── CSV loader ────────────────────────────────────────────────────────
+    def load_csv_data(self) -> bool:
+        print(f"Loading network inventory from {self.csv_file}…")
+        try:
+            with open(self.csv_file, encoding="utf-8") as fh:
+                reader = csv.DictReader(fh)
+                for row in reader:
+                    device = row["Device Name"].strip()
+                    iface = row["Interface Name"].strip()
+                    ip_sub = row["IP Address/Subnet"].strip()
+                    zone = row.get("Zone", "Unknown").strip()
+
+                    if ip_sub.upper() == "DHCP" or not ip_sub:
+                        continue                     # skip dynamic or empty
+
+                    ip = ip_sub.split("/")[0]
+                    try:
+                        ipaddress.ip_address(ip)
+                    except ValueError:
+                        print(f"Warning: invalid IP '{ip}' for {device}")
+                        continue
+
+                    self.device_inventory.setdefault(device, []).append(
+                        (iface, ip, zone)
+                    )
+                    self.ip_to_device_map[ip] = (device, iface, zone)
+                    self.device_zones.setdefault(device, zone)
+
+            print(f"✓ Loaded {len(self.device_inventory)} devices")
+            print(f"✓ Total interfaces: {len(self.ip_to_device_map)}")
+            
+            # Display zone summary
+            zones = set(self.device_zones.values())
+            print(f"✓ Network zones found: {', '.join(sorted(zones))}")
+            return True
+
+        except FileNotFoundError:
+            print(f"Error: '{self.csv_file}' not found")
+            return False
+        except Exception as exc:
+            print(f"CSV load error: {exc}")
+            return False
+
+    # ───── low-level traceroute helpers ──────────────────────────────────────
+    def _test_connectivity(self, ip: str) -> bool:
+        """Single-echo ping to confirm reachability (non-fatal)."""
+        try:
+            if platform.system().lower() == "windows":
+                cmd = ["ping", "-n", "1", "-w", "3000", ip]
+            else:
+                cmd = ["ping", "-c", "1", "-W", "3", ip]
+            result = subprocess.run(cmd, capture_output=True, timeout=10)
+            return result.returncode == 0
+        except Exception:
+            return False
+
+    def _parse_traceroute_line(
+        self, line: str, system: str
+    ) -> Optional[Tuple[int, Optional[str], bool]]:
+        """
+        Returns (hop_no, ip_or_None, is_timeout)
+        or None if the line does not contain hop data.
+        """
+        if system == "windows":
+            # timeout line
+            if re.search(r"^\s*\d+.*\*", line) and "timed out" in line.lower():
+                hop_match = re.search(r"^\s*(\d+)", line)
+                if hop_match:
+                    return int(hop_match.group(1)), None, True
+            # success line
+            m = re.search(r"^\s*(\d+)\s+.*?(\d+\.\d+\.\d+\.\d+)", line)
+            if m:
+                try:
+                    ipaddress.ip_address(m.group(2))
+                    return int(m.group(1)), m.group(2), False
+                except ValueError:
+                    pass
+        else:  # unix
+            if re.match(r"^\s*\d+\s+\*\s+\*\s+\*", line):
+                hop_match = re.search(r"^\s*(\d+)", line)
+                if hop_match:
+                    return int(hop_match.group(1)), None, True
+            
+            pats = [
+                r"^\s*(\d+)\s+(\d+\.\d+\.\d+\.\d+)",                       # plain IP
+                r"^\s*(\d+)\s+\S+\s+\((\d+\.\d+\.\d+\.\d+)\)",              # host (IP)
+                r"^\s*(\d+)\s+.*?(\d+\.\d+\.\d+\.\d+)",                     # any format with IP
+            ]
+            for p in pats:
+                m = re.search(p, line)
+                if m:
+                    try:
+                        ipaddress.ip_address(m.group(2))
+                        return int(m.group(1)), m.group(2), False
+                    except ValueError:
+                        continue
+        return None
+
+    def execute_traceroute_streaming(
+        self, target_ip: str, source_ip: Optional[str] = None
+    ):
+        """
+        Generator yielding (hop_no, ip_or_None) in real time.
+        Compatible with Unix 'traceroute' or Windows 'tracert'.
+        """
+        system = platform.system().lower()
+        if system == "windows":
+            cmd = ["tracert", "-h", str(self.max_hops), "-w", "5000", target_ip]
+        else:
+            cmd = [
+                "traceroute",
+                "-m",
+                str(self.max_hops),
+                "-w",
+                str(self.timeout_base),
+                "-q",
+                "3",
+                target_ip,
+            ]
+            if source_ip:
+                cmd.extend(["-s", source_ip])
+
+        print(f"    Executing: {' '.join(cmd)}")
+
+        try:
+            # Use compatible subprocess arguments
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True,  # This is the Python 3.6+ compatible version
+                encoding='utf-8',
+                errors='ignore',
+                bufsize=1
+            )
+        except FileNotFoundError:
+            print("    Traceroute command not available on this system.")
+            self._suggest_traceroute_alternatives()
+            return
+        except Exception as exc:
+            print(f"    Unable to launch traceroute: {exc}")
+            return
+
+        hop_number = 0
+        consecutive_timeouts = 0
+        max_consecutive_timeouts = 5
+        destination_reached = False
+
+        try:
+            while True:
+                line = proc.stdout.readline()
+                if not line:
+                    if proc.poll() is not None:
+                        break  # process finished
+                    continue  # still running
+
+                line = line.strip()
+                if not line:
+                    continue
+
+                parsed = self._parse_traceroute_line(line, system)
+                if parsed:
+                    hop_no, ip, is_timeout = parsed
+                    hop_number = hop_no
+                    
+                    if is_timeout:
+                        consecutive_timeouts += 1
+                        print(f"    Hop {hop_no}: * * * (timeout)")
+                        
+                        if consecutive_timeouts >= max_consecutive_timeouts:
+                            print(f"    Breaking due to {consecutive_timeouts} consecutive timeouts")
+                            break
+                    else:
+                        consecutive_timeouts = 0
+                        
+                        if ip == target_ip:
+                            destination_reached = True
+                            yield hop_no, ip
+                            print(f"    Destination {target_ip} reached at hop {hop_no}")
+                            break
+                        
+                        yield hop_no, ip
+
+                # Check for destination reached in line (alternative detection)
+                if target_ip in line and not destination_reached:
+                    destination_reached = True
+                    if parsed and not parsed[2]:  # Not a timeout
+                        break
+
+        except Exception as e:
+            print(f"    Error during traceroute: {e}")
+
+        # Wait for process to complete
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            print("    Traceroute process terminated due to timeout")
+        except Exception:
+            pass
+
+    def _suggest_traceroute_alternatives(self):
+        """Suggest alternatives when traceroute is not available"""
+        system = platform.system().lower()
+        if system == 'windows':
+            print("    Try using 'tracert' command manually")
+        else:
+            print("    Try installing traceroute:")
+            print("      Ubuntu/Debian: sudo apt-get install traceroute")
+            print("      RHEL/CentOS: sudo yum install traceroute")
+            print("      macOS: brew install traceroute")
+
+    # ───── display helpers ────────────────────────────────────────────────────
+    def display_hop_details(self, hop_no: int, ip: Optional[str], show_extra_info: bool = True) -> None:
+        """Display detailed information for a single hop"""
+        if ip is None:
+            print(f"\n┌─ HOP {hop_no}")
+            print(f"├─ IP Address: * * * (timeout)")
+            print(f"├─ Device: Unknown (timeout)")
+            print(f"├─ Interface: Unknown (timeout)")
+            print(f"├─ Zone: Unknown")
+            print(f"└─ Status: ⏰ TIMEOUT/NO RESPONSE")
+            return
+
+        device_name, interface_name, zone = self.ip_to_device_map.get(ip, (None, None, None))
+        ptr = get_reverse_dns(ip)
+        
+        print(f"\n┌─ HOP {hop_no}")
+        if ptr:
+            print(f"├─ IP Address: {ip} ({ptr})")
+        else:
+            print(f"├─ IP Address: {ip}")
+
+        if device_name and interface_name:
+            print(f"├─ Device: {device_name}")
+            print(f"├─ Interface: {interface_name}")
+            print(f"├─ Zone: {zone}")
+            print(f"├─ Status: ✓ KNOWN CISCO DEVICE")
+
+            if show_extra_info and device_name in self.device_inventory:
+                # Show additional interfaces on this device
+                other_interfaces = [(intf, ip_addr, z) for intf, ip_addr, z in self.device_inventory[device_name]
+                                    if ip_addr != ip]
+                if other_interfaces:
+                    print(f"├─ Other interfaces on this device:")
+                    for i, (intf, ip_addr, z) in enumerate(other_interfaces[:3]):
+                        prefix = "├─   " if i < len(other_interfaces[:3]) - 1 else "└─   "
+                        print(f"{prefix}├─ {intf}: {ip_addr} (Zone: {z})")
+                    if len(other_interfaces) > 3:
+                        print(f"└─   └─ ... and {len(other_interfaces) - 3} more interfaces")
+                else:
+                    print(f"└─ (This is the only known interface)")
+            else:
+                print(f"└─")
+        else:
+            print(f"├─ Device: Unknown/External")
+            print(f"├─ Interface: Unknown")
+            print(f"├─ Zone: Unknown")
+            print(f"├─ Status: ? EXTERNAL/UNKNOWN HOP")
+            print(f"└─ (Not in Cisco device inventory)")
+
+    # ───── main trace routine ────────────────────────────────────────────────
+    def trace_to_destination_streaming(
+        self, target_ip: str, description: str = ""
+    ):
+        """Trace path with real-time hop-by-hop display and enhanced completion"""
+        try:
+            ipaddress.ip_address(target_ip)
+        except ValueError:
+            print(f"Error: Invalid IP address '{target_ip}'")
+            return
+
+        print(f"\n{'=' * 80}")
+        if description:
+            print(f"TRACING PATH FROM LOCAL PC TO {target_ip} ({description})")
+        else:
+            print(f"TRACING PATH FROM LOCAL PC TO {target_ip}")
+        print(f"{'=' * 80}")
+
+        # Check if target is reachable first
+        print(f"🔍 Pre-flight check: Testing connectivity to {target_ip}...")
+        if self._test_connectivity(target_ip):
+            print(f"✓ Target is reachable via ping")
+        else:
+            print(f"⚠️ Target may not be reachable via ping (continuing with traceroute)")
+
+        # Check if target is in our database
+        target_device, target_interface, target_zone = self.ip_to_device_map.get(target_ip, (None, None, None))
+        if target_device:
+            print(f"🎯 TARGET: {target_device} ({target_interface}) - Zone: {target_zone}")
+            print(f"   Destination is a known Cisco device from inventory")
+        else:
+            print(f"🎯 TARGET: {target_ip}")
+            print(f"   Destination not found in device inventory")
+
+        # Get local PC information
+        try:
+            hostname = socket.gethostname()
+            local_ip = socket.gethostbyname(hostname)
+            print(f"\n💻 SOURCE: {hostname} ({local_ip})")
+        except:
+            print(f"\n💻 SOURCE: Local PC")
+
+        print(f"\n🔍 Starting enhanced traceroute (max {self.max_hops} hops)...")
+        print(f"   Press Ctrl+C to stop")
+        print(f"{'=' * 60}")
+
+        # Perform streaming traceroute
+        hops_data = []
+        known_devices_count = 0
+        unknown_hops_count = 0
+        timeout_hops_count = 0
+        zones_traversed = set()
+        destination_reached = False
+
+        try:
+            for hop_number, ip_address in self.execute_traceroute_streaming(target_ip):
+                # Store hop data
+                hops_data.append((hop_number, ip_address))
+
+                if ip_address is None:
+                    timeout_hops_count += 1
+                else:
+                    # Display hop details immediately
+                    device_name, interface_name, zone = self.ip_to_device_map.get(ip_address, (None, None, None))
+
+                    if device_name:
+                        known_devices_count += 1
+                        zones_traversed.add(zone)
+                    else:
+                        unknown_hops_count += 1
+
+                    # Check if we've reached the destination
+                    if ip_address == target_ip:
+                        destination_reached = True
+
+                self.display_hop_details(hop_number, ip_address)
+
+                # Small delay for readability
+                time.sleep(0.3)
+
+                if destination_reached:
+                    print(f"\n🎯

@@ -1,0 +1,991 @@
+#!/usr/bin/env python3
+"""
+Enhanced Cisco Network Traceroute Mapper
+• Runs on Python 3.8
+• Accepts hostname *or* IP from the command line (non-interactive)  
+  $ python3 CiscoTracerouteMapper.py 10.1.1.10
+  $ python3 CiscoTracerouteMapper.py core-switch-01
+• Falls back to the interactive menu when no target is supplied
+• Performs forward (A) and reverse (PTR) DNS look-ups
+• Groups inventory by security zone
+"""
+
+import argparse
+import csv
+import ipaddress
+import os
+import platform
+import re
+import socket
+import subprocess
+import sys
+import time
+import concurrent.futures
+from typing import Dict, List, Optional, Tuple, Set
+
+# ──────────────────────────────────────────────────────────────────────────────
+# DNS helpers
+# ──────────────────────────────────────────────────────────────────────────────
+def resolve_target(target: str) -> str:
+    """
+    Accepts 'host.example.com' or '10.1.1.1'.
+    Returns a validated IPv4 address ready for traceroute,
+    raises ValueError if resolution fails.
+    """
+    try:                                   # already an IP?
+        ipaddress.IPv4Address(target)
+        return target
+    except ipaddress.AddressValueError:
+        pass
+
+    try:                                   # hostname → IP
+        ip = socket.gethostbyname(target)
+        ipaddress.IPv4Address(ip)          # validate resolver output
+        print(f"✓ Resolved {target} → {ip}")
+        return ip
+    except Exception as exc:
+        raise ValueError(f"DNS resolution failed for '{target}': {exc}") from None
+
+
+def get_reverse_dns(ip: str) -> Optional[str]:
+    """Best-effort PTR lookup – returns hostname or None."""
+    try:
+        hostname, _aliases, _ips = socket.gethostbyaddr(ip)
+        return hostname
+    except Exception:
+        return None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Core class
+# ──────────────────────────────────────────────────────────────────────────────
+class CiscoTracerouteMapper:
+    # ───── initialisation ────────────────────────────────────────────────────
+    def __init__(self, csv_file: str = "cisco_interfaces.csv") -> None:
+        self.csv_file: str = csv_file
+        self.device_inventory: Dict[str, List[Tuple[str, str, str, str]]] = {}
+        self.ip_to_device_map: Dict[str, Tuple[str, str, str, str]] = {}
+        self.device_zones: Dict[str, str] = {}
+        # traceroute settings
+        self.resolve_dns: bool = False  # Default to False for speed
+        self.max_hops: int = 20         # Default limited to 20 for speed
+        self.timeout_base: int = 3
+        self.max_retries: int = 2
+        # Addon subnets: list of (network_obj, behind_device_str, info_str)
+        self.addon_subnets: List[Tuple[ipaddress.IPv4Network, str, str]] = []
+
+    # ───── CSV loader ────────────────────────────────────────────────────────
+    def load_csv_data(self) -> bool:
+        print(f"Loading network inventory from {self.csv_file}…")
+        try:
+            with open(self.csv_file, encoding="utf-8") as fh:
+                reader = csv.DictReader(fh)
+                for row in reader:
+                    device = row["device_name"].strip()
+                    iface = row["interface_name"].strip()
+                    ip_sub = row["ip_address"].strip()
+                    zone = row.get("Zone", "Unknown").strip()
+                    description = row.get("description", "N/A").strip()
+
+                    if ip_sub.upper() in {"DHCP", "PPPOE", "SOURCE: LOOPBACK1"} or not ip_sub:
+                        continue                     # skip dynamic or empty
+
+                    ip = ip_sub.split("/")[0]
+                    try:
+                        ipaddress.ip_address(ip)
+                    except ValueError:
+                        print(f"Warning: invalid IP '{ip}' for {device}")
+                        continue
+
+                    self.device_inventory.setdefault(device, []).append(
+                        (iface, ip, zone, description)
+                    )
+                    self.ip_to_device_map[ip] = (device, iface, zone, description)
+                    self.device_zones.setdefault(device, zone)
+
+            print(f"✓ Loaded {len(self.device_inventory)} devices")
+            print(f"✓ Total interfaces: {len(self.ip_to_device_map)}")
+            return True
+
+        except FileNotFoundError:
+            print(f"Error: '{self.csv_file}' not found")
+            return False
+        except Exception as exc:
+            return False
+
+    def load_addon_subnets(self, filename: str = "addon_subnet.csv") -> None:
+        """Loads additional subnet info from CSV."""
+        if not os.path.exists(filename):
+            return
+        
+        print(f"Loading addon subnets from {filename}…")
+        count = 0
+        try:
+            with open(filename, encoding="utf-8") as fh:
+                reader = csv.DictReader(fh)
+                for row in reader:
+                    s_net = row.get("subnet", "").strip()
+                    b_dev = row.get("behind_device", "").strip()
+                    info = row.get("info", "").strip()
+                    
+                    if not s_net: continue
+                    try:
+                        net = ipaddress.ip_network(s_net, strict=False)
+                        self.addon_subnets.append((net, b_dev, info))
+                        count += 1
+                    except ValueError:
+                        pass
+            print(f"✓ Loaded {count} addon subnets")
+        except Exception as e:
+            print(f"⚠️  Error loading {filename}: {e}")
+
+    def check_addon_subnet(self, ip_str: str) -> List[Tuple[ipaddress.IPv4Network, str, str]]:
+        """
+        Checks if IP is in any addon subnet. 
+        Returns list of (network_obj, behind_device, info_str) for ALL matches.
+        """
+        matches = []
+        try:
+            ip = ipaddress.ip_address(ip_str)
+            for net, dev, info in self.addon_subnets:
+                if ip in net:
+                    matches.append((net, dev, info))
+            
+            if len(matches) > 0:
+                return matches
+        except ValueError:
+            pass
+        return []
+
+    # ───── low-level traceroute helpers ──────────────────────────────────────
+    def _test_connectivity(self, ip: str) -> bool:
+        """Single-echo ping to confirm reachability (non-fatal)."""
+        try:
+            if platform.system().lower() == "windows":
+                cmd = ["ping", "-n", "1", "-w", "3000", ip]
+            else:
+                cmd = ["ping", "-c", "1", "-W", "3", ip]
+            return subprocess.run(cmd, capture_output=True).returncode == 0
+        except Exception:
+            return False
+
+    def _parse_traceroute_line(
+        self, line: str, system: str
+    ) -> Optional[Tuple[int, Optional[str], bool]]:
+        """
+        Returns (hop_no, ip_or_None, is_timeout)
+        or None if the line does not contain hop data.
+        """
+        if system == "windows":
+            # timeout line
+            if re.search(r"^\s*\d+.*\*", line) and "timed out" in line.lower():
+                hop = int(re.findall(r"^\s*(\d+)", line)[0])
+                return hop, None, True
+            # success line
+            m = re.search(r"^\s*(\d+)\s+.*?(\d+\.\d+\.\d+\.\d+)", line)
+            if m:
+                return int(m.group(1)), m.group(2), False
+        else:  # unix
+            if re.match(r"^\s*\d+\s+\*\s+\*\s+\*", line):
+                hop = int(re.findall(r"^\s*(\d+)", line)[0])
+                return hop, None, True
+            pats = [
+                r"^\s*(\d+)\s+(\d+\.\d+\.\d+\.\d+)",                       # plain IP
+                r"^\s*(\d+)\s+\S+\s+\((\d+\.\d+\.\d+\.\d+)\)",              # host (IP)
+                r"^\s*(\d+)\s+\S+\s+(\d+\.\d+\.\d+\.\d+)\s",                # host IP
+            ]
+            for p in pats:
+                m = re.search(p, line)
+                if m:
+                    return int(m.group(1)), m.group(2), False
+        return None
+
+    def execute_traceroute_streaming(
+        self, target_ip: str, source_ip: Optional[str] = None
+    ):
+        """
+        Generator yielding (hop_no, ip_or_None) in real time.
+        Compatible with Unix 'traceroute' or Windows 'tracert'.
+        """
+        system = platform.system().lower()
+        if system == "windows":
+            cmd = ["tracert", "-h", str(self.max_hops), "-w", "5000", target_ip]
+        else:
+            cmd = [
+                "traceroute",
+                "-m",
+                str(self.max_hops),
+                "-w",
+                str(self.timeout_base),
+                "-q",
+                "3",
+                target_ip,
+            ]
+            if source_ip:
+                cmd.extend(["-s", source_ip])
+
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                bufsize=1,
+                universal_newlines=True,
+            )
+        except FileNotFoundError:
+            print("Traceroute executable not found on this system.")
+            return
+        except Exception as exc:
+            print(f"Unable to launch traceroute: {exc}")
+            return
+
+        while True:
+            line = proc.stdout.readline()
+            if not line:
+                if proc.poll() is not None:
+                    break  # process finished
+                continue  # still running
+
+            parsed = self._parse_traceroute_line(line.rstrip(), system)
+            if parsed:
+                hop_no, ip, _ = parsed
+                yield hop_no, ip
+
+        proc.wait(timeout=10)
+
+    # ───── display helpers ────────────────────────────────────────────────────
+    def _display_hop(self, hop_no: int, ip: Optional[str]) -> None:
+        """Prints one hop line with PTR + inventory info."""
+        if ip is None:
+            print(f"{hop_no:>2}   * * *  (timeout)")
+            return
+
+        ptr = None
+        if self.resolve_dns:
+            ptr = get_reverse_dns(ip)
+
+        device, iface, zone, description = self.ip_to_device_map.get(ip, (None, None, None, None))
+        show_ip = f"{ip} ({ptr})" if ptr else ip
+
+        if device:
+            # Check for addon subnet match to append as extra info
+            addons = self.check_addon_subnet(ip)
+            extra = ""
+            if addons:
+                 # Join multiple matches if any
+                 # Format: [Sub: Dev1, Dev2]
+                 devs = sorted(list(set(d for _, d, _ in addons)))
+                 dev_str = ", ".join(devs)
+                 extra = f" [Sub: {dev_str}]"
+                 
+            print(
+                f"{hop_no:>2}   {show_ip:<40}  {device:<20} {iface:<20} {zone} ({description}){extra}"
+            )
+        else:
+            # Check for addon subnet match if no device found
+            addons = self.check_addon_subnet(ip)
+            if addons:
+                for _net, dev_name, info in addons:
+                    # Format: Matches 10.x.x.x/24 (Behind dev) [Info]
+                    match_str = f"Matches {str(_net)} (Behind {dev_name}) [{info}]"
+                    print(f"{hop_no:>2}   {show_ip:<40}  {match_str}")
+            else:
+                print(f"{hop_no:>2}   {show_ip:<40}  External/Unknown")
+
+    # ───── main trace routine ────────────────────────────────────────────────
+    def trace_to_destination_streaming(
+        self, target_ip: str, description: str = ""
+    ):
+        print("\n" + "=" * 80)
+        title = f"TRACING PATH TO {target_ip}"
+        if description:
+            title += f"  ({description})"
+        print(title)
+        
+        # Check addon info
+        addon_data_list = self.check_addon_subnet(target_ip)
+        if addon_data_list:
+            for _net, dev, info in addon_data_list:
+                print(f"ℹ️  ADDON INFO: Matches {str(_net)} (Behind {dev}) [{info}]")
+            
+        print("=" * 80)
+
+        # pre-flight ping
+        if self._test_connectivity(target_ip):
+            print("✓ Ping reachable, continuing with traceroute…")
+        else:
+            print("⚠️  Ping unreachable, continuing anyway…")
+
+        print("-" * 80)
+        print(f"{'No':>2}   {'IP Address':<40}  {'Device Name':<20} {'Interface':<20} {'Zone'}")
+        print("-" * 80)
+
+
+        hops: List[Tuple[int, Optional[str]]] = []
+        destination_reached = False
+
+        try:
+            for hop_no, ip in self.execute_traceroute_streaming(target_ip):
+                hops.append((hop_no, ip))
+                self._display_hop(hop_no, ip)
+                if ip == target_ip:
+                    destination_reached = True
+                    break
+                time.sleep(0.3)  # small pacing for readability
+        except KeyboardInterrupt:
+            print("\nInterrupted by user.")
+
+        # summary
+        print("\n" + "=" * 80)
+        print("SUMMARY")
+        print("=" * 80)
+        print(f"Hops recorded: {len(hops)}")
+        print(f"Destination reached: {'Yes' if destination_reached else 'No'}")
+
+    # ───── wrappers for hostname/IP ───────────────────────────────────────────
+    def trace_to_destination(self, target: str, description: str = "") -> None:
+        try:
+            ip = resolve_target(target)
+        except ValueError as err:
+            print(err)
+            return
+
+        if not description and target != ip:
+            description = target  # preserve original hostname
+        self.trace_to_destination_streaming(ip, description)
+
+    def trace_to_ip(self, ip: str) -> None:  # legacy alias
+        self.trace_to_destination(ip)
+
+    # ───── inventory display ─────────────────────────────────────────────────
+    def display_device_inventory(self) -> None:
+        print("\n" + "=" * 100)
+        print("NETWORK DEVICE INVENTORY (grouped by zone)")
+        print("=" * 100)
+
+        zones: Dict[str, List[str]] = {}
+        for dev, _ifs in self.device_inventory.items():
+            zones.setdefault(self.device_zones.get(dev, "Unknown"), []).append(dev)
+
+        for zone in sorted(zones):
+            print(f"\n🌐 ZONE: {zone}")
+            print("-" * 60)
+            for dev in sorted(zones[zone]):
+                print(f"\n📍 {dev}")
+                print(f"{'Interface':<25} {'IP Address':<16} {'Zone':<15} {'Description'}")
+                print("-" * 100)
+                for iface, ip, z, desc in self.device_inventory[dev]:
+                    print(f"{iface:<25} {ip:<16} {z:<15} {desc}")
+
+    # ───── comparison features ───────────────────────────────────────────────
+    def collect_trace(
+        self, target_ip: str, silent: bool = False
+    ) -> List[Tuple[int, Optional[str]]]:
+        """Runs traceroute to target and returns list of (hop, ip)."""
+        if not silent:
+            print(f"   ► Tracing to {target_ip}...")
+        hops = []
+        try:
+            for hop_no, ip in self.execute_traceroute_streaming(target_ip):
+                hops.append((hop_no, ip))
+                if not silent:
+                    # Simple progress indicator
+                    if ip:
+                        print(f"     Hop {hop_no}: {ip}")
+                    else:
+                        print(f"     Hop {hop_no}: *")
+        except KeyboardInterrupt:
+            if not silent:
+                print("     (Interrupted)")
+        return hops
+
+    def _display_comparison_grid(
+        self,
+        resolved_targets: List[Tuple[str, str]],
+        trace_results: Dict[str, Dict[int, str]],
+        max_hop: int,
+        highlight_ips: Optional[Set[str]] = None
+    ) -> None:
+        """Displays side-by-side comparison of multiple traces."""
+        print("\n" + "=" * 180)  # Widened header separator
+        print("TRACE COMPARISON")
+        print("Format: IP Address [Device Name - Interface Name] or [Sub: Subnet Description]")
+        print("=" * 180)
+
+        # Header
+        header = f"{'Hop':<4}"
+        col_width = 60  # Increased column width
+        for orig_target, ip in resolved_targets:
+            header += f"{orig_target[:col_width]:<{col_width}} "
+        print(header)
+        print("-" * len(header))
+
+        for h in range(1, max_hop + 1):
+            row_str = f"{h:<4}"
+
+            # Check if all valid IPs at this hop are the same
+            ips_at_hop = []
+            for _, ip in resolved_targets:
+                if ip in trace_results and h in trace_results[ip]:
+                    ips_at_hop.append(trace_results[ip][h])
+                else:
+                    ips_at_hop.append(None)
+
+            # Check distinct non-None IPs
+            distinct_set = set(ips_at_hop)
+            
+            # Strict Matching: All must be identical and NOT None
+            is_common = (len(distinct_set) == 1) and (None not in distinct_set)
+
+            # Build the row string
+            for i, (_, target_ip) in enumerate(resolved_targets):
+                hop_ip = ips_at_hop[i]
+                if hop_ip is None:
+                    cell_text = "*"
+                else:
+                    # Enrich with device info
+                    ptr = None
+                    if self.resolve_dns:
+                        ptr = get_reverse_dns(hop_ip)
+
+                    device, iface, _, description = self.ip_to_device_map.get(hop_ip, (None, None, None, None))
+
+                    if device:
+                        cell_text = f"{hop_ip} [{device} - {iface} - {description}]"
+                    else:
+                        # Check addon
+                        addons = self.check_addon_subnet(hop_ip)
+                        if addons:
+                            # Short format: IP [Sub: dev_name1, dev_name2]
+                            devs = sorted(list(set(d for _, d, _ in addons)))
+                            dev_str = ", ".join(devs)
+                            cell_text = f"{hop_ip} [Sub: {dev_str}]"
+                        elif ptr:
+                            # Shorten PTR if too long
+                            short_ptr = ptr.split('.')[0]
+                            if len(short_ptr) > 25: # Increased length allowance
+                                 short_ptr = short_ptr[:22] + "..."
+                            cell_text = f"{hop_ip} ({short_ptr})"
+                        else:
+                            cell_text = hop_ip
+                    
+                    # Add highlight if applicable
+                    if highlight_ips and hop_ip in highlight_ips:
+                        cell_text += " ✅"
+
+                # Truncate to col_width - 1
+                row_str += f"{cell_text[:col_width-1]:<{col_width}} "
+
+            if is_common:
+                 row_str += " (MATCH)"
+
+            print(row_str)
+
+    def compare_traces(self, targets: List[str]) -> None:
+        """
+        Traces multiple targets and displays a side-by-side comparison.
+        """
+        # 1. Resolve all targets
+        resolved_targets = []
+        print("\n" + "=" * 80)
+        print("PREPARING TRACES")
+        print("=" * 80)
+        for t in targets:
+            t = t.strip()
+            if not t: continue
+            try:
+                ip = resolve_target(t)
+                resolved_targets.append((t, ip))
+            except ValueError as e:
+                print(f"⚠️  Skipping {t}: {e}")
+
+        if not resolved_targets:
+            print("No valid targets to trace.")
+            return
+
+        # Display Addon Info
+        for orig_t, ip in resolved_targets:
+            addon_data_list = self.check_addon_subnet(ip)
+            if addon_data_list:
+                 for _net, dev, info in addon_data_list:
+                     print(f"ℹ️  ADDON INFO for {orig_t} ({ip}): Matches {str(_net)} (Behind {dev}) [{info}]")
+
+        # 2. Collect traces in parallel
+        trace_results: Dict[str, Dict[int, str]] = {}  # ip -> {hop: ip_at_hop}
+        max_hop_seen = 0
+
+        print("\n" + "=" * 80)
+        print(f"COLLECTING TRACE DATA (Max 5 parallel sessions)")
+        print("=" * 80)
+        
+        # Pre-check connectivity sequentially (fast enough, avoids ping flood issues)
+        for orig_target, ip in resolved_targets:
+            if not self._test_connectivity(ip):
+                print(f"⚠️  {orig_target} ({ip}) might be unreachable (ping failed).")
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            # Map future to original IP
+            future_to_ip = {
+                executor.submit(self.collect_trace, ip, silent=True): ip 
+                for _, ip in resolved_targets
+            }
+            
+            completed_count = 0
+            total_count = len(resolved_targets)
+            
+            for future in concurrent.futures.as_completed(future_to_ip):
+                ip = future_to_ip[future]
+                completed_count += 1
+                try:
+                    hops = future.result()
+                    print(f"[{completed_count}/{total_count}] Trace completed for {ip}")
+                    
+                    # Convert list of tuples to dict
+                    hop_map = {}
+                    for h_no, h_ip in hops:
+                        if h_ip:
+                            hop_map[h_no] = h_ip
+                            max_hop_seen = max(max_hop_seen, h_no)
+                    trace_results[ip] = hop_map
+                    
+                except Exception as exc:
+                    print(f"[{completed_count}/{total_count}] Trace failed for {ip}: {exc}")
+
+        # 3. Compare and Display
+        self._display_comparison_grid(resolved_targets, trace_results, max_hop_seen)
+
+    # ───── troubleshooting mode ──────────────────────────────────────────────
+    def find_nodes_by_query(self, query: str) -> Dict[str, List[str]]:
+        """
+        Finds devices/IPs matching the user query (Name/IP/Subnet).
+        Returns dict {device: [matching_ips]}.
+        """
+        query = query.strip()
+        matches: Dict[str, List[str]] = {}
+        
+        # 1. Direct device name match
+        if query in self.device_inventory:
+            for _, ip, _, _ in self.device_inventory[query]:
+                matches.setdefault(query, []).append(ip)
+
+        # 2. IP match
+        if query in self.ip_to_device_map:
+            dev, _, _, _ = self.ip_to_device_map[query]
+            matches.setdefault(dev, []).append(query)
+            
+        # 3. Subnet match (only if looks like CIDR or IP)
+        try:
+            # Check if valid network string
+            if "/" in query:
+                net = ipaddress.ip_network(query, strict=False)
+                # Scan all known IPs
+                for ip_str in self.ip_to_device_map:
+                    try:
+                        if ipaddress.ip_address(ip_str) in net:
+                            dev, _, _, _ = self.ip_to_device_map[ip_str]
+                            matches.setdefault(dev, []).append(ip_str)
+                    except ValueError:
+                        continue
+        except ValueError:
+            pass
+
+        return matches
+        
+    def troubleshooting_mode(self) -> None:
+        """Interactive workflow to verify traffic through specific network elements."""
+        monitored_devices: Set[str] = set()
+        manual_ips: Set[str] = set()
+        manual_subnets: List[ipaddress.IPv4Network] = []
+        destinations: List[str] = []
+
+        while True:
+            # Display current state
+            print("\n" + "=" * 80)
+            print("🕵️  TROUBLESHOOTING MODE")
+            print("=" * 80)
+            
+            # Helper to format lists
+            def fmt_list(items):
+                s = ", ".join(sorted([str(x) for x in items]))
+                if len(s) > 60: s = s[:57] + "..."
+                return s if s else "(None)"
+            
+            print(f"  • Monitored Devices: {fmt_list(monitored_devices)}")
+            print(f"  • Manual IPs:        {fmt_list(manual_ips)}")
+            print(f"  • Manual Subnets:    {fmt_list(manual_subnets)}")
+            print(f"  • Destinations:      {fmt_list(destinations)}")
+            print("-" * 80)
+            print("1. Set Monitored Device/IP/Subnet")
+            print("2. Set Destination IP(s)")
+            print("3. Run Verification Trace")
+            print("4. Return to Main Menu")
+            print("-" * 80)
+            
+            choice = input("Select option (1-4): ").strip()
+
+            if choice == "1":
+                print("\nEnter a Device Name, IP Address, or Subnet that you expect traffic to pass through.")
+                query = input("Search Query: ").strip()
+                if not query: continue
+                
+                # 1. Search Inventory
+                matches = self.find_nodes_by_query(query)
+                if matches:
+                    print(f"\n✓ Found {len(matches)} device(s) matching your query:")
+                    for dev in sorted(matches):
+                        ips = matches[dev]
+                        print(f"  • {dev} (IPs: {', '.join(ips)})")
+                    monitored_devices.update(matches.keys())
+                    print(f"Updated monitored devices.")
+                else:
+                    # 2. Try Manual IP/Subnet
+                    print("No directory match found. Checking as manual network entry...")
+                    try:
+                        # Try Subnet first (if it has /)
+                        if "/" in query:
+                            net = ipaddress.ip_network(query, strict=False)
+                            manual_subnets.append(net)
+                            print(f"✓ Added manual subnet monitor: {net}")
+                        else:
+                            # Try IP
+                            ip = ipaddress.ip_address(query)
+                            manual_ips.add(str(ip))
+                            print(f"✓ Added manual IP monitor: {ip}")
+                    except ValueError:
+                         print("❌ Invalid input. Not a device name, valid IP, or valid subnet.")
+
+            
+            elif choice == "2":
+                print("\nEnter destination IP(s) to trace to.")
+                dest_input = input("Destination IP(s) (comma-separated): ").strip()
+                if dest_input:
+                    destinations = [t.strip() for t in dest_input.split(',') if t.strip()]
+                    print(f"Updated destinations: {destinations}")
+
+            elif choice == "3":
+                if not destinations:
+                    print("⚠️  Please set destinations first (Option 2).")
+                    input("Press Enter...")
+                    continue
+
+                self.run_verification_batch(destinations, monitored_devices, manual_ips, manual_subnets)
+                input("\nVerification complete. Press Enter to continue...")
+
+
+
+            elif choice == "4":
+                break
+            else:
+                print("Invalid selection.")
+
+    def run_verification_batch(
+        self,
+        destinations: List[str],
+        monitored_devices: Set[str],
+        manual_ips: Set[str],
+        manual_subnets: List[ipaddress.IPv4Network],
+    ) -> None:
+        """Executes the verification logic for a batch of destinations."""
+        print(f"\nRunning traces to {len(destinations)} destinations...")
+
+        # Store results for display and analysis
+        resolved_targets = []
+        trace_results: Dict[str, Dict[int, str]] = {}
+        max_hop_seen = 0
+        
+        for tgt in destinations:
+            try:
+                dest_ip = resolve_target(tgt)
+                resolved_targets.append((tgt, dest_ip))
+            except ValueError:
+                print(f"Skipping invalid target {tgt}")
+                continue
+        
+        if not resolved_targets:
+            return
+        
+        # Display Addon Info
+        for orig_t, ip in resolved_targets:
+            addon_data_list = self.check_addon_subnet(ip)
+            if addon_data_list:
+                for _net, dev, info in addon_data_list:
+                    print(f"ℹ️  ADDON INFO for {orig_t} ({ip}): Matches {str(_net)} (Behind {dev}) [{info}]")
+
+        # Collection Phase
+        print(f"COLLECTING TRACE DATA (Max 5 parallel sessions)")
+        print("=" * 80)
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            future_to_ip = {
+                executor.submit(self.collect_trace, ip, silent=True): ip 
+                for _, ip in resolved_targets
+            }
+            
+            completed_count = 0
+            total_count = len(resolved_targets)
+            
+            for future in concurrent.futures.as_completed(future_to_ip):
+                ip = future_to_ip[future]
+                completed_count += 1
+                try:
+                    hops = future.result()
+                    print(f"[{completed_count}/{total_count}] Trace completed for {ip}")
+                    
+                    # Convert list of tuples to dict
+                    hop_map = {}
+                    for h_no, h_ip in hops:
+                        if h_ip:
+                            hop_map[h_no] = h_ip
+                            max_hop_seen = max(max_hop_seen, h_no)
+                    trace_results[ip] = hop_map
+                    
+                except Exception as exc:
+                    print(f"[{completed_count}/{total_count}] Trace failed for {ip}: {exc}")
+
+        # Analysis Phase
+        print("\n" + "=" * 80)
+        print("PATH VERIFICATION ANALYSIS")
+        print("=" * 80)
+
+        # 1. Identify Common Path Elements
+        common_ips = None
+        for ip in trace_results:
+            # distinct IPs in this trace
+            trace_unique_ips = set(trace_results[ip].values())
+            if common_ips is None:
+                common_ips = trace_unique_ips
+            else:
+                common_ips = common_ips.intersection(trace_unique_ips)
+        
+        if common_ips:
+            print("\n🔗 COMMON PATH ELEMENTS (Present in all traces):")
+            # We want to sort them roughly by hop order. A bit tricky since hop IDs vary.
+            # Heuristic: find the lowest hop ID this IP appears at in any trace.
+            ip_sort_key = {}
+            for ip in common_ips:
+                min_h = 999
+                for T_ip in trace_results:
+                    for h, val in trace_results[T_ip].items():
+                        if val == ip:
+                            min_h = min(min_h, h)
+                ip_sort_key[ip] = min_h
+                
+            for ip in sorted(common_ips, key=lambda x: ip_sort_key.get(x, 999)):
+                dev, _, _, _ = self.ip_to_device_map.get(ip, (None, None, None, None))
+                label = f"[{dev}]" if dev else ""
+                print(f"  - {ip:<15} {label}")
+            print("-" * 80)
+
+        # 2. Per-Target Analysis
+        verified_ips: Set[str] = set()
+        # Store full match details: target -> list of (hop, ip, dev_name, type)
+        match_details: Dict[str, List[Tuple[int, str, str, str]]] = {}
+        # Store all inventory/device sightings: target -> list of (hop, ip, dev_name)
+        all_inventory_sightings: Dict[str, List[Tuple[int, str, str]]] = {}
+
+        for orig_target, ip in resolved_targets:
+            hop_map = trace_results.get(ip, {})
+            matches_for_target = []
+            sightings_for_target = []
+            
+            for h in sorted(hop_map.keys()):
+                h_ip_str = hop_map[h]
+                matched_dev = None
+                m_type = ""
+
+                # 1. Inventory Check
+                dev_at_hop, _, _, _ = self.ip_to_device_map.get(h_ip_str, (None, None, None, None))
+                if dev_at_hop:
+                    sightings_for_target.append((h, h_ip_str, dev_at_hop))
+                    if dev_at_hop in monitored_devices:
+                        matched_dev = dev_at_hop
+                        m_type = "Inventory"
+
+                # 2. Manual IP Check
+                if not matched_dev and h_ip_str in manual_ips:
+                    matched_dev = "Manual IP"
+                    m_type = "Manual IP"
+                
+                # 3. Manual Subnet Check
+                if not matched_dev:
+                    try:
+                        h_ip_obj = ipaddress.ip_address(h_ip_str)
+                        for net in manual_subnets:
+                            if h_ip_obj in net:
+                                matched_dev = f"Subnet {net}"
+                                m_type = "Manual Subnet"
+                                break
+                    except ValueError:
+                        pass
+                
+                if matched_dev:
+                    verified_ips.add(h_ip_str)
+                    matches_for_target.append((h, h_ip_str, matched_dev, m_type))
+            
+            match_details[orig_target] = matches_for_target
+            all_inventory_sightings[orig_target] = sightings_for_target
+
+        self._display_comparison_grid(resolved_targets, trace_results, max_hop_seen, highlight_ips=verified_ips)
+
+        print("\nPath Verification per Target:")
+        
+        for orig_target, ip in resolved_targets:
+            print(f"\n► Target: {orig_target}")
+            
+            # A. Verification Status
+            matches = match_details.get(orig_target, [])
+            if matches:
+                print(f"  ✓ VERIFIED: Found {len(matches)} monitored hop(s):")
+                for h, ip_str, dev, mtype in matches:
+                    print(f"    - Hop {h:<2}: {dev:<20} ({ip_str})")
+            else:
+                if monitored_devices or manual_ips or manual_subnets:
+                    print(f"  ❌ FAILURE: Did NOT pass through expected devices.")
+                else:
+                    print(f"  ℹ️  No monitored devices set - skipping verification.")
+
+            # B. All Inventory Sightings
+            sightings = all_inventory_sightings.get(orig_target, [])
+            if sightings:
+                print(f"  ℹ️  Inventory Devices on path:")
+                for h, ip_str, dev in sightings:
+                    # Mark if this was one of the verified ones
+                    is_ver = " (Verified)" if any(m[1] == ip_str for m in matches) else ""
+                    print(f"    - Hop {h:<2}: {dev:<20} ({ip_str}){is_ver}")
+
+    # ───── interactive menu ──────────────────────────────────────────────────
+    def _configure_settings(self) -> None:
+        """Change max_hops / timeout_base / max_retries interactively."""
+        print("\n" + "=" * 60)
+        print("⚙️  TRACEROUTE SETTINGS")
+        print("=" * 60)
+        try:
+            new_hops = input(f"Max hops [{self.max_hops}]: ").strip()
+            if new_hops:
+                self.max_hops = max(1, min(255, int(new_hops)))
+
+            new_timeout = input(f"Hop timeout seconds [{self.timeout_base}]: ").strip()
+            if new_timeout:
+                self.timeout_base = max(1, min(30, int(new_timeout)))
+
+            new_retry = input(f"Max retries (unused) [{self.max_retries}]: ").strip()
+            if new_retry:
+                self.max_retries = max(0, min(5, int(new_retry)))
+        except ValueError:
+            print("Invalid entry – settings unchanged.")
+        print("Settings now:")
+        print(f"  max_hops = {self.max_hops}")
+        print(f"  timeout  = {self.timeout_base}s")
+        print(f"  retries  = {self.max_retries}")
+
+    def interactive_menu(self) -> None:
+        while True:
+            dns_state = "ON" if self.resolve_dns else "OFF"
+            print("\n" + "=" * 80)
+            print("🌐 ENHANCED CISCO NETWORK TRACEROUTE MAPPER")
+            print("=" * 80)
+            print("1. Display Device Inventory")
+            print("2. Trace to Single Destination")
+            print("3. Trace & Compare Multiple Destinations")
+            print("4. Troubleshooting Mode (Verify Path)")
+            print("5. Configure Traceroute Settings")
+            print(f"6. Toggle DNS Resolution (Current: {dns_state})")
+            print("7. Exit")
+            print("-" * 80)
+            choice = input("Select option (1-7): ").strip()
+
+            if choice == "1":
+                self.display_device_inventory()
+            elif choice == "2":
+                target = input("Enter IP or hostname: ").strip()
+                if target:
+                    self.trace_to_destination(target)
+            elif choice == "3":
+                targets_str = input("Enter comma-separated IPs/hostnames: ").strip()
+                if targets_str:
+                    targets = [t.strip() for t in targets_str.split(',')]
+                    self.compare_traces(targets)
+            elif choice == "4":
+                self.troubleshooting_mode()
+            elif choice == "5":
+                self._configure_settings()
+            elif choice == "6":
+                self.resolve_dns = not self.resolve_dns
+                print(f"DNS Resolution is now { 'ON' if self.resolve_dns else 'OFF' }")
+            elif choice == "7":
+                print("Good-bye!")
+                break
+            else:
+                print("Invalid selection.")
+            input("\nPress Enter to continue…")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# main()
+# ──────────────────────────────────────────────────────────────────────────────
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Cisco Network Traceroute Mapper – runs on Python 3.8"
+    )
+    parser.add_argument(
+        "targets",
+        nargs="*",
+        help="Destination IP(s) or hostname(s). If omitted the interactive menu starts.",
+    )
+    parser.add_argument(
+        "-f",
+        "--csv",
+        default="cisco_interfaces.csv",
+        help="Inventory CSV file (default: %(default)s)",
+    )
+    parser.add_argument(
+        "-c",
+        "--compare",
+        action="store_true",
+        help="Compare traceroutes to multiple targets (requires >1 targets)",
+    )
+    parser.add_argument(
+        "--resolve-dns",
+        action="store_true",
+        help="Enable DNS resolution for hops (default: False)",
+    )
+    args = parser.parse_args()
+
+    # 1. Instantiate & Load Data
+    mapper = CiscoTracerouteMapper(csv_file=args.csv)
+    if not mapper.load_csv_data():
+        sys.exit(1)
+    mapper.load_addon_subnets()
+
+    # 2. Check Arguments
+    mapper.resolve_dns = args.resolve_dns  # Apply argument
+
+    if args.targets:  # non-interactive
+
+        if args.compare and len(args.targets) > 1:
+            mapper.compare_traces(args.targets)
+        elif len(args.targets) > 1:
+            # Default behavior for multiple targets: Verification Mode
+            # Use targets as both Destinations and Manual IPs
+            destinations = args.targets
+            monitored_devices = set()
+            manual_ips = set(args.targets)
+            manual_subnets = []
+            
+            print(f"Running batch verification for {len(destinations)} targets...")
+            mapper.run_verification_batch(destinations, monitored_devices, manual_ips, manual_subnets)
+        else:
+            # Single target
+            if args.compare:
+                 print("Info: --compare requires multiple targets. Running standard trace.")
+
+            for tgt in args.targets:
+                print("\n" + "=" * 100)
+                mapper.trace_to_destination(tgt)
+    else:
+        mapper.interactive_menu()
+
+
+if __name__ == "__main__":
+    main()

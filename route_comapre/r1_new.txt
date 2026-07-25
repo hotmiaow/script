@@ -1,0 +1,20 @@
+N7K1# show ip route
+IP Route Table for VRF "default"
+'*' denotes best ucast next-hop
+'**' denotes best mcast next-hop
+'[x/y]' denotes [preference/metric]
+
+172.17.100.0/24, ubest/mbest: 1/0
+    *via 192.168.0.10, [200/0], 00:11:58, bgp-65010, internal, tag 65010
+172.17.200.0/24, ubest/mbest: 1/0
+    *via 192.168.0.10, [200/0], 00:11:58, bgp-65010, internal, tag 65010
+172.17.102.0/24, ubest/mbest: 1/0
+    *via 192.168.0.10, [200/0], 00:11:58, bgp-65010, internal, tag 65010
+172.17.103.0/24, ubest/mbest: 1/0
+    *via 192.168.0.10, [200/0], 00:11:58, bgp-65010, internal, tag 65010
+172.20.0.0/16, ubest/mbest: 1/0
+    *via 192.168.0.10, [200/0], 00:11:58, bgp-65010, internal, tag 65010
+172.21.0.0/16, ubest/mbest: 1/0
+    *via 192.168.0.10, [200/0], 00:11:58, bgp-65010, internal, tag 65010
+172.30.0.0/16, ubest/mbest: 1/0
+    *via 10.0.0.3, Eth1/27, [1/0], 00:08:34, static

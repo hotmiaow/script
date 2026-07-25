@@ -1,0 +1,13 @@
+Network Device Interface Extractor
+========================================
+Processing directory: repro
+Output file: repro/output_v1.7.csv
+
+DEBUG: auto_yes=True
+Scanning directory: /home/keith/OneDrive/script/cisco interface ip extract and use it traceroute/repro
+==================================================
+Checking files for text content...
+No text-based files found in repro
+No interface data to export
+
+Processing complete!
