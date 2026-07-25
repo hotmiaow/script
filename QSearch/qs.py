@@ -122,7 +122,31 @@ class SearchEngine:
     def __init__(self, db_path=DB_PATH):
         self.db_path = str(db_path)
         self.use_fts = True
+        self._headers_cache = {}
         self._init_db()
+        self.refresh_headers_cache()
+
+    def refresh_headers_cache(self):
+        """Loads CSV column headers into memory cache for instant 0ms lookup."""
+        try:
+            conn = self.get_connection()
+            cur = conn.cursor()
+            cur.execute("SELECT file_path, headers FROM file_meta WHERE headers IS NOT NULL;")
+            cache = {}
+            for fpath, hdrs in cur.fetchall():
+                if hdrs:
+                    try:
+                        rel_name = os.path.relpath(fpath, CONTENT_DIR) if str(fpath).startswith(str(CONTENT_DIR)) else os.path.basename(fpath)
+                        parsed = json.loads(hdrs)
+                        cache[rel_name] = parsed
+                        cache[os.path.basename(fpath)] = parsed
+                        cache[fpath] = parsed
+                    except Exception:
+                        pass
+            self._headers_cache = cache
+            conn.close()
+        except Exception:
+            pass
 
     def get_connection(self):
         """Returns a thread-safe connection to SQLite with registered fuzzy functions."""
@@ -191,7 +215,14 @@ class SearchEngine:
         conn.close()
 
     def get_file_headers(self, file_name):
-        """Retrieves column header names for a CSV file."""
+        """Retrieves column header names for a CSV file from memory cache or DB."""
+        if file_name in self._headers_cache:
+            return self._headers_cache[file_name]
+        
+        base_name = os.path.basename(file_name)
+        if base_name in self._headers_cache:
+            return self._headers_cache[base_name]
+
         conn = self.get_connection()
         cur = conn.cursor()
         cur.execute("SELECT headers FROM file_meta WHERE file_path LIKE ?;", (f"%{file_name}",))
@@ -199,7 +230,9 @@ class SearchEngine:
         conn.close()
         if row and row[0]:
             try:
-                return json.loads(row[0])
+                headers = json.loads(row[0])
+                self._headers_cache[file_name] = headers
+                return headers
             except Exception:
                 pass
         return []
@@ -224,11 +257,11 @@ class SearchEngine:
         match_type = "exact"
         words = query_str.split()
 
-        # Build SQL extension filter clause (case-insensitive)
+        # Build SQL extension filter clause without per-row scalar lower() calls
         if file_type == "csv":
-            type_clause = " AND lower(file_name) LIKE '%.csv'"
+            type_clause = " AND (file_name LIKE '%.csv' OR file_name LIKE '%.CSV')"
         elif file_type == "text":
-            type_clause = " AND lower(file_name) NOT LIKE '%.csv'"
+            type_clause = " AND NOT (file_name LIKE '%.csv' OR file_name LIKE '%.CSV')"
         else:  # 'all'
             type_clause = ""
 
@@ -577,6 +610,8 @@ if HAS_TKINTER:
             self._debounce_job = None
             self._msg_queue = queue.Queue()
             self._current_results = []
+            self._search_counter = 0
+            self._search_lock = threading.Lock()
 
             self._setup_ui()
             self._setup_indexer()
@@ -700,9 +735,15 @@ if HAS_TKINTER:
                     msg_type, data = self._msg_queue.get_nowait()
                     if msg_type == "stats":
                         self._update_stats_display(*data)
+                    elif msg_type == "search_results":
+                        results, elapsed_ms, match_type, query, counter = data
+                        with self._search_lock:
+                            is_latest = (counter == self._search_counter)
+                        if is_latest and self.search_var.get().strip() == query:
+                            self._apply_search_results(results, elapsed_ms, match_type, query)
             except queue.Empty:
                 pass
-            self.root.after(150, self._poll_queue)
+            self.root.after(50, self._poll_queue)
 
         def _update_stats_display(self, file_cnt, row_cnt, total_files=0, files_left=0, percent=100, is_indexing=False):
             filter_mode = self.filter_var.get() if hasattr(self, 'filter_var') else "CSV Files Only"
@@ -722,17 +763,20 @@ if HAS_TKINTER:
                 return
             if self._debounce_job:
                 self.root.after_cancel(self._debounce_job)
-            self._debounce_job = self.root.after(30, self._perform_search)
+            
+            # Use adaptive debounce: 180ms for 1-2 char queries to avoid heavy full scans while typing, 100ms for 3+ chars
+            q_len = len(self.search_var.get().strip())
+            delay_ms = 180 if q_len < 3 else 100
+            self._debounce_job = self.root.after(delay_ms, self._perform_search)
 
         def _perform_search(self):
             query = self.search_var.get().strip()
-            for item in self.tree.get_children():
-                self.tree.delete(item)
-
-            self.txt_detail.config(state="normal")
-            self.txt_detail.delete("1.0", tk.END)
 
             if not query:
+                for item in self.tree.get_children():
+                    self.tree.delete(item)
+                self.txt_detail.config(state="normal")
+                self.txt_detail.delete("1.0", tk.END)
                 self._current_results = []
                 self.lbl_status.config(text="Ready | Type to search...")
                 return
@@ -745,7 +789,25 @@ if HAS_TKINTER:
             else:
                 file_type = "csv"
 
-            results, elapsed_ms, match_type = self.engine.search(query, limit=300, file_type=file_type)
+            with self._search_lock:
+                self._search_counter += 1
+                current_counter = self._search_counter
+
+            self.lbl_status.config(text=f"Searching for '{query}'...")
+
+            def search_worker(q, ftype, counter):
+                results, elapsed_ms, match_type = self.engine.search(q, limit=300, file_type=ftype)
+                self._msg_queue.put(("search_results", (results, elapsed_ms, match_type, q, counter)))
+
+            threading.Thread(target=search_worker, args=(query, file_type, current_counter), daemon=True).start()
+
+        def _apply_search_results(self, results, elapsed_ms, match_type, query):
+            for item in self.tree.get_children():
+                self.tree.delete(item)
+
+            self.txt_detail.config(state="normal")
+            self.txt_detail.delete("1.0", tk.END)
+
             self._current_results = results
 
             for fname, rnum, ltext, score in results:
