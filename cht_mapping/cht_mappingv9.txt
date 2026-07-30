@@ -184,7 +184,7 @@ def main():
         for row in reader:
             cht_no = get_col_value(row, ["change number", "change_number", "cht", "cht number", "change ticket", "number", "ticket"])
             if cht_no:
-                cht_match = re.search(r'(?:CHT|CHG)-?\d{6,10}', cht_no, re.IGNORECASE)
+                cht_match = re.search(r'(?:CHT|CHG)-?\d{7,8}', cht_no, re.IGNORECASE)
                 cht_key = cht_match.group(0).upper().replace("-", "") if cht_match else cht_no.upper().replace("-", "")
                 
                 requester = get_col_value(row, ["requester", "requster", "requested_by", "requested by", "opened_by", "opened by", "author"])
@@ -213,7 +213,7 @@ def main():
     print(f"\n[INFO] Reading {policy_file.name}")
     print(f"       Encoding: {enc_policy} | Delimiter: {repr(delim_policy)}")
 
-    cht_pattern = re.compile(r'(?:CHT|CHG)-?\d{6,10}', re.IGNORECASE)
+    cht_pattern = re.compile(r'(?:CHT|CHG)-?\d{7,8}', re.IGNORECASE)
 
     policy_name_aliases = ["policy name", "policy_name", "policy", "security policy", "device name", "device", "package", "binding", "firewall", "management"]
     rule_id_aliases = ["securetrack rule id", "rule id", "rule_id", "securetrack_rule_id", "rule number", "rule_number", "rule #", "rule#", "id", "#", "no.", "number"]
@@ -253,19 +253,10 @@ def main():
             comment = get_col_value(row, comment_aliases)
 
             cleaned_r_name = clean_rule_name(rule_name)
+            search_text = comment if comment else " ".join(str(v) for v in row.values() if v)
 
-            # 1. Primary search: extract CHT/CHG tickets from comment
-            cht_matches = cht_pattern.findall(comment) if comment else []
-
-            # 2. Fallback search: if comment has no CHT tickets, extract from rule_name!
-            if not cht_matches and rule_name:
-                cht_matches = cht_pattern.findall(rule_name)
-
-            # 3. Last fallback: search full row text if still empty
-            if not cht_matches:
-                search_text = " ".join(str(v) for v in row.values() if v)
-                cht_matches = cht_pattern.findall(search_text)
-
+            cht_matches = cht_pattern.findall(search_text)
+            
             selected_cht = ""
             requester = ""
             requester_group = ""
@@ -322,7 +313,7 @@ def main():
             })
 
     # ----------------------------------------------------
-    # Step 4: Write result.csv (with interactive retry on file lock)
+    # Step 4: Write result.csv
     # ----------------------------------------------------
     fieldnames = [
         "Policy Name",
@@ -338,22 +329,12 @@ def main():
         "Short Description"
     ]
 
-    while True:
-        try:
-            with open(result_file, mode="w", newline="", encoding="utf-8") as f:
-                writer = csv.DictWriter(f, fieldnames=fieldnames)
-                writer.writeheader()
-                writer.writerows(output_rows)
-            break  # File written successfully
-        except (PermissionError, OSError) as e:
-            print(f"\n[ERROR] Unable to write to '{result_file.name}': {e}")
-            print(f"        The file may be open in Excel or locked by another application.")
-            user_input = input("\n--> Please CLOSE 'result.csv' and press Enter to try again (or type 'q' to cancel): ").strip().lower()
-            if user_input == 'q':
-                print("\n[CANCELLED] Saving result.csv was cancelled by user.")
-                return
+    with open(result_file, mode="w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(output_rows)
 
-    print("\n" + "=" * 75)
+    print("=" * 75)
     print(" SUMMARY RESULTS")
     print("=" * 75)
     print(f" Total policy rows processed: {total_policy_rows}")

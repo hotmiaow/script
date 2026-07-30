@@ -184,7 +184,7 @@ def main():
         for row in reader:
             cht_no = get_col_value(row, ["change number", "change_number", "cht", "cht number", "change ticket", "number", "ticket"])
             if cht_no:
-                cht_match = re.search(r'(?:CHT|CHG)-?\d{6,10}', cht_no, re.IGNORECASE)
+                cht_match = re.search(r'(?:CHT|CHG)-?\d{7,8}', cht_no, re.IGNORECASE)
                 cht_key = cht_match.group(0).upper().replace("-", "") if cht_match else cht_no.upper().replace("-", "")
                 
                 requester = get_col_value(row, ["requester", "requster", "requested_by", "requested by", "opened_by", "opened by", "author"])
@@ -207,13 +207,13 @@ def main():
     print(f"       Loaded {len(change_lookup)} change records.")
 
     # ----------------------------------------------------
-    # Step 3: Process policy.csv (keep ALL rows)
+    # Step 3: Process policy.csv
     # ----------------------------------------------------
     enc_policy, delim_policy = detect_delimiter_and_encoding(policy_file)
     print(f"\n[INFO] Reading {policy_file.name}")
     print(f"       Encoding: {enc_policy} | Delimiter: {repr(delim_policy)}")
 
-    cht_pattern = re.compile(r'(?:CHT|CHG)-?\d{6,10}', re.IGNORECASE)
+    cht_pattern = re.compile(r'(?:CHT|CHG)-?\d{7,8}', re.IGNORECASE)
 
     policy_name_aliases = ["policy name", "policy_name", "policy", "security policy", "device name", "device", "package", "binding", "firewall", "management"]
     rule_id_aliases = ["securetrack rule id", "rule id", "rule_id", "securetrack_rule_id", "rule number", "rule_number", "rule #", "rule#", "id", "#", "no.", "number"]
@@ -253,27 +253,10 @@ def main():
             comment = get_col_value(row, comment_aliases)
 
             cleaned_r_name = clean_rule_name(rule_name)
+            search_text = comment if comment else " ".join(str(v) for v in row.values() if v)
 
-            # 1. Primary search: extract CHT/CHG tickets from comment
-            cht_matches = cht_pattern.findall(comment) if comment else []
-
-            # 2. Fallback search: if comment has no CHT tickets, extract from rule_name!
-            if not cht_matches and rule_name:
-                cht_matches = cht_pattern.findall(rule_name)
-
-            # 3. Last fallback: search full row text if still empty
-            if not cht_matches:
-                search_text = " ".join(str(v) for v in row.values() if v)
-                cht_matches = cht_pattern.findall(search_text)
-
-            selected_cht = ""
-            requester = ""
-            requester_group = ""
-            mapped_group_dl = ""
-            extracted_dl = ""
-            short_desc = ""
-            final_email_dl = ""
-
+            cht_matches = cht_pattern.findall(search_text)
+            
             if cht_matches:
                 unique_chts = []
                 seen = set()
@@ -284,45 +267,47 @@ def main():
                         unique_chts.append(cht_formatted)
 
                 # Reverse lookup: Check from LAST to FIRST change ticket
-                candidate_cht = None
+                selected_cht = None
                 selected_change_info = None
 
                 for cht_candidate in reversed(unique_chts):
                     info = change_lookup.get(cht_candidate)
                     if info and info.get("requester"):
-                        candidate_cht = cht_candidate
+                        selected_cht = cht_candidate
                         selected_change_info = info
                         break
 
-                if not candidate_cht:
-                    candidate_cht = unique_chts[-1]
-                    selected_change_info = change_lookup.get(candidate_cht, {})
+                # If none had requester info in change.csv, fallback to the LAST change ticket
+                if not selected_cht:
+                    selected_cht = unique_chts[-1]
+                    selected_change_info = change_lookup.get(selected_cht, {})
 
                 extracted_cht_count += 1
-                selected_cht = candidate_cht
+
                 requester = selected_change_info.get("requester", "")
                 requester_group = selected_change_info.get("requester_group", "")
                 mapped_group_dl = selected_change_info.get("mapped_group_dl", "")
                 extracted_dl = selected_change_info.get("extracted_dl", "")
                 short_desc = selected_change_info.get("short_description", "")
+
                 final_email_dl = extracted_dl.strip() if extracted_dl.strip() else mapped_group_dl.strip()
 
-            output_rows.append({
-                "Policy Name": policy_name,
-                "SecureTrack Rule ID": rule_id,
-                "Rule Name": rule_name,
-                "Cleaned Rule Name": cleaned_r_name,
-                "Change Number": selected_cht,
-                "Requester": requester,
-                "Requester Group": requester_group,
-                "Mapped Group DL": mapped_group_dl,
-                "Extracted Email DL": extracted_dl,
-                "Combined Email DL": final_email_dl,
-                "Short Description": short_desc
-            })
+                output_rows.append({
+                    "Policy Name": policy_name,
+                    "SecureTrack Rule ID": rule_id,
+                    "Rule Name": rule_name,
+                    "Cleaned Rule Name": cleaned_r_name,
+                    "Change Number": selected_cht,
+                    "Requester": requester,
+                    "Requester Group": requester_group,
+                    "Mapped Group DL": mapped_group_dl,
+                    "Extracted Email DL": extracted_dl,
+                    "Combined Email DL": final_email_dl,
+                    "Short Description": short_desc
+                })
 
     # ----------------------------------------------------
-    # Step 4: Write result.csv (with interactive retry on file lock)
+    # Step 4: Write result.csv
     # ----------------------------------------------------
     fieldnames = [
         "Policy Name",
@@ -338,27 +323,17 @@ def main():
         "Short Description"
     ]
 
-    while True:
-        try:
-            with open(result_file, mode="w", newline="", encoding="utf-8") as f:
-                writer = csv.DictWriter(f, fieldnames=fieldnames)
-                writer.writeheader()
-                writer.writerows(output_rows)
-            break  # File written successfully
-        except (PermissionError, OSError) as e:
-            print(f"\n[ERROR] Unable to write to '{result_file.name}': {e}")
-            print(f"        The file may be open in Excel or locked by another application.")
-            user_input = input("\n--> Please CLOSE 'result.csv' and press Enter to try again (or type 'q' to cancel): ").strip().lower()
-            if user_input == 'q':
-                print("\n[CANCELLED] Saving result.csv was cancelled by user.")
-                return
+    with open(result_file, mode="w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(output_rows)
 
-    print("\n" + "=" * 75)
+    print("=" * 75)
     print(" SUMMARY RESULTS")
     print("=" * 75)
     print(f" Total policy rows processed: {total_policy_rows}")
-    print(f" Policy rows with CHT extracted: {extracted_cht_count}")
-    print(f" Output saved to: {result_file.name} (Total output rows: {len(output_rows)})")
+    print(f" Total CHT numbers extracted: {extracted_cht_count}")
+    print(f" Output saved to: {result_file.name} ({len(output_rows)} rows)")
     print("=" * 75)
 
 if __name__ == "__main__":
