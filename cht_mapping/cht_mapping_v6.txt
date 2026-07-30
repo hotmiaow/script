@@ -111,6 +111,7 @@ def clean_rule_name(rule_name):
     rule_str = str(rule_name).strip()
     
     # Match CHG or CHT + digits + optional suffixes (e.g. _CHG12345678, _CHG12345678_1, -CHT-999999)
+    # Note: Avoid \b because \b treats '_' as a word character!
     ticket_pattern = re.compile(r'[-_\s]*(?:CHG|CHT)-?\d+(?:[-_]\d+)*[-_\s]*', re.IGNORECASE)
     
     cleaned = ticket_pattern.sub("", rule_str).strip(" -_")
@@ -258,53 +259,32 @@ def main():
             cht_matches = cht_pattern.findall(search_text)
             
             if cht_matches:
-                unique_chts = []
-                seen = set()
+                seen_chts = set()
                 for cht in cht_matches:
                     cht_formatted = cht.upper().replace("-", "")
-                    if cht_formatted not in seen:
-                        seen.add(cht_formatted)
-                        unique_chts.append(cht_formatted)
+                    if cht_formatted not in seen_chts:
+                        seen_chts.add(cht_formatted)
+                        extracted_cht_count += 1
 
-                # Reverse lookup: Check from LAST to FIRST change ticket
-                selected_cht = None
-                selected_change_info = None
+                        change_info = change_lookup.get(cht_formatted, {})
+                        requester = change_info.get("requester", "")
+                        requester_group = change_info.get("requester_group", "")
+                        mapped_group_dl = change_info.get("mapped_group_dl", "")
+                        extracted_dl = change_info.get("extracted_dl", "")
+                        short_desc = change_info.get("short_description", "")
 
-                for cht_candidate in reversed(unique_chts):
-                    info = change_lookup.get(cht_candidate)
-                    if info and info.get("requester"):
-                        selected_cht = cht_candidate
-                        selected_change_info = info
-                        break
-
-                # If none had requester info in change.csv, fallback to the LAST change ticket
-                if not selected_cht:
-                    selected_cht = unique_chts[-1]
-                    selected_change_info = change_lookup.get(selected_cht, {})
-
-                extracted_cht_count += 1
-
-                requester = selected_change_info.get("requester", "")
-                requester_group = selected_change_info.get("requester_group", "")
-                mapped_group_dl = selected_change_info.get("mapped_group_dl", "")
-                extracted_dl = selected_change_info.get("extracted_dl", "")
-                short_desc = selected_change_info.get("short_description", "")
-
-                final_email_dl = extracted_dl.strip() if extracted_dl.strip() else mapped_group_dl.strip()
-
-                output_rows.append({
-                    "Policy Name": policy_name,
-                    "SecureTrack Rule ID": rule_id,
-                    "Rule Name": rule_name,
-                    "Cleaned Rule Name": cleaned_r_name,
-                    "Change Number": selected_cht,
-                    "Requester": requester,
-                    "Requester Group": requester_group,
-                    "Mapped Group DL": mapped_group_dl,
-                    "Extracted Email DL": extracted_dl,
-                    "Combined Email DL": final_email_dl,
-                    "Short Description": short_desc
-                })
+                        output_rows.append({
+                            "Policy Name": policy_name,
+                            "SecureTrack Rule ID": rule_id,
+                            "Rule Name": rule_name,
+                            "Cleaned Rule Name": cleaned_r_name,
+                            "Change Number": cht_formatted,
+                            "Requester": requester,
+                            "Requester Group": requester_group,
+                            "Mapped Group DL": mapped_group_dl,
+                            "Extracted Email DL": extracted_dl,
+                            "Short Description": short_desc
+                        })
 
     # ----------------------------------------------------
     # Step 4: Write result.csv
@@ -319,7 +299,6 @@ def main():
         "Requester Group",
         "Mapped Group DL",
         "Extracted Email DL",
-        "Combined Email DL",
         "Short Description"
     ]
 
