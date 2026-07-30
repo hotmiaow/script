@@ -19,6 +19,7 @@
 - 顶部中文标题默认左对齐并处在左上内容轴;不要把标题放到页面中间。
 - 不允许临时发明原始 22P 之外的正文结构。本文档末尾的 P23/P24 属于历史实验区,默认禁用。
 - 需要单张大图时使用 `S22 Image Hero`;需要多图时用 `S15/S16` 的原始矩阵/小报骨架改造成图片格。
+- 地点、路线、人物住所、城市关系页使用 `S08 + Swiss Map Component`;这仍然是 S08 的右侧插槽扩展,不是新正文页。先读 `swiss-map-component.md`。
 - SVG 只画几何,不写可见文字。标签放 HTML 里。
 - 生成完成后运行 `node scripts/validate-swiss-deck.mjs index.html`。
 
@@ -51,6 +52,32 @@
 | 3 行或更长标题 | 改写标题;实在不能改时用 `min(4.6vw,8.2vh)` |
 
 规则:中文标题优先改短,其次降字号;不要让标题挤占下方图文区域。英文、数字型 hero 可以更大,中文方法论页必须更克制。
+
+**演示最小字号与字重阶梯**
+瑞士风不是网页说明页,投屏时不能出现 10-12px 的注释字。默认下限:
+
+| 文本类型 | 最小字号 |
+|---|---|
+| 正文段落 / 主要说明 | `18px` |
+| 卡片描述 / 列表 / 时间线说明 / caption / 图注 | `16px` |
+| meta / kicker / mono label / 图表标签 | `14px` |
+
+内容过多时,先压缩文案、拆页或更换 Sxx 版式;禁止靠降低小字字号解决拥挤。图注、时间线说明、KPI 注释、底部 note 尤其要守住这个下限。
+
+**字号与字重阶梯(瑞士风核心)** — "越大越细,越小越粗"不是感性描述:
+
+| 字号区间 | 推荐字重 | 典型场景 |
+|---|---|---|
+| ≥ 8vw | 200 (ExtraLight) | 封面大字、巨号 KPI、h-statement |
+| 4-7.9vw | 200-300 | 章节标题(h-xl/h-xl-zh)、大编号 |
+| 1.8-3.9vw | 300-400 | 中型标题、takeaway 标题(≈1.8vw)、中号数字 |
+| 1-1.7vw / 16-20px | 400-500 | 正文段落、卡片描述、说明文字 |
+| 13-15px(小字) | 500-600 | meta、kicker、角标、图表标签、caption 强调 |
+
+**硬规则:**
+- 同一页内,字号越小的元素字重必须 ≥ 字号越大的元素(不允许 16px 正文用 300 而 1.8vw 标题用 500)
+- 16px 左右的小字拒绝使用 weight 300(太细不可读),最低 400,推荐 500
+- 封面/IKB 反白大标题内强调字用 `italic + weight 300`,不要用 accent 色(蓝压蓝看不见)
 
 **网格**(IBM Carbon 2x Grid 改造)
 - 16 列 grid:`grid-template-columns:repeat(16,1fr)` + `gap:16px`
@@ -207,6 +234,7 @@ Swiss 主题有 22 个登记版式,生成时要主动展示版式系统,不要�
 | 发丝线 / border-bottom | 可选;只能用于建立层级,不能为了装饰堆线 |
 | KPI / 数字 | 只在有真实数据时使用;不要为概念解释编造数值 |
 | `footnote` / 底部说明 | 可选;如果使用,必须避开 nav 安全区 |
+| `S08 + Swiss Map Component` | 地点/路线/人物住所关系专用;右侧地图必须有点、连线、卡片和 `+` / `-` / `DRAG` 控制,详见 `swiss-map-component.md` |
 
 ### 通用版式 / 非通用版式
 
@@ -774,7 +802,7 @@ Swiss 主题有 22 个登记版式,生成时要主动展示版式系统,不要�
 - 同组图片必须同一比例、同一高度、同一边距密度;不要一张 16:9、一张 4:3、一张长条截图混排
 - 标题区和图片区之间必须有明显缓冲;模板里的 `.swiss-img-grid` 默认带顶部间距,只有在外层 grid 已经给足 gap 时才加 `.tight`
 - UI/信息图统一 `.fit-contain`;照片统一 cover
-- 如果用户原始截图比例混乱,先用 GPT-M 2.0 重生成同一比例的"截图再设计"
+- 如果用户原始截图比例混乱,先按 `screenshot-framing.md` 做 CleanShot X 式程序化适配;只有太长、太窄或需要重构信息时,才用 GPT-M 2.0 重生成同一比例的"截图再设计"
 
 ```html
 <section class="slide light" data-animate="grid-reveal">
@@ -825,6 +853,7 @@ Swiss 主题有 22 个登记版式,生成时要主动展示版式系统,不要�
 | 4-6 行账单式 KPI | P20 Stacked Ledger |
 | 产品规格 / benchmark | P21 Tech Spec |
 | 案例图 + 数据落地 | P22 Image Hero |
+| 地点 / 路线 / 人物住所关系 | S08 + Swiss Map Component |
 | 单图解释论点 / 图文混排 | P23 Swiss Image Split |
 | 2-3 张图片/截图/图表证据链 | P24 Swiss Evidence Grid |
 
@@ -842,6 +871,7 @@ Swiss 主题有 22 个登记版式,生成时要主动展示版式系统,不要�
 | 6 项对等 | P4 Six Cells / P16 Brief | 不能强凑成 4 用 P19 |
 | 3 项对等 | P5 Sub-cards / P13 Three Forces | |
 | Before/After | P8 Duo Compare(必须正好 2 项) | |
+| 地点/路线/城市关系 | S08 + Swiss Map Component | 普通 S04/S16 卡片罗列 |
 | 闭环结构 | P14 Loop Diagram | P11 横向流程(线性 ≠ 闭环) |
 | 三层嵌套 | P17 System Diagram | |
 | 时间演化(有数据) | P2 Vertical Timeline | |

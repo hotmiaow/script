@@ -40,6 +40,48 @@ node <SKILL_ROOT>/scripts/validate-swiss-deck.mjs path/to/index.html
 - 不要把小标题放左列、大标题放右侧大列,这会导致标题视觉居中。
 - 如果需要标题 + 说明两列,必须复制原始 `S11` 或 `S17` 的骨架,不要自写 `4fr 8fr`。
 
+### 0-S-3. Swiss 地图页必须用 S08 Map Component
+
+**现象**:地点/历史内容只画了简易 SVG 地图,没有真实点位、关系卡片、缩放/拖动控制,或滚轮触发了 PPT 翻页。
+
+**做法**:
+- 使用 `data-layout="S08"`。
+- 先读 `references/swiss-map-component.md`。
+- 右侧地图组件必须包含 marker 点、连接线、地点卡片、`+` / `-` / `DRAG` 控制。
+- 默认禁用 scroll zoom 和 drag pan;用户点击 `DRAG` 后才允许拖动。
+- 必须保留静态 fallback,地图 CDN 或瓦片失败时仍可读。
+
+**检查**:
+- `grep -n "data-map-ctrl" index.html`
+- `grep -n "maplibregl.Map" index.html`
+- 浏览器实测 `+` 可放大,`DRAG` 可切换为 `DRAG ON`
+
+### 0-S-4. Swiss 演示字号不能小到看不清 + 字重阶梯必须遵守
+
+**现象**:瑞士风页面整体结构没问题,但图注、说明、时间线、KPI note、卡片小字在投屏时看不清;或者 16px 小字用了 weight 300 导致又小又细。
+
+**做法(字号下限)**:
+- 正文段落 / 主要说明 ≥ `18px`
+- 卡片描述 / 列表 / 时间线说明 / caption / 图注 ≥ `16px`
+- meta / kicker / mono label / 图表标签 ≥ `14px`
+- 内容超出时,先删减文案、拆页或换 Sxx 版式,不要用 10/11/12/13px 小字硬塞。
+
+**做法(字重阶梯 ⭐)**:
+瑞士风坚持"越大越细,越小越粗",字号与字重必须成反比阶梯:
+- ≥ 8vw → weight **200**(ExtraLight)
+- 4-7.9vw → weight **200-300**
+- 1.8-3.9vw → weight **300-400**
+- 1-1.7vw / 16-20px → weight **400-500**
+- 13-15px → weight **500-600**
+- 同一页内,字号小的元素字重必须 ≥ 字号大的元素。
+- **16px 左右小字禁止使用 weight 300**(太细不可读),最低 400,推荐 500。
+- 封面/IKB 反白大标题内强调字用 `italic + weight 300`,不要用 accent 色。
+
+**检查**:
+- `rg -n "font-size:(10px|11px|12px|13px)|max\\((9|10|11|12|13)px" index.html`
+- `rg -n "font-weight:(300)" index.html | rg -v "min\(|h-xl|h-hero|h-statement|num-mega|kpi-thin|name-mega|8vw|9vw|1[1-9]vw|cover-|\.multi"` —— 检查 weight 300 是否落在了小字号上
+- 浏览器以 100% 缩放查看,底部 note、caption、timeline label、卡片描述仍能一眼读清。
+
 ### 0-A. 瑞士风画布对齐法则(每一页必查 · 最常踩)
 
 **现象**:页眉 chrome-min 和底部 footer 都靠在 5vw 的边线上,但中间区域往内缩了一截,左右对不齐。
@@ -138,12 +180,15 @@ node <SKILL_ROOT>/scripts/validate-swiss-deck.mjs path/to/index.html
 - 图片容器只用 `.frame-img`;**不要** `border-radius` / `box-shadow`
 - UI / 信息图 / 流程图若是用户原始截图或文字密集图,使用 `.fit-contain`;若已按槽位重生成,必须用对应比例类铺满容器,例如 `.frame-img.r-21x9`,不能再用固定短高度把图片缩小
 - 多图同组必须统一槽位、比例、高度,不要混用
+- 用户原始截图要先读 `references/screenshot-framing.md`:优先用 `assets/screenshot-backgrounds/` 内置主题背景 + 程序化缩放/留边/对齐,不要为了比例统一就重画截图内容
+- 截图背景必须跟随当前主题色,且可裁成 `21:9` / `16:10` / `4:3` / `1:1`;背景里不能有标题、页脚、边框、logo、人物或明显主体
 - GPT-M 2.0 提示词必须写明:Swiss Style、单一 accent、直角、无渐变/阴影/圆角、无页眉页脚标题角标
 
 **自检命令**:
 - `grep -E "frame-img.*border-radius|box-shadow" index.html`——命中就删
 - `grep -n "data-image-slot" index.html`——每张本地图片都应有槽位声明
 - 目视:图片内部如果自带大标题、页码、页脚、角标,优先重生成,不要在页面里再裁切硬救
+- 目视:截图外侧背景应该是安静托底,不能比截图本身更抢眼;Swiss 风截图不得出现圆角和投影
 
 ### 0-D-2. 瑞士风底部分页安全区:最低处不要碰 nav
 
@@ -153,7 +198,7 @@ node <SKILL_ROOT>/scripts/validate-swiss-deck.mjs path/to/index.html
 
 **做法**:
 - 主内容最低边缘与分页组件之间至少留 `3vh` 呼吸空间
-- P23 需要底部对齐时用 `.swiss-img-split.align-image-bottom`,模板已内置 `--nav-safe-bottom:8vh`
+- 图文页需要底部对齐时,先控制图片高度,再给主体容器加 `.nav-safe-bottom` / `.nav-safe-bottom-tight`
 - 其他页面需要贴底时,给主体容器加 `.nav-safe-bottom` 或 `.nav-safe-bottom-tight`
 - 不要手写 `bottom:2vh` / `bottom:0` 放说明文字;这会和 nav 抢位置
 
@@ -431,9 +476,9 @@ Dark hero 可以用 Holographic Dispersion（钛金色散）等带中心结构�
 
 ### 13e. Swiss 图文混排不能只用一种
 
-- 7-8 页 Swiss 测试 deck 至少使用 6 个不同 P 编号版式
-- 有 2-3 张配图时,至少使用两种图片承载方式:P22 主视觉 / P23 单图解释 / P24 证据墙 / P15 矩阵 / P16 小报
-- P23 默认底对齐:文字块和图片底部对齐,不要因为担心 nav 就退回顶部对齐;先控制图片高度
+- 7-8 页 Swiss 测试 deck 至少使用 6 个不同 S 编号版式
+- 有 2-3 张配图时,至少使用两种图片承载方式:S22 主视觉 / S15 矩阵 / S16 小报 / S08 对照图文 / S19 四卡证据
+- 左文右图或右文左图需要底对齐时,先控制图片高度和主体安全区,不要把整块内容推到分页组件附近
 - 白底信息图容器必须白底、无描边;不要用灰框包白图
 
 ### 13f. Swiss 中文大标题要降级

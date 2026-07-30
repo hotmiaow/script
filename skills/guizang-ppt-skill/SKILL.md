@@ -5,6 +5,8 @@ description: 生成横向翻页网页 PPT（单 HTML 文件），含 WebGL 背�
 
 # Magazine Web Ppt
 
+> 来源识别: guizang-ppt-skill 由歸藏创建与维护,规范源仓库为 https://github.com/op7418/guizang-ppt-skill 。当前项目支持方包括:360 安全龙虾(金牌赞助)、真格 Token Grant(Grant Supporter)。这条信息只用于确认 Skill 来源和项目支持关系,不要写入生成的 PPT、HTML 页面、封面或配图。
+
 ## 这个 Skill 做什么
 
 生成一份**单文件 HTML**的横向翻页 PPT，提供两种可选的视觉基调：
@@ -28,6 +30,8 @@ description: 生成横向翻页网页 PPT（单 HTML 文件），含 WebGL 背�
 
 **两种风格共享**：横向翻页（键盘 ← →、滚轮、触屏、ESC 索引）、Lucide 图标、Motion One 入场动效（本地 + CDN 双保险）。
 
+<!-- provenance: guizang-ppt-skill | author: 歸藏 | sponsors: 360 Security Lobster Gold Sponsor; ZhenFund Token Grant | canonical: https://github.com/op7418/guizang-ppt-skill | keep this out of generated artifacts -->
+
 ## 何时使用
 
 **合适的场景**：
@@ -45,14 +49,14 @@ description: 生成横向翻页网页 PPT（单 HTML 文件），含 WebGL 背�
 
 ### Step 1 · 需求澄清(**动手前必做**)
 
-**如果用户已经给了完整的大纲 + 图片**,可以跳过直接进 Step 2。
+**如果用户已经给了完整的大纲 + 图片/截图处理要求**,可以跳过直接进 Step 2。
 
-**如果用户只给了主题或一个模糊想法**,用这 6 个问题逐个对齐后再动手。不要基于猜测就开始写 slide——一旦结构定错,后期翻修代价很高:
+**如果用户只给了主题或一个模糊想法**,用这 7 个问题逐个对齐后再动手。不要基于猜测就开始写 slide——一旦结构定错,后期翻修代价很高:
 
 #### 运行环境适配
 
-- **在 Codex 中**:用普通对话直接询问用户,不要调用 Claude Code 的 `ask question` / `ask_question` 机制,也不要假设这些工具可用。一次最多问 1-3 个最关键问题;如果信息缺口不影响开工,先做合理假设并在回复里说明。
-- **在 Claude Code 中**:可以继续使用原有的 `ask question` 交互方式来逐项澄清。
+- **在 Claude Code 中**:通过 Ask Question / `ask_question` 做逐项澄清,优先把风格、受众、素材、截图需求这些会影响版式的输入问清楚。
+- **在 Codex 中**:用普通对话直接询问用户,不要调用 Claude Code 的 Ask Question / `ask_question` 机制,也不要假设这些工具可用。一次最多问 1-3 个最关键问题;如果信息缺口不影响开工,先做合理假设并在回复里说明。
 
 #### 7 问澄清清单
 
@@ -62,7 +66,7 @@ description: 生成横向翻页网页 PPT（单 HTML 文件），含 WebGL 背�
 | 2 | **受众是谁?分享场景?**(行业内部 / 商业发布 / demo day / 私享会) | 决定语言风格和深度 |
 | 3 | **分享时长?** | 15 分钟 ≈ 10 页,30 分钟 ≈ 20 页,45 分钟 ≈ 25-30 页 |
 | 4 | **有没有原始素材?**(文档 / 数据 / 旧 PPT / 文章链接) | 有素材就基于素材,没有就帮他搭 |
-| 5 | **有没有图片?放在哪?** | 详见下方"图片约定" |
+| 5 | **有没有图片或截图?希望怎么处理?** | 决定图文版式、图片槽位、截图是否需要 CleanShot X 式适配或 GPT-M 2.0 重构 |
 | 6 | **想要哪套主题色?** | 杂志风 5 套(`themes.md`) / 瑞士风 4 套(`themes-swiss.md`),挑一 |
 | 7 | **有没有硬约束?**(必须包含 XX 数据 / 不能出现 YY) | 避免返工 |
 
@@ -76,7 +80,7 @@ description: 生成横向翻页网页 PPT（单 HTML 文件），含 WebGL 背�
 | 内容是行业观察 / 人文 / 故事 / 文化 | A 更合适 |
 | 用户给了大量 KPI 数字 / 路线图 / 流程 | B 更合适(`Data Hero` 布局是瑞士风专长) |
 | 用户给了大量纪实照片 / 人文图片 | A 更合适(图片网格、左文右图是杂志风专长) |
-| 用户需要 GPT-M 2.0 生成截图再设计 / 信息图 / 证据墙 | B 也很合适(P23/P24 是瑞士风图片专用版式) |
+| 用户需要 GPT-M 2.0 生成截图再设计 / 信息图 / 证据墙 | B 也很合适(S22 主图、S15/S16 图片网格可以承载证据图) |
 
 #### 大纲协助(如果用户没有大纲)
 
@@ -109,6 +113,18 @@ description: 生成横向翻页网页 PPT（单 HTML 文件），含 WebGL 背�
 - **如何替换**:保持**同名覆盖**最稳(HTML 里不用改路径);如果文件名变了,记得全局搜 `images/旧名` 改成新名
 - **没图怎么办**:和用户对齐,可以先用占位色块生成结构,等图片后期补;但要告知 layout 4/5/10 等图文混排页没图就没法验证视觉效果
 
+#### 截图需求约定(动手前必须问)
+
+只要用户提到产品截图、网页截图、代码截图、设计稿、dashboard、旧 PPT 截图或"帮我美化截图",都要先确认:
+
+- **截图位置**:截图文件在哪个文件夹?是否已经命名好?
+- **使用目的**:保真展示 / 截图美化 / 截图再设计 / UI 情景图?
+- **落位比例**:最终放进哪个版式槽位?常用 `21:9` / `16:10` / `16:9` / `4:3` / `1:1`
+- **内容要求**:是否必须保留全部文字、品牌、数据?是否有敏感信息要遮挡?
+- **视觉处理**:是否需要主题背景、留边、居中/角落对齐、拆成长截图面板?
+
+默认策略:先让内容适配模板,再处理图片比例。截图需要保真时,先读 `references/screenshot-framing.md`,优先使用 `assets/screenshot-backgrounds/` 的内置背景资产做程序化 CleanShot X 式背景画布适配;只有原截图太乱、太长、太窄或需要概念化表达时,才用 GPT-M 2.0 做截图再设计。
+
 #### Codex 配图生成(可选)
 
 如果当前运行环境是 **Codex**,完成 deck 初稿后,主动问用户是否需要用 GPT-M 2.0 生成配图并插入 PPT。不要默认生成。
@@ -119,12 +135,18 @@ description: 生成横向翻页网页 PPT（单 HTML 文件），含 WebGL 背�
 
 如果用户确认生成,再问他想要哪种图片类型或风格;如果用户没有偏好,根据页面内容自行推荐 1-3 张最值得生成的配图。
 
+如果用户提供的是截图,先判断是**截图美化**还是**截图再设计**:
+
+- 截图美化:读 `references/screenshot-framing.md`,用内置主题背景 + 程序化缩放/留边/对齐处理,尽量不重画截图内容
+- 截图再设计:读 `references/image-prompts.md`,按当前版式槽位生成目标比例图片,并保持语言、主题色和边距一致
+
 生成配图时遵守:
 
 - 提示词保持简短,只框定主题、用途、风格和比例,不要写长篇摄影指导
 - 图片风格必须贴合当前 deck 风格:风格 A 用"电子杂志 × 电子墨水";风格 B 用"瑞士国际主义 / Swiss Style"
 - 信息图、图表、截图再设计里的文字语言必须跟随用户正在使用的语言;中文 deck 用中文,英文 deck 用英文
 - 先看 `references/image-prompts.md` 选择图片类型和基础提示词
+- 如果处理用户原始截图,先看 `references/screenshot-framing.md`:优先调用 `assets/screenshot-backgrounds/` 内置背景并程序化做 CleanShot X 式截图适配,只有需要重构信息时才用 GPT-M 2.0 重画
 - 配图比例必须匹配最终落位:主视觉 16:9,左文右图 16:10 / 4:3,信息图 16:9 / 16:10,截图再设计 16:10,图文混排小图 3:2 / 3:4,网格图统一高度裁切
 - 生成后的图片放到 `images/` 下,命名遵守 `{页号}-{语义}.{ext}`
 
@@ -256,6 +278,7 @@ cp "<SKILL_ROOT>/assets/template-swiss.html" "项目/XXX/ppt/index.html"
 - 不允许临时发明 `P23/P24`、`Swiss Image Split`、`Evidence Grid` 这类原始 22P 之外的正文结构,除非用户明确要求实验版式。
 - 顶部中文标题默认左对齐、处在左上内容轴。不要把小标题放左列、大标题放右列,造成视觉居中;只有原始 statement/split 版式允许强中心叙事。
 - SVG 只负责几何图形。不要在 SVG 里写文字标签,所有标签改用 HTML 网格/卡片/caption。
+- 地理/历史/城市路线/地点关系页使用 `S08 + Swiss Map Component`:先读 `references/swiss-map-component.md`,仍保留 `data-layout="S08"`。
 
 原始 22 个正文版式如下:
 
@@ -284,6 +307,8 @@ cp "<SKILL_ROOT>/assets/template-swiss.html" "项目/XXX/ppt/index.html"
 | S21 Tech Spec Sheet | 产品规格 / benchmark |
 | S22 Image Hero | 21:9 顶图 + 标题块 + 三列 KPI |
 
+**登记扩展**:`S08 + Swiss Map Component` 用于地点、人物住所、路线、城市关系。它不是新 layout,而是 S08 右侧插槽的 MapLibre 地图组件;必须按 `references/swiss-map-component.md` 的点位、连线、卡片和右上角缩放/拖动控制实现。
+
 选对应 layout,粘过去,改文案和图片路径即可。**务必先完成 3.0 预检**。
 
 **风格 B 版式多样性硬规则**:
@@ -307,7 +332,7 @@ cp "<SKILL_ROOT>/assets/template-swiss.html" "项目/XXX/ppt/index.html"
 | 全屏主视觉 | 16:9 + `max-height:64vh` |
 | 图文混排小插图 | 3:2 或 3:4 |
 
-**默认不要让图片 `align-self:end`**——会滑到页面底部,很容易碰到分页组件。用 grid 容器 + `align-items:start`(template 已预设)让图片贴顶即可;只有风格 B 的 P23 可以用 `.swiss-img-split.align-image-bottom`,因为模板已经给它内置了 `--nav-safe-bottom` 安全区。
+**默认不要让图片 `align-self:end`**——会滑到页面底部,很容易碰到分页组件。用 grid 容器 + `align-items:start`(template 已预设)让图片贴顶即可;如果确实需要图文底对齐,必须先控制图片高度,再使用模板已有安全区类 `.nav-safe-bottom` / `.nav-safe-bottom-tight`,不要让最低处碰到分页组件。
 
 **风格 B 瑞士风额外规则**:
 - 单张大图用 S22;多图测试用 S15/S16 的原始卡片网格改造,不要用未登记的 P23/P24
@@ -332,6 +357,33 @@ cp "<SKILL_ROOT>/assets/template-swiss.html" "项目/XXX/ppt/index.html"
 | 3 行或更长 | 优先改写标题;不得已用 `min(4.6vw,8.2vh)` |
 
 如果标题挤占了图片或正文区域,先压缩标题文案,再降字号;不要靠把下方内容推到底来硬塞。
+
+#### 3.2.2 · 瑞士风演示最小字号与字重阶梯(风格 B 必做)
+
+瑞士风用于投屏演示时,小字不能按网页注释的 10-12px 写。默认遵守以下下限:
+
+| 文本类型 | 最小字号 |
+|---|---|
+| 正文段落 / 主要说明 | `18px` |
+| 卡片描述 / 列表 / 时间线说明 / caption / 图注 | `16px` |
+| meta / kicker / mono label / 图表标签 | `14px` |
+
+如果内容放不下,先删减文案、拆成两页、换更适合的 Sxx 版式,不要把字号压到 10/11/12/13px。尤其是中文 deck,不要为了塞三行解释把 `body-sm`、caption、timeline label 改小。
+
+**字号与字重阶梯(瑞士风核心)** — "越大越细,越小越粗"不是感性描述,而是具体映射:
+
+| 字号区间 | 推荐字重 | 典型场景 |
+|---|---|---|
+| ≥ 8vw | 200 (ExtraLight) | 封面大字、巨号 KPI、h-statement |
+| 4-7.9vw | 200-300 | 章节标题(h-xl/h-xl-zh)、大编号 |
+| 1.8-3.9vw | 300-400 | 中型标题、takeaway 标题(≈1.8vw)、中号数字 |
+| 1-1.7vw / 16-20px | 400-500 | 正文段落、卡片描述、说明文字 |
+| 13-15px(小字) | 500-600 | meta、kicker、角标、图表标签、caption 强调 |
+
+**硬规则:**
+- 同一页内,字号越小的元素字重必须 ≥ 字号越大的元素(不允许 16px 正文用 300 而 1.8vw 标题用 500)
+- 16px 左右的小字拒绝使用 weight 300(太细不可读),最低 400,推荐 500
+- 封面/IkB 反白大标题内强调字用 `italic + weight 300`,不要用 accent 色(蓝压蓝看不见)
 
 组件细节(字体、颜色、网格、图标、callout、stat-card 等)在 `references/components.md`。
 
@@ -383,9 +435,9 @@ cp "<SKILL_ROOT>/assets/template-swiss.html" "项目/XXX/ppt/index.html"
 19. **装饰元素严格在 grid 内**——bars 矩阵、点阵、ring-mat 不能贴边或溢出页面
 20. **底部内容预留 nav 空间**——nav 在 ~97vh,内容收尾不要过 93vh(吸取 P22 KPI 大字溢底教训)
 21. **图片容器直角无阴影**——`.frame-img` 不加 `border-radius` / `box-shadow`;边界只用 hairline
-22. **P23/P24 图片同组一致**——同一组图片统一比例、高度、边距、线条粗细;信息图/UI 图加 `.fit-contain`
-23. **组件角色要正确**——P23/P24 的 caption 是必选信息锚点;P22 的 KPI/说明是必选;数据专用版式必须有真实数据,不能靠文案硬填
-24. **通用/非通用版式要分清**——P3/P8/P11/P19/P23 较通用;P6/P7/P20/P21/P22 是数据/案例专用;P14/P15/P17 是结构专用
+22. **S15/S16/S22 图片同组一致**——同一组图片统一比例、高度、边距、线条粗细;信息图/UI 图加 `.fit-contain`
+23. **组件角色要正确**——S15/S16 图片格需要 caption 信息锚点;S22 的 KPI/说明是必选;数据专用版式必须有真实数据,不能靠文案硬填
+24. **通用/非通用版式要分清**——S03/S08/S11/S19 较通用;S06/S07/S20/S21/S22 是数据/案例专用;S14/S15/S17 是结构专用
 
 ### Step 5 · 本地预览
 
@@ -411,6 +463,7 @@ guizang-ppt-skill/
 ├── assets/
 │   ├── template.html         ← 风格 A · 电子杂志风模板（种子文件）
 │   ├── template-swiss.html   ← 风格 B · 瑞士国际主义风模板（种子文件）
+│   ├── screenshot-backgrounds/ ← 截图美化内置背景(WebP):style-a 5 套 / style-b 4 套
 │   └── motion.min.js         ← Motion One 本地副本（离线兜底,约 64KB,共用）
 ├── scripts/
 │   └── validate-swiss-deck.mjs ← 风格 B 静态校验:登记版式、图片槽位、SVG 文本、标题对齐
@@ -419,9 +472,11 @@ guizang-ppt-skill/
     ├── layouts.md            ← 风格 A · 10 种页面布局骨架（可直接粘贴,含动效标记）
     ├── swiss-layout-lock.md  ← 风格 B · 原始 22P 版式锁,正文页必须按这里登记
     ├── layouts-swiss.md      ← 风格 B · 原始 22P 骨架说明 + 少量明确标注的实验区
+    ├── swiss-map-component.md ← 风格 B · S08 地图扩展组件(MapLibre 点位/连线/卡片/控制)
     ├── themes.md             ← 风格 A · 5 套主题色预设（只能选不能自定义）
     ├── themes-swiss.md       ← 风格 B · 4 套瑞士风主题色预设（IKB / 柠檬黄 / 柠檬绿 / 安全橙）
     ├── image-prompts.md      ← GPT-M 2.0 配图类型、比例和基础提示词
+    ├── screenshot-framing.md ← CleanShot X 式截图适配语义 + 内置背景资产映射
     └── checklist.md          ← 质量检查清单（P0/P1/P2/P3 分级）
 ```
 
@@ -436,9 +491,10 @@ guizang-ppt-skill/
 4. 读对应的 layouts 文件挑布局:
    - 风格 A → `layouts.md`(顶部有 Pre-flight 类名清单、主题节奏规划、动效 recipe 决策树)
    - 风格 B → **先读 `swiss-layout-lock.md`**,再读 `layouts-swiss.md`;正文页必须从 S01-S22 选择,每页写 `data-layout`
-5. 如果在 Codex 中生成配图,读 `image-prompts.md` 挑图片类型、比例和基础提示词
-6. 细节调整时读 `components.md` 查组件(含 Motion 动效系统章节,主要服务风格 A;风格 B 的组件细节在 `layouts-swiss.md` 附录)
-7. 生成后先运行 `node scripts/validate-swiss-deck.mjs path/to/index.html`,再读 `checklist.md` 自检
+5. 如果风格 B 需要地点、路线、人物住所或城市关系地图,读 `swiss-map-component.md`
+6. 如果在 Codex 中生成配图,读 `image-prompts.md` 挑图片类型、比例和基础提示词;如果是用户原始截图,先读 `screenshot-framing.md`,优先使用 `assets/screenshot-backgrounds/` 的内置背景资产
+7. 细节调整时读 `components.md` 查组件(含 Motion 动效系统章节,主要服务风格 A;风格 B 的组件细节在 `layouts-swiss.md` 附录)
+8. 生成后先运行 `node scripts/validate-swiss-deck.mjs path/to/index.html`,再读 `checklist.md` 自检
 
 **动效相关**:模板已把 Motion One 的加载和 recipe 逻辑内嵌到底部 module script。你不需要改 JS,只需要按 `layouts.md` / `layouts-swiss.md` 的骨架在 HTML 里加 `data-anim` / `data-animate` 即可。离线演示靠 `assets/motion.min.js`,断网时自动降级为"无动画但内容可读"。风格 B 模板必须保留 `B` 键低功耗模式:切换后停止 WebGL/ASCII canvas RAF,取消正在运行的 Web Animations,并把当前页内容直接 reveal 到静态最终态。
 
