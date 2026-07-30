@@ -96,32 +96,14 @@ def extract_email_dl(text):
 
 def clean_rule_name(rule_name):
     """
-    Remove CHG/CHT change ticket patterns and sequence suffixes (e.g. _1, _2, -1) from rule name.
-    Examples:
-      - 'yyyy_CHG12345678_1' -> 'yyyy'
-      - 'yyyy_CHG12345678_2' -> 'yyyy'
-      - 'CHG12345678_yyyy_1' -> 'yyyy'
-      - 'CHG12345678' -> 'CHG12345678' (kept as is if only ticket)
-      - 'CHG12345678_1' -> 'CHG12345678_1' (kept as is if only ticket)
+    Remove CHG/CHT change ticket patterns from rule name.
+    Example: YYY_CHG12345678 -> YYY, CHG12345678_YYYY -> YYYY
     """
     if not rule_name:
         return ""
-        
-    rule_str = str(rule_name).strip()
-    
-    # Match CHG/CHT + 7-8 digits + optional sub-sequence suffix (e.g., _1, _2, -1, -2)
-    ticket_pattern = re.compile(r'[-_]?\b(?:CHG|CHT)-?\d{7,8}(?:[-_]\d+)?\b[-_]?', re.IGNORECASE)
-    
-    cleaned = ticket_pattern.sub("", rule_str).strip(" -_")
-    
-    # Extra check: remove any leftover trailing sequence number if CHG was stripped
-    cleaned = re.sub(r'[-_]\d+$', '', cleaned).strip(" -_")
-    
-    # If rule name was ONLY CHG/CHT ticket (e.g. "CHG12345678" or "CHG12345678_1"), keep original
-    if not cleaned:
-        return rule_str
-        
-    return cleaned
+    pattern = re.compile(r'[-_]?\b(?:CHG|CHT)-?\d{7,8}\b[-_]?', re.IGNORECASE)
+    cleaned = pattern.sub("", rule_name).strip(" -_")
+    return cleaned if cleaned else rule_name
 
 def main():
     script_dir = Path(__file__).parent.resolve()
@@ -191,8 +173,11 @@ def main():
                 short_desc = get_col_value(row, ["short description", "short_description", "description", "summary"])
                 full_desc = get_col_value(row, ["description", "full_description", "long description", "details", "short description", "summary"])
 
+                # Combine short_desc and full_desc to extract Email DL
                 combined_desc = f"{short_desc} {full_desc}".strip()
                 extracted_dl = extract_email_dl(combined_desc)
+                
+                # Query Group Mapping DL
                 mapped_group_dl = group_lookup.get(requester_group.upper(), "") if requester_group else ""
 
                 change_lookup[cht_key] = {
@@ -212,6 +197,7 @@ def main():
     print(f"\n[INFO] Reading {policy_file.name}")
     print(f"       Encoding: {enc_policy} | Delimiter: {repr(delim_policy)}")
 
+    # Match CHT or CHG tickets followed by 7 or 8 digits
     cht_pattern = re.compile(r'\b(?:CHT|CHG)-?\d{7,8}\b', re.IGNORECASE)
 
     policy_name_aliases = ["policy name", "policy_name", "policy", "security policy", "device name", "device", "package", "binding", "firewall", "management"]
@@ -231,12 +217,10 @@ def main():
 
         sample_row = next(reader, None)
         if sample_row:
-            raw_r_name = get_col_value(sample_row, rule_name_aliases)
-            cleaned_sample = clean_rule_name(raw_r_name)
             print("\n--- Diagnostic Column Matching for First Row in policy.csv ---")
             print(f"  Detected Policy Name -> '{get_col_value(sample_row, policy_name_aliases)}'")
             print(f"  Detected Rule ID    -> '{get_col_value(sample_row, rule_id_aliases)}'")
-            print(f"  Detected Rule Name  -> '{raw_r_name}' (Cleaned -> '{cleaned_sample}')")
+            print(f"  Detected Rule Name  -> '{get_col_value(sample_row, rule_name_aliases)}'")
             print(f"  Detected Comment    -> '{get_col_value(sample_row, comment_aliases)}'")
             print("----------------------------------------------------------------\n")
             
@@ -252,6 +236,8 @@ def main():
             comment = get_col_value(row, comment_aliases)
 
             cleaned_r_name = clean_rule_name(rule_name)
+
+            # Fallback text search across row if comment column was empty or unparsed
             search_text = comment if comment else " ".join(str(v) for v in row.values() if v)
 
             cht_matches = cht_pattern.findall(search_text)
