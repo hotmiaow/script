@@ -40,6 +40,7 @@ def get_col_value(row, possible_names, default=""):
     if not row:
         return default
 
+    # Clean keys dictionary: { 'cleaned_lower_key': 'original_key' }
     row_keys_cleaned = {}
     for k in row.keys():
         if k is not None:
@@ -54,7 +55,7 @@ def get_col_value(row, possible_names, default=""):
             val = row[actual_key]
             return str(val).strip() if val is not None else ""
 
-    # 2. Try substring match (only if target name is at least 4 characters)
+    # 2. Try substring match (only if target name is at least 4 characters to avoid false matches)
     for target_name in possible_names:
         target = target_name.strip().lower()
         if len(target) < 4:
@@ -66,56 +67,16 @@ def get_col_value(row, possible_names, default=""):
 
     return default
 
-def extract_email_dl(text):
-    """
-    Extract email DL from text (especially near "Business Owner" / "support group DL" / "future communication").
-    """
-    if not text:
-        return ""
-    
-    # 1. Look for email address near Business Owner / support group DL context
-    bo_pattern = re.compile(
-        r'(?:Business\s*Owner|support\s*group\s*DL|future\s*communication)[^@\n]*?([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})',
-        re.IGNORECASE
-    )
-    bo_match = bo_pattern.search(text)
-    if bo_match:
-        return bo_match.group(1).strip()
-        
-    # 2. Fallback: Find any email address in the text
-    email_pattern = re.compile(r'\b[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}\b')
-    emails = email_pattern.findall(text)
-    if emails:
-        seen = []
-        for e in emails:
-            if e not in seen:
-                seen.append(e)
-        return ", ".join(seen)
-        
-    return ""
-
-def clean_rule_name(rule_name):
-    """
-    Remove CHG/CHT change ticket patterns from rule name.
-    Example: YYY_CHG12345678 -> YYY, CHG12345678_YYYY -> YYYY
-    """
-    if not rule_name:
-        return ""
-    pattern = re.compile(r'[-_]?\b(?:CHG|CHT)-?\d{7,8}\b[-_]?', re.IGNORECASE)
-    cleaned = pattern.sub("", rule_name).strip(" -_")
-    return cleaned if cleaned else rule_name
-
 def main():
     script_dir = Path(__file__).parent.resolve()
     policy_file = script_dir / "policy.csv"
     change_file = script_dir / "change.csv"
-    group_map_file = script_dir / "group_mapping.csv"
     result_file = script_dir / "result.csv"
 
-    print("=" * 75)
-    print(" CHT & Policy Rule Mapping Tool")
-    print(f" Working Directory: {script_dir}")
-    print("=" * 75)
+    print("=" * 70)
+    print("CHT Mapping Tool")
+    print(f"Working Directory: {script_dir}")
+    print("=" * 70)
 
     if not policy_file.exists():
         print(f"\n[ERROR] '{policy_file.name}' not found in {script_dir}")
@@ -128,29 +89,7 @@ def main():
         return
 
     # ----------------------------------------------------
-    # Step 1: Load group_mapping.csv (if available)
-    # ----------------------------------------------------
-    group_lookup = {}
-    if group_map_file.exists():
-        enc_grp, delim_grp = detect_delimiter_and_encoding(group_map_file)
-        print(f"\n[INFO] Reading {group_map_file.name}")
-        print(f"       Encoding: {enc_grp} | Delimiter: {repr(delim_grp)}")
-        with open(group_map_file, mode="r", encoding=enc_grp, errors="replace") as f:
-            reader = csv.DictReader(f, delimiter=delim_grp)
-            headers = [h.strip() for h in (reader.fieldnames or []) if h]
-            print(f"       Headers in group_mapping.csv: {headers}")
-            for row in reader:
-                grp_name = get_col_value(row, ["requester group", "requester_group", "group name", "group_name", "group", "source group", "source_group"])
-                email_dl = get_col_value(row, ["email dl", "email_dl", "dl", "mapped_dl", "mapped dl", "email", "group dl", "group_dl", "target dl"])
-                if grp_name:
-                    group_lookup[grp_name.upper()] = email_dl
-        print(f"       Loaded {len(group_lookup)} group mappings.")
-    else:
-        print(f"\n[NOTICE] '{group_map_file.name}' not found in directory.")
-        print("         Group DL mapping will be left blank if group_mapping.csv is missing.")
-
-    # ----------------------------------------------------
-    # Step 2: Load change.csv
+    # Step 1: Load change.csv
     # ----------------------------------------------------
     enc_change, delim_change = detect_delimiter_and_encoding(change_file)
     print(f"\n[INFO] Reading {change_file.name}")
@@ -165,41 +104,32 @@ def main():
         for row in reader:
             cht_no = get_col_value(row, ["change number", "change_number", "cht", "cht number", "change ticket", "number", "ticket"])
             if cht_no:
-                cht_match = re.search(r'(?:CHT|CHG)-?\d{7,8}', cht_no, re.IGNORECASE)
+                cht_match = re.search(r'CHT-?\d{7,8}', cht_no, re.IGNORECASE)
                 cht_key = cht_match.group(0).upper().replace("-", "") if cht_match else cht_no.upper().replace("-", "")
                 
                 requester = get_col_value(row, ["requester", "requster", "requested_by", "requested by", "opened_by", "opened by", "author"])
                 requester_group = get_col_value(row, ["requester_group", "requester group", "requster_group", "request_group", "assignment group", "group"])
                 short_desc = get_col_value(row, ["short description", "short_description", "description", "summary"])
-                full_desc = get_col_value(row, ["description", "full_description", "long description", "details", "short description", "summary"])
-
-                # Combine short_desc and full_desc to extract Email DL
-                combined_desc = f"{short_desc} {full_desc}".strip()
-                extracted_dl = extract_email_dl(combined_desc)
                 
-                # Query Group Mapping DL
-                mapped_group_dl = group_lookup.get(requester_group.upper(), "") if requester_group else ""
-
                 change_lookup[cht_key] = {
                     "requester": requester,
                     "requester_group": requester_group,
-                    "mapped_group_dl": mapped_group_dl,
-                    "extracted_dl": extracted_dl,
                     "short_description": short_desc
                 }
 
     print(f"       Loaded {len(change_lookup)} change records.")
 
     # ----------------------------------------------------
-    # Step 3: Process policy.csv
+    # Step 2: Process policy.csv
     # ----------------------------------------------------
     enc_policy, delim_policy = detect_delimiter_and_encoding(policy_file)
     print(f"\n[INFO] Reading {policy_file.name}")
     print(f"       Encoding: {enc_policy} | Delimiter: {repr(delim_policy)}")
 
-    # Match CHT or CHG tickets followed by 7 or 8 digits
-    cht_pattern = re.compile(r'\b(?:CHT|CHG)-?\d{7,8}\b', re.IGNORECASE)
+    # CHT Regex (CHT followed by 7 or 8 digits, optional hyphen)
+    cht_pattern = re.compile(r'\bCHT-?\d{7,8}\b', re.IGNORECASE)
 
+    # Alias definitions for SecureTrack / Policy CSV columns
     policy_name_aliases = ["policy name", "policy_name", "policy", "security policy", "device name", "device", "package", "binding", "firewall", "management"]
     rule_id_aliases = ["securetrack rule id", "rule id", "rule_id", "securetrack_rule_id", "rule number", "rule_number", "rule #", "rule#", "id", "#", "no.", "number"]
     rule_name_aliases = ["rule name", "rule_name", "rule label", "rule_label", "name", "title", "rule title"]
@@ -215,6 +145,7 @@ def main():
         headers = [str(h).strip() for h in raw_headers if h]
         print(f"       Headers in policy.csv: {headers}")
 
+        # Show detected column matches for diagnostics
         sample_row = next(reader, None)
         if sample_row:
             print("\n--- Diagnostic Column Matching for First Row in policy.csv ---")
@@ -224,6 +155,7 @@ def main():
             print(f"  Detected Comment    -> '{get_col_value(sample_row, comment_aliases)}'")
             print("----------------------------------------------------------------\n")
             
+            # Reset file reader position back to top (after header)
             f.seek(0)
             reader = csv.DictReader(f, delimiter=delim_policy)
 
@@ -235,11 +167,10 @@ def main():
             rule_name = get_col_value(row, rule_name_aliases)
             comment = get_col_value(row, comment_aliases)
 
-            cleaned_r_name = clean_rule_name(rule_name)
-
             # Fallback text search across row if comment column was empty or unparsed
             search_text = comment if comment else " ".join(str(v) for v in row.values() if v)
 
+            # Extract all CHT numbers
             cht_matches = cht_pattern.findall(search_text)
             
             if cht_matches:
@@ -253,37 +184,26 @@ def main():
                         change_info = change_lookup.get(cht_formatted, {})
                         requester = change_info.get("requester", "")
                         requester_group = change_info.get("requester_group", "")
-                        mapped_group_dl = change_info.get("mapped_group_dl", "")
-                        extracted_dl = change_info.get("extracted_dl", "")
-                        short_desc = change_info.get("short_description", "")
 
                         output_rows.append({
                             "Policy Name": policy_name,
                             "SecureTrack Rule ID": rule_id,
                             "Rule Name": rule_name,
-                            "Cleaned Rule Name": cleaned_r_name,
                             "Change Number": cht_formatted,
                             "Requester": requester,
-                            "Requester Group": requester_group,
-                            "Mapped Group DL": mapped_group_dl,
-                            "Extracted Email DL": extracted_dl,
-                            "Short Description": short_desc
+                            "Requester Group": requester_group
                         })
 
     # ----------------------------------------------------
-    # Step 4: Write result.csv
+    # Step 3: Write result.csv
     # ----------------------------------------------------
     fieldnames = [
         "Policy Name",
         "SecureTrack Rule ID",
         "Rule Name",
-        "Cleaned Rule Name",
         "Change Number",
         "Requester",
-        "Requester Group",
-        "Mapped Group DL",
-        "Extracted Email DL",
-        "Short Description"
+        "Requester Group"
     ]
 
     with open(result_file, mode="w", newline="", encoding="utf-8") as f:
@@ -291,13 +211,13 @@ def main():
         writer.writeheader()
         writer.writerows(output_rows)
 
-    print("=" * 75)
-    print(" SUMMARY RESULTS")
-    print("=" * 75)
-    print(f" Total policy rows processed: {total_policy_rows}")
-    print(f" Total CHT numbers extracted: {extracted_cht_count}")
-    print(f" Output saved to: {result_file.name} ({len(output_rows)} rows)")
-    print("=" * 75)
+    print("=" * 70)
+    print("SUMMARY RESULTS")
+    print("=" * 70)
+    print(f"Total policy rows processed: {total_policy_rows}")
+    print(f"Total CHT numbers extracted: {extracted_cht_count}")
+    print(f"Output saved to: {result_file.name} ({len(output_rows)} rows)")
+    print("=" * 70)
 
 if __name__ == "__main__":
     main()
