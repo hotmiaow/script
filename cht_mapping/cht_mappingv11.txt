@@ -96,7 +96,7 @@ def extract_email_dl(text):
 
 def clean_rule_name(rule_name):
     """
-    Remove CHG/CHT/REQ change ticket patterns and optional sequence suffixes (_1, _2, -1, -2, etc.) from rule name.
+    Remove CHG/CHT change ticket patterns and optional sequence suffixes (_1, _2, -1, -2, etc.) from rule name.
     Examples:
       - 'Teams_CHG12345678' -> 'Teams'
       - 'yyyy_CHG12345678_1' -> 'yyyy'
@@ -110,8 +110,8 @@ def clean_rule_name(rule_name):
         
     rule_str = str(rule_name).strip()
     
-    # Match CHG, CHT, or REQ + digits + optional suffixes (e.g. _CHG12345678, _CHG12345678_1, -CHT-999999)
-    ticket_pattern = re.compile(r'[-_\s]*(?:CHG|CHT|REQ)-?\d+(?:[-_]\d+)*[-_\s]*', re.IGNORECASE)
+    # Match CHG or CHT + digits + optional suffixes (e.g. _CHG12345678, _CHG12345678_1, -CHT-999999)
+    ticket_pattern = re.compile(r'[-_\s]*(?:CHG|CHT)-?\d+(?:[-_]\d+)*[-_\s]*', re.IGNORECASE)
     
     cleaned = ticket_pattern.sub("", rule_str).strip(" -_")
     
@@ -127,6 +127,7 @@ def clean_rule_name(rule_name):
 def main():
     script_dir = Path(__file__).parent.resolve()
     policy_file = script_dir / "policy.csv"
+    change_file = script_dir / "change.csv"
     group_map_file = script_dir / "group_mapping.csv"
     result_file = script_dir / "result.csv"
 
@@ -138,6 +139,11 @@ def main():
     if not policy_file.exists():
         print(f"\n[ERROR] '{policy_file.name}' not found in {script_dir}")
         print("Please make sure policy.csv is located in the same directory as this script.")
+        return
+
+    if not change_file.exists():
+        print(f"\n[ERROR] '{change_file.name}' not found in {script_dir}")
+        print("Please make sure change.csv is located in the same directory as this script.")
         return
 
     # ----------------------------------------------------
@@ -163,71 +169,42 @@ def main():
         print("         Group DL mapping will be left blank if group_mapping.csv is missing.")
 
     # ----------------------------------------------------
-    # Step 2: Load Change & Request Files (including old_request.csv, old_change.csv, etc.)
+    # Step 2: Load change.csv
     # ----------------------------------------------------
-    candidate_change_files = [
-        script_dir / "change.csv",
-        script_dir / "request.csv",
-        script_dir / "old_change.csv",
-        script_dir / "old_request.csv",
-        script_dir / "old_changes.csv",
-        script_dir / "old_requests.csv"
-    ]
+    enc_change, delim_change = detect_delimiter_and_encoding(change_file)
+    print(f"\n[INFO] Reading {change_file.name}")
+    print(f"       Encoding: {enc_change} | Delimiter: {repr(delim_change)}")
     
-    existing_change_files = [f for f in candidate_change_files if f.exists()]
-    
-    # Fallback: scan any *.csv file containing 'change' or 'request' in filename
-    if not existing_change_files:
-        for f in script_dir.glob("*.csv"):
-            fname = f.name.lower()
-            if ("change" in fname or "request" in fname) and f.name not in ["policy.csv", "result.csv", "group_mapping.csv"]:
-                existing_change_files.append(f)
-
-    if not existing_change_files:
-        print(f"\n[ERROR] No change/request files (e.g. change.csv, request.csv, old_request.csv) found in {script_dir}")
-        print("Please place change.csv or request.csv in the script directory.")
-        return
-
     change_lookup = {}
-    for c_file in existing_change_files:
-        enc_change, delim_change = detect_delimiter_and_encoding(c_file)
-        print(f"\n[INFO] Reading change file: {c_file.name} (Encoding: {enc_change}, Delimiter: {repr(delim_change)})")
-        
-        loaded_count = 0
-        with open(c_file, mode="r", encoding=enc_change, errors="replace") as f:
-            reader = csv.DictReader(f, delimiter=delim_change)
-            headers = [h.strip() for h in (reader.fieldnames or []) if h]
-            print(f"       Headers in {c_file.name}: {headers}")
+    with open(change_file, mode="r", encoding=enc_change, errors="replace") as f:
+        reader = csv.DictReader(f, delimiter=delim_change)
+        headers = [h.strip() for h in (reader.fieldnames or []) if h]
+        print(f"       Headers in change.csv: {headers}")
 
-            for row in reader:
-                cht_no = get_col_value(row, ["change number", "change_number", "cht", "cht number", "change ticket", "number", "ticket", "request_number", "request number", "req_number"])
-                if cht_no:
-                    cht_match = re.search(r'(?:CHT|CHG|REQ)-?\d{6,10}', cht_no, re.IGNORECASE)
-                    cht_key = cht_match.group(0).upper().replace("-", "") if cht_match else cht_no.upper().replace("-", "")
-                    
-                    # Primary files take priority; old files backfill missing records
-                    if cht_key not in change_lookup:
-                        requester = get_col_value(row, ["requester", "requster", "requested_by", "requested by", "opened_by", "opened by", "author"])
-                        requester_group = get_col_value(row, ["requester_group", "requester group", "requster_group", "request_group", "assignment group", "group"])
-                        short_desc = get_col_value(row, ["short description", "short_description", "description", "summary"])
-                        full_desc = get_col_value(row, ["description", "full_description", "long description", "details", "short description", "summary"])
+        for row in reader:
+            cht_no = get_col_value(row, ["change number", "change_number", "cht", "cht number", "change ticket", "number", "ticket"])
+            if cht_no:
+                cht_match = re.search(r'(?:CHT|CHG)-?\d{6,10}', cht_no, re.IGNORECASE)
+                cht_key = cht_match.group(0).upper().replace("-", "") if cht_match else cht_no.upper().replace("-", "")
+                
+                requester = get_col_value(row, ["requester", "requster", "requested_by", "requested by", "opened_by", "opened by", "author"])
+                requester_group = get_col_value(row, ["requester_group", "requester group", "requster_group", "request_group", "assignment group", "group"])
+                short_desc = get_col_value(row, ["short description", "short_description", "description", "summary"])
+                full_desc = get_col_value(row, ["description", "full_description", "long description", "details", "short description", "summary"])
 
-                        combined_desc = f"{short_desc} {full_desc}".strip()
-                        extracted_dl = extract_email_dl(combined_desc)
-                        mapped_group_dl = group_lookup.get(requester_group.upper(), "") if requester_group else ""
+                combined_desc = f"{short_desc} {full_desc}".strip()
+                extracted_dl = extract_email_dl(combined_desc)
+                mapped_group_dl = group_lookup.get(requester_group.upper(), "") if requester_group else ""
 
-                        change_lookup[cht_key] = {
-                            "requester": requester,
-                            "requester_group": requester_group,
-                            "mapped_group_dl": mapped_group_dl,
-                            "extracted_dl": extracted_dl,
-                            "short_description": short_desc,
-                            "source_file": c_file.name
-                        }
-                        loaded_count += 1
-        print(f"       Loaded {loaded_count} change/request records from {c_file.name}.")
+                change_lookup[cht_key] = {
+                    "requester": requester,
+                    "requester_group": requester_group,
+                    "mapped_group_dl": mapped_group_dl,
+                    "extracted_dl": extracted_dl,
+                    "short_description": short_desc
+                }
 
-    print(f"\n[SUMMARY] Total unique change records in lookup memory: {len(change_lookup)}")
+    print(f"       Loaded {len(change_lookup)} change records.")
 
     # ----------------------------------------------------
     # Step 3: Process policy.csv (keep ALL rows)
@@ -236,7 +213,7 @@ def main():
     print(f"\n[INFO] Reading {policy_file.name}")
     print(f"       Encoding: {enc_policy} | Delimiter: {repr(delim_policy)}")
 
-    cht_pattern = re.compile(r'(?:CHT|CHG|REQ)-?\d{6,10}', re.IGNORECASE)
+    cht_pattern = re.compile(r'(?:CHT|CHG)-?\d{6,10}', re.IGNORECASE)
 
     policy_name_aliases = ["policy name", "policy_name", "policy", "security policy", "device name", "device", "package", "binding", "firewall", "management"]
     rule_id_aliases = ["securetrack rule id", "rule id", "rule_id", "securetrack_rule_id", "rule number", "rule_number", "rule #", "rule#", "id", "#", "no.", "number"]
@@ -340,7 +317,7 @@ def main():
                         selected_change_info = info
                         break
 
-            # Phase D: Fallback if NO ticket anywhere matched a requester in change_lookup
+            # Phase D: Fallback if NO ticket anywhere matched a requester in change.csv
             if not selected_cht:
                 if comment_chts:
                     selected_cht = comment_chts[-1]
@@ -385,27 +362,6 @@ def main():
             })
 
     # ----------------------------------------------------
-    # Step 3.5: Cross-check & backfill empty Combined Email DL
-    # ----------------------------------------------------
-    group_dl_cache = {}
-    for r in output_rows:
-        grp = r.get("Requester Group", "").strip().upper()
-        combined_dl = r.get("Combined Email DL", "").strip()
-        if grp and combined_dl and grp not in group_dl_cache:
-            group_dl_cache[grp] = combined_dl
-
-    backfilled_count = 0
-    for r in output_rows:
-        combined_dl = r.get("Combined Email DL", "").strip()
-        grp = r.get("Requester Group", "").strip().upper()
-        if not combined_dl and grp and grp in group_dl_cache:
-            r["Combined Email DL"] = group_dl_cache[grp]
-            backfilled_count += 1
-
-    if backfilled_count > 0:
-        print(f"       Cross-row backfilled {backfilled_count} empty 'Combined Email DL' fields using matching Requester Groups.")
-
-    # ----------------------------------------------------
     # Step 4: Write result.csv (with interactive retry on file lock)
     # ----------------------------------------------------
     fieldnames = [
@@ -442,7 +398,6 @@ def main():
     print("=" * 75)
     print(f" Total policy rows processed: {total_policy_rows}")
     print(f" Policy rows with CHT extracted: {extracted_cht_count}")
-    print(f" Empty 'Combined Email DL' backfilled across rows: {backfilled_count}")
     print(f" Output saved to: {result_file.name} (Total output rows: {len(output_rows)})")
     print("=" * 75)
 
