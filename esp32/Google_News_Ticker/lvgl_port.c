@@ -114,7 +114,7 @@ static void example_lvgl_flush_cb(lv_display_t * disp, const lv_area_t * area, u
 #endif
 }
 
-static void TouchInputReadCallback(lv_indev_t * indev, lv_indev_data_t *indevData)
+void TouchInputReadCallback(lv_indev_t * indev, lv_indev_data_t *indevData)
 {
   uint8_t read_touchpad_cmd[11] = {0xb5, 0xab, 0xa5, 0x5a, 0x0, 0x0, 0x0, 0x0e, 0x0, 0x0, 0x0};
   uint8_t buff[32] = {0};
@@ -264,11 +264,13 @@ void lvgl_port_init(void)
   lv_display_set_rotation(disp, LV_DISPLAY_ROTATION_270);
 #endif
 
-  /* Port Input Device */
+  /* Port Input Device (Disabled since touch is not in use) */
+  /*
   lv_indev_t *touch_indev = NULL;
   touch_indev = lv_indev_create();
   lv_indev_set_type(touch_indev, LV_INDEV_TYPE_POINTER);
   lv_indev_set_read_cb(touch_indev, TouchInputReadCallback);
+  */
 
   ESP_LOGI(TAG, "Install LVGL tick timer");
   esp_timer_create_args_t lvgl_tick_timer_args = {};

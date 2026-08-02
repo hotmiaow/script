@@ -64,6 +64,9 @@ This project is an **ESP32-S3 Google News Ticker** built for the **Waveshare ESP
 - [x] Integrated Wi-Fi Signal (RSSI) and battery level percentage indicators in the status bar (using ADC GPIO 4)
 - [x] Added configurable news page flip durations in the Web Portal
 - [x] Implemented automatic headline de-duplication inside the RSS parser to filter out identical stories from different sources
-- [x] Added Custom RSS Feed URL configuration in Web Portal with "Restore Default" fallback button
+- [x] Added 5 Custom RSS Feed URL configurations in Web Portal (distributed within the 50 items limit) with 10 suggested English news feeds and a Clear All button
+- [x] Configured CPU boot frequency to 80 MHz (lowest stable frequency that preserves correct SPI LCD & I2C Touch peripheral bus operations)
+- [x] Bypassed Wi-Fi connection and HTTP news fetches during Smart Sleep Hours to maximize battery saving (checking only once per hour instead of every 5 minutes)
+- [x] Disabled touch screen polling and hardware driver initialization in lvgl_port.c to conserve CPU wake cycles and I2C bus traffic
 
 

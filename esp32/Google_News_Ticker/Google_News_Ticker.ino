@@ -62,7 +62,7 @@ bool auto_bright = false;
 int day_bright = 255;
 int night_bright = 50;
 int scroll_interval_seconds = 10;
-String custom_rss_url = "";
+String custom_rss_urls[5] = {"", "", "", "", ""};
 
 #define MAX_BLACKLIST_COUNT 16
 char blacklist_items[MAX_BLACKLIST_COUNT][MAX_SOURCE_LEN];
@@ -230,6 +230,7 @@ void handle_save(void);
 void handle_ota_get(void);
 void handle_ota_post(void);
 void handle_ota_upload(void);
+void show_ap_mode_ui(void);
 
 // Add these definitions before setup()
 // Power management pins for ESP32-S3-Touch-LCD-3.49
@@ -455,6 +456,7 @@ void audio_init(void)
 
 void setup()
 {
+  setCpuFrequencyMhz(80);
   // Initialize Serial Monitor
   Serial.begin(115200);
   delay(100);
@@ -1013,8 +1015,8 @@ void resolve_region(String country) {
 // Uses fixed char buffers (no String churn per-character) and explicitly
 // handles <![CDATA[ ... ]]> wrapped titles, which Google News uses.
 // ----------------------------------------------------
-int parse_rss_stream(WiFiClientSecure *stream) {
-  int count = 0;
+int parse_rss_stream(WiFiClientSecure *stream, int limit, int start_count) {
+  int count = start_count;
 
   char tag_buf[24];
   int tag_len = 0;
@@ -1093,7 +1095,7 @@ int parse_rss_stream(WiFiClientSecure *stream) {
         } else if (strcmp(tag_buf, "/item") == 0) {
           in_item = false;
 
-          if (count < MAX_NEWS_ITEMS && item_title_len > 0) {
+          if (count < start_count + limit && count < MAX_NEWS_ITEMS && item_title_len > 0) {
             item_title_buf[item_title_len] = '\0';
             item_pubdate_buf[item_pubdate_len] = '\0';
 
@@ -1154,7 +1156,7 @@ int parse_rss_stream(WiFiClientSecure *stream) {
             }
           }
         }
-        if (count >= MAX_NEWS_ITEMS) break;
+        if (count >= start_count + limit || count >= MAX_NEWS_ITEMS) break;
         } else if (strcmp(tag_buf, "title") == 0) {
           in_title = true; in_pubdate = false;
         } else if (strcmp(tag_buf, "/title") == 0) {
@@ -1237,8 +1239,8 @@ void fetch_news_task(void *pvParameters) {
     lvgl_port_unlock();
   }
 
-  // Disable Wi-Fi sleep to prevent random disconnects, lags, and excessive latency
-  WiFi.setSleep(false);
+  // Enable Wi-Fi Modem Sleep to save power
+  WiFi.setSleep(true);
   WiFi.setAutoReconnect(true);
 
   Serial.print("Connecting to Wi-Fi: ");
@@ -1273,6 +1275,7 @@ void fetch_news_task(void *pvParameters) {
     server.on("/update", HTTP_GET, handle_ota_get);
     server.on("/update", HTTP_POST, handle_ota_post, handle_ota_upload);
     server.begin();
+    WiFi.scanNetworks(true);
     
     // Loop in AP mode indefinitely until user configures Wi-Fi
     for (;;) {
@@ -1302,6 +1305,7 @@ void fetch_news_task(void *pvParameters) {
   server.on("/update", HTTP_GET, handle_ota_get);
   server.on("/update", HTTP_POST, handle_ota_post, handle_ota_upload);
   server.begin();
+  WiFi.scanNetworks(true);
 
   unsigned long last_fetch_time = 0;
   unsigned long last_scroll_time = 0;
@@ -1345,6 +1349,12 @@ void fetch_news_task(void *pvParameters) {
       }
     } else {
       current_target = is_dimmed ? 10 : base_brightness;
+    }
+    
+    // Low Power Mode: Cap maximum brightness at 100 when battery is below 20%
+    int bat_pct = get_battery_percentage();
+    if (bat_pct < 20 && current_target > 100) {
+      current_target = 100;
     }
 
     if (current_target != last_applied_brightness) {
@@ -1457,6 +1467,15 @@ void fetch_news_task(void *pvParameters) {
 
     if (fetch_requested) {
       fetch_requested = false;
+      
+      // If smart sleep is active, skip fetching news to conserve battery!
+      if (is_sleep_time_active()) {
+        Serial.println("[Power] Sleep mode active. Skipping news fetch to conserve battery.");
+        seconds_to_refresh = 3600; // Check again in 1 hour
+        is_updating = false;
+        continue;
+      }
+      
       last_fetch_time = now;
 
       // Smart Wi-Fi check: Wait for auto-reconnect if temporarily disconnected
@@ -1687,43 +1706,74 @@ void fetch_news_task(void *pvParameters) {
 // Fetch Local News search feed using the region-matched city and
         // its correct Google News hl/gl/ceid edition params.
         String feed_url = "";
-        if (custom_rss_url.length() > 0) {
-          feed_url = custom_rss_url;
-        } else {
-          String query_city = news_query_city;
-          query_city.replace(" ", "%20");
-          feed_url = "https://news.google.com/rss/search?q=" + query_city +
-                     "&hl=" + news_hl + "&gl=" + news_gl + "&ceid=" + news_ceid +
-                     "&nocache=" + String(millis());
+        int current_count = 0;
+        int active_sources = 0;
+        for (int i = 0; i < 5; i++) {
+          if (custom_rss_urls[i].length() > 0) {
+            active_sources++;
+          }
         }
 
-        Serial.println("Fetching local news from: " + feed_url);
-        http.begin(secure_client, feed_url);
-        http.setTimeout(8000); // slightly longer - this response is a full RSS feed body
-        int httpCodeNews = http.GET();
-        if (httpCodeNews == HTTP_CODE_OK) {
-          WiFiClientSecure *stream = (WiFiClientSecure*)http.getStreamPtr();
-          int items_parsed = parse_rss_stream(stream);
-          
-          if (items_parsed > 0) {
-            news_count = items_parsed;
-            Serial.printf("Successfully parsed %d news items.\n", news_count);
-            if (lvgl_port_lock(-1)) {
-              update_ui_news();
-              lvgl_port_unlock();
-            }
-            save_news_cache(); // Persist latest headlines to NVS for next boot
+        if (active_sources == 0) {
+          String query_city = news_query_city;
+          query_city.replace(" ", "%20");
+          String feed_url = "https://news.google.com/rss/search?q=" + query_city +
+                             "&hl=" + news_hl + "&gl=" + news_gl + "&ceid=" + news_ceid +
+                             "&nocache=" + String(millis());
+
+          Serial.println("Fetching local news from default feed: " + feed_url);
+          http.begin(secure_client, feed_url);
+          http.setTimeout(8000);
+          int httpCodeNews = http.GET();
+          if (httpCodeNews == HTTP_CODE_OK) {
+            WiFiClientSecure *stream = (WiFiClientSecure*)http.getStreamPtr();
+            current_count = parse_rss_stream(stream, 50, 0);
           } else {
-            Serial.println("No news items parsed.");
-            if (lvgl_port_lock(-1)) {
-              lv_label_set_text(status_label, is_asia ? "解析失敗" : "Parse failed");
-              lvgl_port_unlock();
+            Serial.printf("HTTP news request failed, code: %d\n", httpCodeNews);
+          }
+          http.end();
+        } else {
+          int sources_processed = 0;
+          for (int i = 0; i < 5; i++) {
+            if (custom_rss_urls[i].length() > 0) {
+              int limit = 50 / active_sources;
+              if (active_sources == 2) limit = 25;
+              else if (active_sources == 3) {
+                limit = (sources_processed == 2) ? 18 : 16;
+              } else if (active_sources == 4) {
+                limit = (sources_processed == 3) ? 14 : 12;
+              } else if (active_sources == 5) {
+                limit = 10;
+              }
+              
+              Serial.printf("Fetching source %d: %s (limit: %d, start_idx: %d)\n", i + 1, custom_rss_urls[i].c_str(), limit, current_count);
+              http.begin(secure_client, custom_rss_urls[i]);
+              http.setTimeout(8000);
+              int httpCodeNews = http.GET();
+              if (httpCodeNews == HTTP_CODE_OK) {
+                WiFiClientSecure *stream = (WiFiClientSecure*)http.getStreamPtr();
+                current_count = parse_rss_stream(stream, limit, current_count);
+              } else {
+                Serial.printf("HTTP request failed for source %d, code: %d\n", i + 1, httpCodeNews);
+              }
+              http.end();
+              sources_processed++;
             }
           }
-        } else {
-          Serial.printf("HTTP news request failed, code: %d\n", httpCodeNews);
+        }
+
+        if (current_count > 0) {
+          news_count = current_count;
+          Serial.printf("Successfully parsed %d news items total.\n", news_count);
           if (lvgl_port_lock(-1)) {
-            lv_label_set_text(status_label, is_asia ? "網絡錯誤" : "Network error");
+            update_ui_news();
+            lvgl_port_unlock();
+          }
+          save_news_cache(); // Persist latest headlines to NVS for next boot
+        } else {
+          Serial.println("No news items parsed.");
+          if (lvgl_port_lock(-1)) {
+            lv_label_set_text(status_label, is_asia ? "解析失敗" : "Parse failed");
             lvgl_port_unlock();
           }
         }
@@ -1758,7 +1808,11 @@ void load_settings() {
   day_bright = newsPrefs.getInt("day_bright", 255);
   night_bright = newsPrefs.getInt("night_bright", 50);
   scroll_interval_seconds = newsPrefs.getInt("scroll_int", 10);
-  custom_rss_url = newsPrefs.getString("rss_url", "");
+  custom_rss_urls[0] = newsPrefs.getString("rss_url1", "");
+  custom_rss_urls[1] = newsPrefs.getString("rss_url2", "");
+  custom_rss_urls[2] = newsPrefs.getString("rss_url3", "");
+  custom_rss_urls[3] = newsPrefs.getString("rss_url4", "");
+  custom_rss_urls[4] = newsPrefs.getString("rss_url5", "");
   newsPrefs.end();
 
   update_blacklist_array();
@@ -1776,7 +1830,11 @@ void save_settings() {
   newsPrefs.putInt("day_bright", day_bright);
   newsPrefs.putInt("night_bright", night_bright);
   newsPrefs.putInt("scroll_int", scroll_interval_seconds);
-  newsPrefs.putString("rss_url", custom_rss_url);
+  newsPrefs.putString("rss_url1", custom_rss_urls[0]);
+  newsPrefs.putString("rss_url2", custom_rss_urls[1]);
+  newsPrefs.putString("rss_url3", custom_rss_urls[2]);
+  newsPrefs.putString("rss_url4", custom_rss_urls[3]);
+  newsPrefs.putString("rss_url5", custom_rss_urls[4]);
   newsPrefs.end();
 
   update_blacklist_array();
@@ -1954,7 +2012,41 @@ input:checked + .slider-toggle:before {
   color: #606060;
   margin-top: 20px;
 }
+.sug-btn {
+  background: rgba(0, 255, 102, 0.08);
+  color: #00ff66;
+  border: 1px solid rgba(0, 255, 102, 0.3);
+  border-radius: 6px;
+  padding: 8px 10px;
+  font-size: 12px;
+  font-weight: bold;
+  cursor: pointer;
+  text-align: center;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transition: 0.2s;
+}
+.sug-btn:hover {
+  background: rgba(0, 255, 102, 0.2);
+  border-color: #00ff66;
+  box-shadow: 0 0 8px rgba(0, 255, 102, 0.3);
+}
 </style>
+<script>
+function addSuggestion(url) {
+  for (let i = 1; i <= 5; i++) {
+    let inp = document.getElementById('rss_url_' + i);
+    if (inp && inp.value === '') {
+      inp.value = url;
+      return;
+    }
+  }
+  // If all are full, overwrite the first one
+  let first = document.getElementById('rss_url_1');
+  if (first) first.value = url;
+}
+</script>
 </head>
 <body>
 <div class="card">
@@ -1980,10 +2072,28 @@ input:checked + .slider-toggle:before {
       <input type="text" name="blacklist" value="{{BLACKLIST}}" placeholder="e.g. 香港文匯報,文匯報">
     </div>
     <div class="form-group">
-      <label>Custom RSS Feed URL</label>
-      <div style="display:flex;gap:10px;align-items:center;">
-        <input type="text" id="rss_url_input" name="rss_url" value="{{RSS_URL}}" placeholder="Leave blank to use default Google News" style="flex-grow:1;margin:0;">
-        <button type="button" class="btn" onclick="document.getElementById('rss_url_input').value='';" style="width:auto;margin:0;padding:12px 18px;background:linear-gradient(135deg,#ff3366 0%,#cc1144 100%);color:#ffffff;border-radius:8px;font-weight:bold;cursor:pointer;">Restore Default</button>
+      <label>Custom RSS Feeds (Up to 5, leave blank to use default Google News)</label>
+      <div style="display:flex;flex-direction:column;gap:8px;margin-bottom:8px;">
+        <input type="text" id="rss_url_1" name="rss_url1" value="{{RSS_URL1}}" placeholder="RSS Source 1 URL" style="margin:0;">
+        <input type="text" id="rss_url_2" name="rss_url2" value="{{RSS_URL2}}" placeholder="RSS Source 2 URL" style="margin:0;">
+        <input type="text" id="rss_url_3" name="rss_url3" value="{{RSS_URL3}}" placeholder="RSS Source 3 URL" style="margin:0;">
+        <input type="text" id="rss_url_4" name="rss_url4" value="{{RSS_URL4}}" placeholder="RSS Source 4 URL" style="margin:0;">
+        <input type="text" id="rss_url_5" name="rss_url5" value="{{RSS_URL5}}" placeholder="RSS Source 5 URL" style="margin:0;">
+      </div>
+      <button type="button" class="btn" onclick="for(let i=1;i<=5;i++)document.getElementById('rss_url_'+i).value='';" style="width:auto;margin:0 0 15px 0;padding:10px 15px;background:linear-gradient(135deg,#ff3366 0%,#cc1144 100%);color:#ffffff;border-radius:8px;font-weight:bold;cursor:pointer;">Restore Defaults (Clear All)</button>
+    </div>
+    
+    <div class="form-group">
+      <label>Suggested English News Sources (Click to add to empty slots)</label>
+      <div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(110px,1fr));gap:6px;max-height:120px;overflow-y:auto;background:rgba(20, 24, 30, 0.6);padding:8px;border-radius:8px;border:1px solid rgba(55, 63, 80, 0.6);">
+        <button type="button" class="sug-btn" onclick="addSuggestion('https://news.google.com/rss')">Google News</button>
+        <button type="button" class="sug-btn" onclick="addSuggestion('http://feeds.bbci.co.uk/news/world/rss.xml')">BBC News World</button>
+        <button type="button" class="sug-btn" onclick="addSuggestion('http://rss.cnn.com/rss/edition_world.rss')">CNN World</button>
+        <button type="button" class="sug-btn" onclick="addSuggestion('https://rss.nytimes.com/services/xml/rss/nyt/World.xml')">NYT World</button>
+        <button type="button" class="sug-btn" onclick="addSuggestion('https://ir.thomsonreuters.com/rss/news-releases.xml?items=15')">Reuters</button>
+        <button type="button" class="sug-btn" onclick="addSuggestion('https://news.google.com/rss/search?q=source:%22Associated%20Press%22')">AP News</button>
+        <button type="button" class="sug-btn" onclick="addSuggestion('https://techcrunch.com/feed/')">TechCrunch</button>
+        <button type="button" class="sug-btn" onclick="addSuggestion('https://www.wired.com/feed/rss')">Wired Science</button>
       </div>
     </div>
     
@@ -2051,8 +2161,8 @@ input:checked + .slider-toggle:before {
 )rawliteral";
 
 void handle_root() {
-  // Scan for Wi-Fi networks in the area
-  int n = WiFi.scanNetworks();
+  // Read scan results from background async scan (non-blocking)
+  int n = WiFi.scanComplete();
   String wifi_opts = "";
   if (n > 0) {
     for (int i = 0; i < n; ++i) {
@@ -2061,8 +2171,16 @@ void handle_root() {
       String enc = (WiFi.encryptionType(i) == WIFI_AUTH_OPEN) ? "Open" : "Secured";
       wifi_opts += "<option value=\"" + ssid + "\">" + ssid + " (" + String(rssi) + "dBm, " + enc + ")</option>\n";
     }
+    WiFi.scanDelete(); // Free memory
+  } else if (n == -1) { // WIFI_SCAN_RUNNING
+    wifi_opts += "<option value=\"\">-- Scanning in progress... Refresh page in a few seconds --</option>\n";
   } else {
-    wifi_opts += "<option value=\"\">No networks found</option>\n";
+    wifi_opts += "<option value=\"\">-- No cached networks (refresh page to start scan) --</option>\n";
+  }
+
+  // Trigger a new async scan for the next load if it's not currently running
+  if (n != -1) {
+    WiFi.scanNetworks(true);
   }
 
   String html = String(config_html);
@@ -2092,7 +2210,11 @@ void handle_root() {
   html.replace("{{DAY_BRIGHT}}", String(day_bright));
   html.replace("{{NIGHT_BRIGHT}}", String(night_bright));
   html.replace("{{SCROLL_INT}}", String(scroll_interval_seconds));
-  html.replace("{{RSS_URL}}", custom_rss_url);
+  html.replace("{{RSS_URL1}}", custom_rss_urls[0]);
+  html.replace("{{RSS_URL2}}", custom_rss_urls[1]);
+  html.replace("{{RSS_URL3}}", custom_rss_urls[2]);
+  html.replace("{{RSS_URL4}}", custom_rss_urls[3]);
+  html.replace("{{RSS_URL5}}", custom_rss_urls[4]);
 
   server.send(200, "text/html; charset=utf-8", html);
 }
@@ -2126,8 +2248,20 @@ void handle_save() {
   if (server.hasArg("scroll_int")) {
     scroll_interval_seconds = server.arg("scroll_int").toInt();
   }
-  if (server.hasArg("rss_url")) {
-    custom_rss_url = server.arg("rss_url");
+  if (server.hasArg("rss_url1")) {
+    custom_rss_urls[0] = server.arg("rss_url1");
+  }
+  if (server.hasArg("rss_url2")) {
+    custom_rss_urls[1] = server.arg("rss_url2");
+  }
+  if (server.hasArg("rss_url3")) {
+    custom_rss_urls[2] = server.arg("rss_url3");
+  }
+  if (server.hasArg("rss_url4")) {
+    custom_rss_urls[3] = server.arg("rss_url4");
+  }
+  if (server.hasArg("rss_url5")) {
+    custom_rss_urls[4] = server.arg("rss_url5");
   }
 
   save_settings();
