@@ -2,6 +2,9 @@
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
 #include <Preferences.h>
+#include <WebServer.h>
+#include <WiFiAP.h>
+#include <Update.h>
 #include "time.h"
 
 #include "user_config.h"
@@ -15,6 +18,11 @@
 #include "src/codec_board/codec_board.h"
 #include "src/codec_board/codec_init.h"
 
+#include "esp_sleep.h"
+#include "driver/gpio.h"
+#include "esp_pm.h"
+#include <Wire.h>
+
 // ==========================================
 // USER CONFIGURATION: Configure Wi-Fi Here
 // ==========================================
@@ -23,7 +31,7 @@
 // ==========================================
 
 // Global State
-#define MAX_HEADLINE_LEN 160
+#define MAX_HEADLINE_LEN 250
 #define MAX_SOURCE_LEN   48
 #define MAX_PUBDATE_LEN  24
 
@@ -33,12 +41,108 @@ struct NewsItem {
   char pubDate[MAX_PUBDATE_LEN];
 };
 
-#define MAX_NEWS_ITEMS 20
+#define MAX_NEWS_ITEMS 50
 #define MAX_CACHED_NEWS 10
 NewsItem news_list[MAX_NEWS_ITEMS];
 
 int news_count = 0;
 bool is_updating = false;
+
+WebServer server(80);
+bool ap_mode_started = false;
+
+// Dynamic Settings & Blacklist
+String wifi_ssid = "";
+String wifi_pass = "";
+String blacklist_str = "香港文匯報,文匯報,香港文汇报";
+bool sleep_enabled = false;
+int sleep_start = 23;
+int sleep_end = 7;
+bool auto_bright = false;
+int day_bright = 255;
+int night_bright = 50;
+int scroll_interval_seconds = 10;
+String custom_rss_url = "";
+
+#define MAX_BLACKLIST_COUNT 16
+char blacklist_items[MAX_BLACKLIST_COUNT][MAX_SOURCE_LEN];
+int blacklist_count = 0;
+
+// Forecast variables
+double forecast_max[3] = {0.0, 0.0, 0.0};
+double forecast_min[3] = {0.0, 0.0, 0.0};
+int forecast_code[3] = {0, 0, 0};
+bool forecast_fetched = false;
+int active_page = 0; // 0 = News, 1 = Forecast
+unsigned long last_sleep_bypass_time = 0;
+
+void switch_page(int page);
+
+void update_blacklist_array() {
+  blacklist_count = 0;
+  String temp = blacklist_str;
+  temp.trim();
+  if (temp.length() == 0) return;
+
+  int last_idx = 0;
+  int comma_idx = temp.indexOf(',');
+  while (blacklist_count < MAX_BLACKLIST_COUNT) {
+    String val;
+    if (comma_idx == -1) {
+      val = temp.substring(last_idx);
+      val.trim();
+      if (val.length() > 0) {
+        strncpy(blacklist_items[blacklist_count], val.c_str(), MAX_SOURCE_LEN - 1);
+        blacklist_items[blacklist_count][MAX_SOURCE_LEN - 1] = '\0';
+        blacklist_count++;
+      }
+      break;
+    } else {
+      val = temp.substring(last_idx, comma_idx);
+      val.trim();
+      if (val.length() > 0) {
+        strncpy(blacklist_items[blacklist_count], val.c_str(), MAX_SOURCE_LEN - 1);
+        blacklist_items[blacklist_count][MAX_SOURCE_LEN - 1] = '\0';
+        blacklist_count++;
+      }
+      last_idx = comma_idx + 1;
+      comma_idx = temp.indexOf(',', last_idx);
+    }
+  }
+}
+
+float get_battery_voltage() {
+  int raw = analogRead(4);
+  float voltage = (raw * 3.3 / 4095.0) * 3.0;
+  return voltage;
+}
+
+int get_battery_percentage() {
+  float v = get_battery_voltage();
+  if (v >= 4.2) return 100;
+  if (v <= 3.3) return 0;
+  return (int)((v - 3.3) / (4.2 - 3.3) * 100.0);
+}
+
+bool is_source_blacklisted(const char* source) {
+  if (source == NULL) return false;
+  for (int i = 0; i < blacklist_count; i++) {
+    if (strstr(source, blacklist_items[i]) != NULL) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool is_duplicate_headline(const char* headline, int current_count) {
+  if (headline == NULL || strlen(headline) == 0) return false;
+  for (int i = 0; i < current_count; i++) {
+    if (strcmp(news_list[i].headline, headline) == 0) {
+      return true;
+    }
+  }
+  return false;
+}
 volatile bool fetch_requested = true;
 int seconds_to_refresh = 300; // 5 minutes refresh interval
 int current_page = 0;
@@ -78,6 +182,7 @@ esp_codec_dev_handle_t record = NULL;
 esp_io_expander_handle_t io_expander = NULL;
 volatile int silence_minutes = 0;
 volatile bool is_dimmed = false;
+volatile int last_applied_brightness = -1;
 unsigned long last_sound_check_time = 0;
 
 // LVGL UI Handles
@@ -120,7 +225,56 @@ void save_news_cache(void);
 void resolve_region(String country);
 static void flash_top_panel(void);
 String build_news_meta(const NewsItem &item);
+void handle_root(void);
+void handle_save(void);
+void handle_ota_get(void);
+void handle_ota_post(void);
+void handle_ota_upload(void);
 
+// Add these definitions before setup()
+// Power management pins for ESP32-S3-Touch-LCD-3.49
+#define PIN_POWER_ON    21  // Common power enable pin
+#define PIN_BAT_ADC     14  // Battery voltage monitoring (if available)
+
+// Add this function before setup()
+void init_power_management() {
+    Serial.println("Configuring power management...");
+    
+    // Some Waveshare boards have these pins for power control
+    // Try setting GPIO 46 high if it exists (common power hold pin)
+    pinMode(46, OUTPUT);
+    digitalWrite(46, HIGH);
+    
+    // Also try GPIO 21 (sometimes used for power enable)
+    pinMode(21, OUTPUT);
+    digitalWrite(21, HIGH);
+    
+    // Prevent deep sleep
+    esp_sleep_disable_wakeup_source(ESP_SLEEP_WAKEUP_ALL);
+    
+    Serial.println("Power management configured.");
+}
+
+
+// Add to loop() or create a task for battery monitoring
+void check_battery_status() {
+    // Read battery voltage (if ADC pin is available)
+    analogReadResolution(12);
+    int bat_raw = analogRead(PIN_BAT_ADC);
+    float bat_voltage = (bat_raw / 4095.0) * 3.3 * 2; // Assuming voltage divider
+    
+    static unsigned long last_bat_check = 0;
+    if (millis() - last_bat_check > 60000) { // Check every minute
+        last_bat_check = millis();
+        Serial.printf("Battery: %.2fV (Raw: %d)\n", bat_voltage, bat_raw);
+        
+        // Update UI if battery is low
+        if (bat_voltage < 3.3 && lvgl_port_lock(100)) {
+            lv_label_set_text(status_label, "Low Battery!");
+            lvgl_port_unlock();
+        }
+    }
+}
 
 // Trims leading/trailing whitespace in-place; returns pointer to trimmed start.
 static char* trim_inplace(char* s) {
@@ -203,14 +357,49 @@ static void refresh_btn_event_handler(lv_event_t * e) {
   }
 }
 
+bool is_sleep_time_active() {
+  if (!sleep_enabled) return false;
+  struct tm timeinfo;
+  int current_hour = -1;
+  if (getLocalTime(&timeinfo)) {
+    current_hour = timeinfo.tm_hour;
+  } else {
+    return false;
+  }
+  
+  if (sleep_start > sleep_end) {
+    return (current_hour >= sleep_start || current_hour < sleep_end);
+  } else {
+    return (current_hour >= sleep_start && current_hour < sleep_end);
+  }
+}
+
 void reset_dim_timer(void) {
   silence_minutes = 0;
-  if (is_dimmed) {
+  last_sleep_bypass_time = millis();
+  
+  struct tm timeinfo;
+  int current_hour = 12;
+  if (getLocalTime(&timeinfo)) {
+    current_hour = timeinfo.tm_hour;
+  }
+  
+  int target_bright = 255;
+  if (auto_bright) {
+    if (current_hour >= 7 && current_hour < 19) {
+      target_bright = day_bright;
+    } else {
+      target_bright = night_bright;
+    }
+  } else {
+    target_bright = day_bright;
+  }
+
+  if (is_dimmed || is_sleep_time_active()) {
     is_dimmed = false;
-    // Called from LVGL's own event context (screen/panel tap), so no
-    // extra lvgl_port_lock needed here - already inside the LVGL task.
-    set_brightness_smooth(10, 255, 250);
-    Serial.println("[Power] Screen woke up: ramping to max brightness.");
+    last_applied_brightness = target_bright;
+    set_brightness_smooth(10, target_bright, 250);
+    Serial.printf("[Power] Screen woke up: ramping to %d.\n", target_bright);
   }
 }
 
@@ -219,13 +408,32 @@ static void screen_click_event_handler(lv_event_t * e) {
   if(code == LV_EVENT_PRESSED || code == LV_EVENT_CLICKED) {
     reset_dim_timer();
   }
+  else if (code == LV_EVENT_GESTURE) {
+    lv_dir_t dir = lv_indev_get_gesture_dir(lv_indev_active());
+    if (dir == LV_DIR_LEFT) {
+      Serial.println("[UI] Gesture Left detected: Swapping to Weather page");
+      switch_page(1);
+    } else if (dir == LV_DIR_RIGHT) {
+      Serial.println("[UI] Gesture Right detected: Swapping to News page");
+      switch_page(0);
+    }
+  }
 }
 
 void tca9554_init(void)
 {
   i2c_master_bus_handle_t tca9554_i2c_bus_ = NULL;
-  ESP_ERROR_CHECK(i2c_master_get_bus_handle(0,&tca9554_i2c_bus_));
+  if (i2c_master_get_bus_handle(0,&tca9554_i2c_bus_) != ESP_OK) {
+      Serial.println("TCA9554 bus not ready");
+      return;
+  }
   esp_io_expander_new_i2c_tca9554(tca9554_i2c_bus_, ESP_IO_EXPANDER_I2C_TCA9554_ADDRESS_000, &io_expander);
+  
+  // Power latch pin 6: Holds the power latch to keep the board on when running on battery (18650)
+  esp_io_expander_set_dir(io_expander, IO_EXPANDER_PIN_NUM_6, IO_EXPANDER_OUTPUT);
+  esp_io_expander_set_level(io_expander, IO_EXPANDER_PIN_NUM_6, 1);
+
+  // Audio power pin 7: Enables codec/audio power
   esp_io_expander_set_dir(io_expander, IO_EXPANDER_PIN_NUM_7, IO_EXPANDER_OUTPUT);
   esp_io_expander_set_level(io_expander, IO_EXPANDER_PIN_NUM_7, 1);
 }
@@ -251,17 +459,19 @@ void setup()
   Serial.begin(115200);
   delay(100);
   Serial.println("Initializing ESP32-S3 Google News Ticker...");
-
+  init_power_management();
   // Load any cached news from a previous session BEFORE anything else,
   // so we have something to show the instant the UI is created —
   // no waiting on Wi-Fi/RSS fetch for the first paint.
+  i2c_master_Init();
+
+  tca9554_init();
+
   load_cached_news();
 
   // Initialize Onboard Dual I2C buses (Touch & Sensors)
-  i2c_master_Init();
 
   // Initialize TCA9554 and Audio Codec (Power pin 7)
-  tca9554_init();
   audio_init();
 
   // Initialize LVGL Port (AXS15231B LCD & CST328 Touch Panel)
@@ -336,6 +546,12 @@ bool check_for_sound(void) {
 
   esp_codec_dev_close(record);
   Serial.printf("[Audio] Sound check complete. Max amplitude: %.2f\n", max_amplitude);
+
+  // If a very loud sound is detected (e.g. clap, shout > 1200.0) and the screen is dimmed/sleeping, wake it up!
+  if (max_amplitude > 1200.0 && (is_dimmed || is_sleep_time_active())) {
+    Serial.println("[Audio] Loud sound detected! Waking screen up.");
+    reset_dim_timer();
+  }
 
   return (max_amplitude > 350.0);
 }
@@ -529,6 +745,32 @@ void update_ui_news(void) {
 
 
 void update_ui_news_labels(void) {
+  if (active_page == 1) {
+    char tom_str[128];
+    char day_after_str[128];
+    
+    if (is_asia) {
+      sprintf(tom_str, "明日預報: %.1f°C ~ %.1f°C | %s", forecast_min[1], forecast_max[1], get_weather_desc(forecast_code[1]).c_str());
+      sprintf(day_after_str, "後日預報: %.1f°C ~ %.1f°C | %s", forecast_min[2], forecast_max[2], get_weather_desc(forecast_code[2]).c_str());
+      
+      lv_label_set_text(top_headline_lbl, tom_str);
+      lv_label_set_text(top_meta_lbl, "天氣預報");
+      
+      lv_label_set_text(bottom_headline_lbl, day_after_str);
+      lv_label_set_text(bottom_meta_lbl, "天氣預報");
+    } else {
+      sprintf(tom_str, "Tomorrow: %.1f°C - %.1f°C | %s", forecast_min[1], forecast_max[1], get_weather_desc(forecast_code[1]).c_str());
+      sprintf(day_after_str, "Day After: %.1f°C - %.1f°C | %s", forecast_min[2], forecast_max[2], get_weather_desc(forecast_code[2]).c_str());
+      
+      lv_label_set_text(top_headline_lbl, tom_str);
+      lv_label_set_text(top_meta_lbl, "Weather Forecast");
+      
+      lv_label_set_text(bottom_headline_lbl, day_after_str);
+      lv_label_set_text(bottom_meta_lbl, "Weather Forecast");
+    }
+    return;
+  }
+
   if (news_count == 0) {
     if (is_asia) {
       lv_label_set_text(top_headline_lbl, is_updating ? "正在擷取最新新聞..." : "無可用新聞。");
@@ -574,7 +816,7 @@ void update_status_time(void) {
     char timeStr[6];
     sprintf(timeStr, "%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min);
     
-    char dateStr[32];
+    char dateStr[80];
     if (is_asia) {
       // Traditional Chinese date: e.g. "8月1日 週六"
       const char* wd_names[] = {"週日", "週一", "週二", "週三", "週四", "週五", "週六"};
@@ -585,6 +827,8 @@ void update_status_time(void) {
       const char* wd_names[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
       sprintf(dateStr, "%s %d %s", months[timeinfo.tm_mon], timeinfo.tm_mday, wd_names[timeinfo.tm_wday]);
     }
+
+
 
     // Safely update LVGL labels
     if (lvgl_port_lock(100)) {
@@ -858,38 +1102,59 @@ int parse_rss_stream(WiFiClientSecure *stream) {
 
             // Split "Headline - Source Name"
             char* split = strrstr_custom(trimmed_title, " - ");
+            char source_name[MAX_SOURCE_LEN] = "";
             if (split) {
-              int headline_len = split - trimmed_title;
-              if (headline_len >= MAX_HEADLINE_LEN) headline_len = MAX_HEADLINE_LEN - 1;
-              strncpy(news_list[count].headline, trimmed_title, headline_len);
-              news_list[count].headline[headline_len] = '\0';
-
-              strncpy(news_list[count].source, split + 3, MAX_SOURCE_LEN - 1);
-              news_list[count].source[MAX_SOURCE_LEN - 1] = '\0';
+              strncpy(source_name, split + 3, MAX_SOURCE_LEN - 1);
+              source_name[MAX_SOURCE_LEN - 1] = '\0';
             } else {
-              strncpy(news_list[count].headline, trimmed_title, MAX_HEADLINE_LEN - 1);
-              news_list[count].headline[MAX_HEADLINE_LEN - 1] = '\0';
-              strncpy(news_list[count].source, "谷歌新聞", MAX_SOURCE_LEN - 1);
-              news_list[count].source[MAX_SOURCE_LEN - 1] = '\0';
+              strncpy(source_name, "谷歌新聞", MAX_SOURCE_LEN - 1);
+              source_name[MAX_SOURCE_LEN - 1] = '\0';
             }
 
-            // Clean up UTC timestamp: "Fri, 31 Jul 2026 12:34:56 GMT" -> "31 Jul 12:34"
-            size_t pd_len = strlen(trimmed_pubdate);
-            if (pd_len > 22) {
-              char day_month[8]; // "31 Jul"
-              char hh_mm[8];     // "12:34"
-              strncpy(day_month, trimmed_pubdate + 5, 6); day_month[6] = '\0';
-              strncpy(hh_mm, trimmed_pubdate + 17, 5); hh_mm[5] = '\0';
-              snprintf(news_list[count].pubDate, MAX_PUBDATE_LEN, "%s %s", day_month, hh_mm);
-            } else {
-              strncpy(news_list[count].pubDate, trimmed_pubdate, MAX_PUBDATE_LEN - 1);
-              news_list[count].pubDate[MAX_PUBDATE_LEN - 1] = '\0';
-            }
+            char* trimmed_source = trim_inplace(source_name);
 
-            Serial.printf("[News] Got: %s [%s]\n", news_list[count].headline, news_list[count].source);
-            count++;
+            if (is_source_blacklisted(trimmed_source)) {
+              Serial.printf("[News] Ignored blacklisted source: %s\n", trimmed_source);
+            } else {
+              char temp_headline[MAX_HEADLINE_LEN] = "";
+              if (split) {
+                int headline_len = split - trimmed_title;
+                if (headline_len >= MAX_HEADLINE_LEN) headline_len = MAX_HEADLINE_LEN - 1;
+                strncpy(temp_headline, trimmed_title, headline_len);
+                temp_headline[headline_len] = '\0';
+              } else {
+                strncpy(temp_headline, trimmed_title, MAX_HEADLINE_LEN - 1);
+                temp_headline[MAX_HEADLINE_LEN - 1] = '\0';
+              }
+              
+              char* final_headline = trim_inplace(temp_headline);
+
+              if (is_duplicate_headline(final_headline, count)) {
+                Serial.printf("[News] Ignored duplicate headline: %s\n", final_headline);
+              } else {
+                strcpy(news_list[count].headline, final_headline);
+                strncpy(news_list[count].source, trimmed_source, MAX_SOURCE_LEN - 1);
+                news_list[count].source[MAX_SOURCE_LEN - 1] = '\0';
+
+              // Clean up UTC timestamp: "Fri, 31 Jul 2026 12:34:56 GMT" -> "31 Jul 12:34"
+              size_t pd_len = strlen(trimmed_pubdate);
+              if (pd_len > 22) {
+                char day_month[8]; // "31 Jul"
+                char hh_mm[8];     // "12:34"
+                strncpy(day_month, trimmed_pubdate + 5, 6); day_month[6] = '\0';
+                strncpy(hh_mm, trimmed_pubdate + 17, 5); hh_mm[5] = '\0';
+                snprintf(news_list[count].pubDate, MAX_PUBDATE_LEN, "%s %s", day_month, hh_mm);
+              } else {
+                strncpy(news_list[count].pubDate, trimmed_pubdate, MAX_PUBDATE_LEN - 1);
+                news_list[count].pubDate[MAX_PUBDATE_LEN - 1] = '\0';
+              }
+
+              Serial.printf("[News] Got: %s [%s]\n", news_list[count].headline, news_list[count].source);
+              count++;
+            }
           }
-          if (count >= MAX_NEWS_ITEMS) break;
+        }
+        if (count >= MAX_NEWS_ITEMS) break;
         } else if (strcmp(tag_buf, "title") == 0) {
           in_title = true; in_pubdate = false;
         } else if (strcmp(tag_buf, "/title") == 0) {
@@ -964,10 +1229,9 @@ static void flash_top_panel(void) {
 }
 
 void fetch_news_task(void *pvParameters) {
-  // Connect to Wi-Fi
-  Serial.print("Connecting to Wi-Fi: ");
-  Serial.println(WIFI_SSID);
-  
+  // Load settings from NVS
+  load_settings();
+
   if (lvgl_port_lock(-1)) {
     lv_label_set_text(status_label, "Connecting Wi-Fi...");
     lvgl_port_unlock();
@@ -977,7 +1241,9 @@ void fetch_news_task(void *pvParameters) {
   WiFi.setSleep(false);
   WiFi.setAutoReconnect(true);
 
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  Serial.print("Connecting to Wi-Fi: ");
+  Serial.println(wifi_ssid);
+  WiFi.begin(wifi_ssid.c_str(), wifi_pass.c_str());
   int retry_count = 0;
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
@@ -985,33 +1251,106 @@ void fetch_news_task(void *pvParameters) {
     retry_count++;
     if (retry_count > 30) { // Timeout after 15 seconds
       Serial.println("\nWi-Fi connection failed.");
-      if (lvgl_port_lock(-1)) {
-        lv_label_set_text(status_label, "Connection failed");
-        lvgl_port_unlock();
-      }
       break;
     }
   }
 
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\nWi-Fi Connected successfully!");
-    if (lvgl_port_lock(-1)) {
-      lv_label_set_text(status_label, "Wi-Fi Connected");
-      lvgl_port_unlock();
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("\nStarting Access Point 'ESP32_News_Ticker' for setup...");
+    ap_mode_started = true;
+    WiFi.mode(WIFI_AP);
+    WiFi.softAP("ESP32_News_Ticker");
+    
+    Serial.print("AP IP Address: ");
+    Serial.println(WiFi.softAPIP());
+    
+    // Show AP instructions on the screen
+    show_ap_mode_ui();
+    
+    // Start Web Server
+    server.on("/", handle_root);
+    server.on("/save", HTTP_POST, handle_save);
+    server.on("/update", HTTP_GET, handle_ota_get);
+    server.on("/update", HTTP_POST, handle_ota_post, handle_ota_upload);
+    server.begin();
+    
+    // Loop in AP mode indefinitely until user configures Wi-Fi
+    for (;;) {
+      server.handleClient();
+      vTaskDelay(pdMS_TO_TICKS(10));
     }
-    wifi_was_connected = true; // baseline state for the health-tracking logic
-
-    // Configure NTP Local Chinese Time (Beijing/Hong Kong time: GMT+8)
-    configTzTime("CST-8", "pool.ntp.org", "ntp.aliyun.com");
   }
+
+  Serial.println("\nWi-Fi Connected successfully!");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
+
+  if (lvgl_port_lock(-1)) {
+    char ip_str[32];
+    sprintf(ip_str, "IP: %s", WiFi.localIP().toString().c_str());
+    lv_label_set_text(status_label, ip_str);
+    lvgl_port_unlock();
+  }
+  wifi_was_connected = true; // baseline state for the health-tracking logic
+
+  // Configure NTP Local Chinese Time (Beijing/Hong Kong time: GMT+8)
+  configTzTime("CST-8", "pool.ntp.org", "ntp.aliyun.com");
+
+  // Start Web Server in Station Mode
+  server.on("/", handle_root);
+  server.on("/save", HTTP_POST, handle_save);
+  server.on("/update", HTTP_GET, handle_ota_get);
+  server.on("/update", HTTP_POST, handle_ota_post, handle_ota_upload);
+  server.begin();
 
   unsigned long last_fetch_time = 0;
   unsigned long last_scroll_time = 0;
   
+
+
   for(;;) {
+    server.handleClient(); // Serve config page requests
+
     // 1. Periodically update NTP clock every second
     if (WiFi.status() == WL_CONNECTED) {
       update_status_time();
+    }
+
+    struct tm timeinfo;
+    int current_hour = 12;
+    if (getLocalTime(&timeinfo)) {
+      current_hour = timeinfo.tm_hour;
+    }
+
+    // Evaluate target brightness based on time/auto-brightness configuration
+    int base_brightness = 255;
+    if (auto_bright) {
+      if (current_hour >= 7 && current_hour < 19) {
+        base_brightness = day_bright;
+      } else {
+        base_brightness = night_bright;
+      }
+    } else {
+      base_brightness = day_bright;
+    }
+
+    // Apply sleep scheduling
+    bool sleep_active = is_sleep_time_active();
+    int current_target = base_brightness;
+    if (sleep_active) {
+      if (millis() - last_sleep_bypass_time < 30000) {
+        current_target = is_dimmed ? 10 : base_brightness;
+      } else {
+        current_target = 0;
+      }
+    } else {
+      current_target = is_dimmed ? 10 : base_brightness;
+    }
+
+    if (current_target != last_applied_brightness) {
+      last_applied_brightness = current_target;
+      setUpduty(current_target);
+      Serial.printf("[Power] Applied brightness level: %d\n", current_target);
     }
 
     // 5. Periodic Sound Level check (every 5 minutes)
@@ -1041,7 +1380,7 @@ void fetch_news_task(void *pvParameters) {
     }
 
     // 2. Automated Page-Flipping Scroll: Trigger fade transition every 10 seconds (10000ms)
-    if (news_count > 0 && !is_updating && (now - last_scroll_time > 10000)) {
+    if (active_page == 0 && news_count > 0 && !is_updating && (now - last_scroll_time > (scroll_interval_seconds * 1000))) {
       last_scroll_time = now;
       if (lvgl_port_lock(100)) {
         // Trigger fade out transition on the news container
@@ -1061,17 +1400,40 @@ void fetch_news_task(void *pvParameters) {
     // actually changed, avoiding redundant redraws (e.g. every tick while
     // "is_updating" stays true for the whole fetch cycle).
     {
-      static char last_status_str[32] = "";
-      char new_status_str[32];
+      static char last_status_str[48] = "";
+      char new_status_str[48] = "";
 
-      if (is_updating) {
-        strncpy(new_status_str, is_asia ? "正在更新..." : "Updating...", sizeof(new_status_str) - 1);
-        new_status_str[sizeof(new_status_str) - 1] = '\0';
-      } else if (is_asia) {
-        snprintf(new_status_str, sizeof(new_status_str), "%d秒後更新", seconds_to_refresh);
-      } else {
-        snprintf(new_status_str, sizeof(new_status_str), "Refresh in %ds", seconds_to_refresh);
+      static int status_rotation_state = 0;
+      static unsigned long last_status_rotate_time = 0;
+
+      unsigned long now_ms = millis();
+      if (now_ms - last_status_rotate_time >= 3000) {
+        last_status_rotate_time = now_ms;
+        status_rotation_state = (status_rotation_state + 1) % 3;
       }
+
+      if (status_rotation_state == 0) {
+        if (is_updating) {
+          strncpy(new_status_str, is_asia ? "正在更新..." : "Updating...", sizeof(new_status_str) - 1);
+        } else if (active_page == 1) {
+          strncpy(new_status_str, is_asia ? "左右滑動切換" : "Swipe for News", sizeof(new_status_str) - 1);
+        } else if (is_asia) {
+          snprintf(new_status_str, sizeof(new_status_str), "%d秒後更新", seconds_to_refresh);
+        } else {
+          snprintf(new_status_str, sizeof(new_status_str), "Refresh in %ds", seconds_to_refresh);
+        }
+      } else if (status_rotation_state == 1) {
+        if (WiFi.status() == WL_CONNECTED) {
+          int rssi = WiFi.RSSI();
+          snprintf(new_status_str, sizeof(new_status_str), "WiFi: %d dBm", rssi);
+        } else {
+          strncpy(new_status_str, "WiFi: Offline", sizeof(new_status_str) - 1);
+        }
+      } else { // State 2: Battery
+        int bat = get_battery_percentage();
+        snprintf(new_status_str, sizeof(new_status_str), "Battery: %d%%", bat);
+      }
+      new_status_str[sizeof(new_status_str) - 1] = '\0';
 
       if (strcmp(new_status_str, last_status_str) != 0) {
         strncpy(last_status_str, new_status_str, sizeof(last_status_str) - 1);
@@ -1222,7 +1584,7 @@ void fetch_news_task(void *pvParameters) {
         // B. Weather: Query Open-Meteo API using parsed coordinates
         Serial.println("Querying Weather API...");
         String weather_url = "http://api.open-meteo.com/v1/forecast?latitude=" + String(lat, 4) + 
-                             "&longitude=" + String(lon, 4) + "&current=temperature_2m,weather_code";
+                             "&longitude=" + String(lon, 4) + "&current=temperature_2m,weather_code&daily=temperature_2m_max,temperature_2m_min,weather_code";
         http.begin(client, weather_url);
         http.setTimeout(6000);
         int weatherCode = http.GET();
@@ -1257,6 +1619,50 @@ void fetch_news_task(void *pvParameters) {
             Serial.printf("[Weather] Temp: %.1f, Code: %d (%s)\n", local_temp, wcode, local_weather_desc.c_str());
             weather_fetched = true;
           }
+
+          // Parse daily forecast arrays for Tomorrow and Day After
+          int daily_idx = payload.indexOf("\"daily\":{");
+          if (daily_idx != -1) {
+            // 1. Max temperatures
+            int max_idx = payload.indexOf("\"temperature_2m_max\":[", daily_idx);
+            if (max_idx != -1) {
+              int start = max_idx + 22;
+              for (int i = 0; i < 3; i++) {
+                int end = payload.indexOf(i == 2 ? "]" : ",", start);
+                if (end != -1) {
+                  forecast_max[i] = payload.substring(start, end).toDouble();
+                  start = end + 1;
+                }
+              }
+            }
+
+            // 2. Min temperatures
+            int min_idx = payload.indexOf("\"temperature_2m_min\":[", daily_idx);
+            if (min_idx != -1) {
+              int start = min_idx + 22;
+              for (int i = 0; i < 3; i++) {
+                int end = payload.indexOf(i == 2 ? "]" : ",", start);
+                if (end != -1) {
+                  forecast_min[i] = payload.substring(start, end).toDouble();
+                  start = end + 1;
+                }
+              }
+            }
+
+            // 3. Weather codes
+            int code_idx = payload.indexOf("\"weather_code\":[", daily_idx);
+            if (code_idx != -1) {
+              int start = code_idx + 16;
+              for (int i = 0; i < 3; i++) {
+                int end = payload.indexOf(i == 2 ? "]" : ",", start);
+                if (end != -1) {
+                  forecast_code[i] = payload.substring(start, end).toInt();
+                  start = end + 1;
+                }
+              }
+            }
+            forecast_fetched = true;
+          }
         } else {
           Serial.printf("[Weather] Failed, HTTP code: %d\n", weatherCode);
           local_weather_desc = is_asia ? "獲取失敗" : "Failed";
@@ -1280,11 +1686,16 @@ void fetch_news_task(void *pvParameters) {
         // (districts/suburbs are mapped to their parent city for better results)
 // Fetch Local News search feed using the region-matched city and
         // its correct Google News hl/gl/ceid edition params.
-        String query_city = news_query_city;
-        query_city.replace(" ", "%20");
-        String feed_url = "https://news.google.com/rss/search?q=" + query_city +
-                           "&hl=" + news_hl + "&gl=" + news_gl + "&ceid=" + news_ceid +
-                           "&nocache=" + String(millis());
+        String feed_url = "";
+        if (custom_rss_url.length() > 0) {
+          feed_url = custom_rss_url;
+        } else {
+          String query_city = news_query_city;
+          query_city.replace(" ", "%20");
+          feed_url = "https://news.google.com/rss/search?q=" + query_city +
+                     "&hl=" + news_hl + "&gl=" + news_gl + "&ceid=" + news_ceid +
+                     "&nocache=" + String(millis());
+        }
 
         Serial.println("Fetching local news from: " + feed_url);
         http.begin(secure_client, feed_url);
@@ -1329,5 +1740,510 @@ void fetch_news_task(void *pvParameters) {
     }
 
     vTaskDelay(pdMS_TO_TICKS(1000));
+  }
+}
+
+// ----------------------------------------------------
+// NVS / Settings Management
+// ----------------------------------------------------
+void load_settings() {
+  newsPrefs.begin("news", false);
+  wifi_ssid = newsPrefs.getString("ssid", WIFI_SSID);
+  wifi_pass = newsPrefs.getString("pass", WIFI_PASSWORD);
+  blacklist_str = newsPrefs.getString("blacklist", "香港文匯報,文匯報,香港文汇报");
+  sleep_enabled = newsPrefs.getBool("sleep_on", false);
+  sleep_start = newsPrefs.getInt("sleep_start", 23);
+  sleep_end = newsPrefs.getInt("sleep_end", 7);
+  auto_bright = newsPrefs.getBool("auto_bright", false);
+  day_bright = newsPrefs.getInt("day_bright", 255);
+  night_bright = newsPrefs.getInt("night_bright", 50);
+  scroll_interval_seconds = newsPrefs.getInt("scroll_int", 10);
+  custom_rss_url = newsPrefs.getString("rss_url", "");
+  newsPrefs.end();
+
+  update_blacklist_array();
+}
+
+void save_settings() {
+  newsPrefs.begin("news", false);
+  newsPrefs.putString("ssid", wifi_ssid);
+  newsPrefs.putString("pass", wifi_pass);
+  newsPrefs.putString("blacklist", blacklist_str);
+  newsPrefs.putBool("sleep_on", sleep_enabled);
+  newsPrefs.putInt("sleep_start", sleep_start);
+  newsPrefs.putInt("sleep_end", sleep_end);
+  newsPrefs.putBool("auto_bright", auto_bright);
+  newsPrefs.putInt("day_bright", day_bright);
+  newsPrefs.putInt("night_bright", night_bright);
+  newsPrefs.putInt("scroll_int", scroll_interval_seconds);
+  newsPrefs.putString("rss_url", custom_rss_url);
+  newsPrefs.end();
+
+  update_blacklist_array();
+}
+
+// ----------------------------------------------------
+// Page Navigation (News Ticker vs Weather Forecast)
+// ----------------------------------------------------
+void switch_page(int page) {
+  active_page = page;
+  if (lvgl_port_lock(100)) {
+    update_ui_news_labels();
+    if (active_page == 1) {
+      lv_label_set_text(status_label, is_asia ? "左右滑動切換" : "Swipe for News");
+    } else {
+      char countdown_str[32];
+      if (is_asia) {
+        sprintf(countdown_str, "%d秒後更新", seconds_to_refresh);
+      } else {
+        sprintf(countdown_str, "Refresh in %ds", seconds_to_refresh);
+      }
+      lv_label_set_text(status_label, countdown_str);
+    }
+    lvgl_port_unlock();
+  }
+}
+
+// ----------------------------------------------------
+// Web Portal Handlers & Content (PROGMEM)
+// ----------------------------------------------------
+const char config_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>News Ticker Setup</title>
+<style>
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  background: linear-gradient(135deg, #0f1116 0%, #191e28 100%);
+  color: #f0f0f0;
+  margin: 0;
+  padding: 20px;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  min-height: 100vh;
+}
+.card {
+  background: rgba(33, 38, 48, 0.7);
+  backdrop-filter: blur(10px);
+  border: 1px solid rgba(55, 63, 80, 0.8);
+  border-radius: 16px;
+  padding: 24px;
+  width: 100%;
+  max-width: 440px;
+  box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.3);
+}
+h2 {
+  margin-top: 0;
+  font-weight: 600;
+  color: #00ff66;
+  text-align: center;
+  border-bottom: 1px solid rgba(55, 63, 80, 0.5);
+  padding-bottom: 12px;
+}
+.form-group {
+  margin-bottom: 20px;
+}
+label {
+  display: block;
+  font-size: 14px;
+  margin-bottom: 8px;
+  color: #b0b0b0;
+}
+input[type="text"], input[type="password"], select {
+  width: 100%;
+  padding: 12px;
+  background: rgba(20, 24, 30, 0.8);
+  border: 1px solid rgba(55, 63, 80, 0.8);
+  border-radius: 8px;
+  color: #ffffff;
+  box-sizing: border-box;
+  font-size: 16px;
+}
+input[type="text"]:focus, input[type="password"]:focus, select:focus {
+  border-color: #00ff66;
+  outline: none;
+}
+.row {
+  display: flex;
+  gap: 12px;
+}
+.row .form-group {
+  flex: 1;
+}
+.toggle-group {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  background: rgba(20, 24, 30, 0.4);
+  padding: 12px;
+  border-radius: 8px;
+  border: 1px solid rgba(55, 63, 80, 0.4);
+}
+.switch {
+  position: relative;
+  display: inline-block;
+  width: 48px;
+  height: 24px;
+}
+.switch input {
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+.slider-toggle {
+  position: absolute;
+  cursor: pointer;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background-color: #332630;
+  transition: .3s;
+  border-radius: 24px;
+}
+.slider-toggle:before {
+  position: absolute;
+  content: "";
+  height: 18px;
+  width: 18px;
+  left: 3px;
+  bottom: 3px;
+  background-color: white;
+  transition: .3s;
+  border-radius: 50%;
+}
+input:checked + .slider-toggle {
+  background-color: #00ff66;
+}
+input:checked + .slider-toggle:before {
+  transform: translateX(24px);
+}
+.slider-val {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.slider-val input[type="range"] {
+  flex: 1;
+  accent-color: #00ff66;
+}
+.btn {
+  width: 100%;
+  padding: 14px;
+  background: linear-gradient(135deg, #00ff66 0%, #00cc55 100%);
+  border: none;
+  border-radius: 8px;
+  color: #050505;
+  font-size: 16px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: 0.2s;
+  margin-top: 10px;
+}
+.btn:hover {
+  opacity: 0.9;
+  box-shadow: 0 0 12px rgba(0, 255, 102, 0.4);
+}
+.footer {
+  text-align: center;
+  font-size: 12px;
+  color: #606060;
+  margin-top: 20px;
+}
+</style>
+</head>
+<body>
+<div class="card">
+  <h2>News Ticker Setup</h2>
+  <form action="/save" method="POST">
+    <div class="form-group">
+      <label>Scanned Wi-Fi Networks</label>
+      <select id="wifi_select" onchange="if(this.value){document.getElementById('ssid_input').value = this.value;}">
+        <option value="">-- Select network or type below --</option>
+        {{WIFI_OPTIONS}}
+      </select>
+    </div>
+    <div class="form-group">
+      <label>Wi-Fi SSID</label>
+      <input type="text" id="ssid_input" name="ssid" value="{{SSID}}" placeholder="Enter Wi-Fi SSID" required>
+    </div>
+    <div class="form-group">
+      <label>Wi-Fi Password</label>
+      <input type="password" name="pass" value="{{PASS}}" placeholder="Enter Wi-Fi Password">
+    </div>
+    <div class="form-group">
+      <label>Blacklisted Sources (Comma-separated)</label>
+      <input type="text" name="blacklist" value="{{BLACKLIST}}" placeholder="e.g. 香港文匯報,文匯報">
+    </div>
+    <div class="form-group">
+      <label>Custom RSS Feed URL</label>
+      <div style="display:flex;gap:10px;align-items:center;">
+        <input type="text" id="rss_url_input" name="rss_url" value="{{RSS_URL}}" placeholder="Leave blank to use default Google News" style="flex-grow:1;margin:0;">
+        <button type="button" class="btn" onclick="document.getElementById('rss_url_input').value='';" style="width:auto;margin:0;padding:12px 18px;background:linear-gradient(135deg,#ff3366 0%,#cc1144 100%);color:#ffffff;border-radius:8px;font-weight:bold;cursor:pointer;">Restore Default</button>
+      </div>
+    </div>
+    
+    <div class="form-group toggle-group">
+      <label style="margin-bottom:0;">Smart Sleep Hours</label>
+      <label class="switch">
+        <input type="checkbox" name="sleep_on" value="1" {{SLEEP_CHECKED}}>
+        <span class="slider-toggle"></span>
+      </label>
+    </div>
+    
+    <div class="row">
+      <div class="form-group">
+        <label>Sleep Start Hour</label>
+        <select name="sleep_start">
+          {{START_OPTIONS}}
+        </select>
+      </div>
+      <div class="form-group">
+        <label>Sleep End Hour</label>
+        <select name="sleep_end">
+          {{END_OPTIONS}}
+        </select>
+      </div>
+    </div>
+
+    <div class="form-group toggle-group">
+      <label style="margin-bottom:0;">Auto Brightness (Day/Night)</label>
+      <label class="switch">
+        <input type="checkbox" name="auto_bright" value="1" {{BRIGHT_CHECKED}}>
+        <span class="slider-toggle"></span>
+      </label>
+    </div>
+
+    <div class="form-group">
+      <label>Day Brightness</label>
+      <div class="slider-val">
+        <input type="range" name="day_bright" min="10" max="255" value="{{DAY_BRIGHT}}" oninput="this.nextElementSibling.innerText = this.value">
+        <span style="width: 30px; text-align: right;">{{DAY_BRIGHT}}</span>
+      </div>
+    </div>
+
+    <div class="form-group">
+      <label>Night Brightness</label>
+      <div class="slider-val">
+        <input type="range" name="night_bright" min="10" max="255" value="{{NIGHT_BRIGHT}}" oninput="this.nextElementSibling.innerText = this.value">
+        <span style="width: 30px; text-align: right;">{{NIGHT_BRIGHT}}</span>
+      </div>
+    </div>
+    
+    <div class="form-group">
+      <label>News Scroll Interval (seconds)</label>
+      <input type="number" name="scroll_int" min="3" max="60" value="{{SCROLL_INT}}" required style="width:100%;padding:12px;background:rgba(20, 24, 30, 0.8);border:1px solid rgba(55, 63, 80, 0.8);border-radius:8px;color:#ffffff;box-sizing:border-box;font-size:16px;">
+    </div>
+    
+    <button type="submit" class="btn">Save & Reboot</button>
+  </form>
+  <div style="text-align:center;margin-top:15px;">
+    <a href="/update" style="color:#00ff66;text-decoration:none;font-size:14px;">Go to Firmware Update (OTA)</a>
+  </div>
+  <div class="footer">ESP32-S3 News Ticker Portal</div>
+</div>
+</body>
+</html>
+)rawliteral";
+
+void handle_root() {
+  // Scan for Wi-Fi networks in the area
+  int n = WiFi.scanNetworks();
+  String wifi_opts = "";
+  if (n > 0) {
+    for (int i = 0; i < n; ++i) {
+      String ssid = WiFi.SSID(i);
+      int rssi = WiFi.RSSI(i);
+      String enc = (WiFi.encryptionType(i) == WIFI_AUTH_OPEN) ? "Open" : "Secured";
+      wifi_opts += "<option value=\"" + ssid + "\">" + ssid + " (" + String(rssi) + "dBm, " + enc + ")</option>\n";
+    }
+  } else {
+    wifi_opts += "<option value=\"\">No networks found</option>\n";
+  }
+
+  String html = String(config_html);
+  html.replace("{{WIFI_OPTIONS}}", wifi_opts);
+  html.replace("{{SSID}}", wifi_ssid);
+  html.replace("{{PASS}}", wifi_pass);
+  html.replace("{{BLACKLIST}}", blacklist_str);
+  html.replace("{{SLEEP_CHECKED}}", sleep_enabled ? "checked" : "");
+  html.replace("{{BRIGHT_CHECKED}}", auto_bright ? "checked" : "");
+  
+  String start_opts = "";
+  for (int h = 0; h < 24; h++) {
+    String hr = String(h);
+    String sel = (h == sleep_start) ? "selected" : "";
+    start_opts += "<option value=\"" + hr + "\" " + sel + ">" + hr + ":00</option>\n";
+  }
+  html.replace("{{START_OPTIONS}}", start_opts);
+
+  String end_opts = "";
+  for (int h = 0; h < 24; h++) {
+    String hr = String(h);
+    String sel = (h == sleep_end) ? "selected" : "";
+    end_opts += "<option value=\"" + hr + "\" " + sel + ">" + hr + ":00</option>\n";
+  }
+  html.replace("{{END_OPTIONS}}", end_opts);
+
+  html.replace("{{DAY_BRIGHT}}", String(day_bright));
+  html.replace("{{NIGHT_BRIGHT}}", String(night_bright));
+  html.replace("{{SCROLL_INT}}", String(scroll_interval_seconds));
+  html.replace("{{RSS_URL}}", custom_rss_url);
+
+  server.send(200, "text/html; charset=utf-8", html);
+}
+
+void handle_save() {
+  if (server.hasArg("ssid")) {
+    wifi_ssid = server.arg("ssid");
+  }
+  if (server.hasArg("pass")) {
+    wifi_pass = server.arg("pass");
+  }
+  if (server.hasArg("blacklist")) {
+    blacklist_str = server.arg("blacklist");
+  }
+  
+  sleep_enabled = server.hasArg("sleep_on");
+  if (server.hasArg("sleep_start")) {
+    sleep_start = server.arg("sleep_start").toInt();
+  }
+  if (server.hasArg("sleep_end")) {
+    sleep_end = server.arg("sleep_end").toInt();
+  }
+  
+  auto_bright = server.hasArg("auto_bright");
+  if (server.hasArg("day_bright")) {
+    day_bright = server.arg("day_bright").toInt();
+  }
+  if (server.hasArg("night_bright")) {
+    night_bright = server.arg("night_bright").toInt();
+  }
+  if (server.hasArg("scroll_int")) {
+    scroll_interval_seconds = server.arg("scroll_int").toInt();
+  }
+  if (server.hasArg("rss_url")) {
+    custom_rss_url = server.arg("rss_url");
+  }
+
+  save_settings();
+
+  String success_html = "<html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'>"
+                        "<style>body{background:#0f1116;color:#00ff66;font-family:sans-serif;text-align:center;padding:50px;}"
+                        "h2{margin-top:100px;}</style></head><body>"
+                        "<h2>Settings Saved successfully!</h2>"
+                        "<p>Rebooting device to apply new configurations...</p>"
+                        "</body></html>";
+  server.send(200, "text/html; charset=utf-8", success_html);
+  
+  delay(1000);
+  ESP.restart();
+}
+
+void show_ap_mode_ui() {
+  if (lvgl_port_lock(-1)) {
+    lv_label_set_text(status_label, "Setup Mode (192.168.4.1)");
+    lv_label_set_text(top_headline_lbl, "Wi-Fi disconnected. Connect to Hotspot:\nSSID: ESP32_News_Ticker");
+    lv_label_set_text(bottom_headline_lbl, "Open browser and configure device at:\nhttp://192.168.4.1/");
+    lvgl_port_unlock();
+  }
+}
+
+// ----------------------------------------------------
+// Web OTA Firmware Updater Handlers & Page
+// ----------------------------------------------------
+const char ota_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Firmware Update</title>
+<style>
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:linear-gradient(135deg,#0f1116 0%,#191e28 100%);color:#f0f0f0;text-align:center;padding:50px;margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;}
+.card{background:rgba(33,38,48,0.7);backdrop-filter:blur(10px);border:1px solid rgba(55,63,80,0.8);border-radius:16px;padding:30px;width:100%;max-width:380px;box-shadow:0 8px 32px 0 rgba(0,0,0,0.3);}
+h2{margin-top:0;font-weight:600;color:#00ff66;}
+.btn{background:linear-gradient(135deg,#00ff66 0%,#00cc55 100%);color:#050505;border:none;padding:14px;border-radius:8px;font-size:16px;cursor:pointer;font-weight:bold;width:100%;margin-top:20px;transition:0.2s;}
+.btn:hover{opacity:0.9;box-shadow:0 0 12px rgba(0,255,102,0.4);}
+progress{width:100%;accent-color:#00ff66;margin-top:20px;height:12px;border-radius:6px;background:rgba(20,24,30,0.8);}
+</style>
+</head>
+<body>
+<div class="card">
+  <h2>Firmware OTA Update</h2>
+  <form method="POST" action="/update" enctype="multipart/form-data" id="upload_form">
+    <input type="file" name="update" accept=".bin" required style="width:100%;background:rgba(20,24,30,0.8);padding:10px;border-radius:6px;box-sizing:border-box;border:1px solid rgba(55,63,80,0.8);color:#ffffff;">
+    <button type="submit" class="btn">Update Firmware</button>
+  </form>
+  <div id="prg_box" style="display:none;">
+    <progress id="prg" value="0" max="100"></progress>
+    <div id="prg_pct" style="margin-top:10px;font-size:18px;font-weight:bold;color:#00ff66;">0%</div>
+  </div>
+</div>
+<script>
+document.getElementById('upload_form').onsubmit = function(e) {
+  e.preventDefault();
+  var form = new FormData(this);
+  var xhr = new XMLHttpRequest();
+  xhr.open('POST', '/update', true);
+  
+  document.getElementById('upload_form').style.display = 'none';
+  document.getElementById('prg_box').style.display = 'block';
+  
+  xhr.upload.onprogress = function(e) {
+    if (e.lengthComputable) {
+      var p = Math.round((e.loaded / e.total) * 100);
+      document.getElementById('prg').value = p;
+      document.getElementById('prg_pct').innerText = p + '%';
+    }
+  };
+  
+  xhr.onload = function() {
+    if (xhr.status == 200) {
+      document.body.innerHTML = '<h2>Update Successful!</h2><p>Rebooting device...</p>';
+      setTimeout(function() { window.location.href = '/'; }, 5000);
+    } else {
+      document.body.innerHTML = '<h2 style="color:red;">Update Failed!</h2><p>' + xhr.responseText + '</p><a href="/update" style="color:#00ff66;">Try again</a>';
+    }
+  };
+  xhr.send(form);
+};
+</script>
+</body>
+</html>
+)rawliteral";
+
+void handle_ota_get() {
+  server.send(200, "text/html; charset=utf-8", ota_html);
+}
+
+void handle_ota_post() {
+  server.sendHeader("Connection", "close");
+  server.send(200, "text/plain", (Update.hasError()) ? "FAIL" : "OK");
+  delay(1000);
+  ESP.restart();
+}
+
+void handle_ota_upload() {
+  HTTPUpload& upload = server.upload();
+  if (upload.status == UPLOAD_FILE_START) {
+    Serial.printf("Update: %s\n", upload.filename.c_str());
+    if (!Update.begin(UPDATE_SIZE_UNKNOWN)) { // Start with max available size
+      Update.printError(Serial);
+    }
+  } else if (upload.status == UPLOAD_FILE_WRITE) {
+    if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+      Update.printError(Serial);
+    }
+  } else if (upload.status == UPLOAD_FILE_END) {
+    if (Update.end(true)) { // true to set the size to the current progress
+      Serial.printf("Update Success: %u\nRebooting...\n", upload.totalSize);
+    } else {
+      Update.printError(Serial);
+    }
   }
 }
