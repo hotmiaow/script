@@ -5,7 +5,10 @@
 #include <WebServer.h>
 #include <WiFiAP.h>
 #include <Update.h>
+#include <ESPmDNS.h>
+#include <DNSServer.h>
 #include "time.h"
+#include "esp_task_wdt.h"
 
 #include "user_config.h"
 #include "lvgl_port.h"
@@ -63,6 +66,7 @@ int day_bright = 255;
 int night_bright = 50;
 int scroll_interval_seconds = 10;
 String custom_rss_urls[5] = {"", "", "", "", ""};
+String custom_city = "";
 
 #define MAX_BLACKLIST_COUNT 16
 char blacklist_items[MAX_BLACKLIST_COUNT][MAX_SOURCE_LEN];
@@ -111,10 +115,23 @@ void update_blacklist_array() {
   }
 }
 
+// Battery ADC smoothing: 16-sample ring buffer for stable readings
+#define BAT_SAMPLE_COUNT 16
+static float bat_samples[BAT_SAMPLE_COUNT];
+static int bat_sample_idx = 0;
+static bool bat_samples_filled = false;
+
 float get_battery_voltage() {
   int raw = analogRead(4);
   float voltage = (raw * 3.3 / 4095.0) * 3.0;
-  return voltage;
+  bat_samples[bat_sample_idx] = voltage;
+  bat_sample_idx = (bat_sample_idx + 1) % BAT_SAMPLE_COUNT;
+  if (bat_sample_idx == 0) bat_samples_filled = true;
+  int count = bat_samples_filled ? BAT_SAMPLE_COUNT : bat_sample_idx;
+  if (count == 0) return voltage;
+  float sum = 0;
+  for (int i = 0; i < count; i++) sum += bat_samples[i];
+  return sum / count;
 }
 
 int get_battery_percentage() {
@@ -123,6 +140,18 @@ int get_battery_percentage() {
   if (v <= 3.3) return 0;
   return (int)((v - 3.3) / (4.2 - 3.3) * 100.0);
 }
+
+// Burn-in protection: pixel shift offset applied every 30 minutes
+static int burnin_offset_x = 0;
+static int burnin_offset_y = 0;
+static unsigned long last_burnin_shift_time = 0;
+
+// DNS server for captive portal in AP mode
+DNSServer dnsServer;
+static bool dns_server_active = false;
+
+// Retry backoff state
+static int fetch_fail_count = 0;
 
 bool is_source_blacklisted(const char* source) {
   if (source == NULL) return false;
@@ -187,9 +216,11 @@ unsigned long last_sound_check_time = 0;
 
 // LVGL UI Handles
 LV_FONT_DECLARE(lv_font_source_han_sans_sc_16_cjk);
+LV_FONT_DECLARE(lv_font_indicator_14);
 static lv_style_t main_style;
 static lv_style_t title_style;
 static lv_style_t sub_style;
+static lv_style_t indicator_style;
 
 lv_obj_t *main_screen = NULL;
 lv_obj_t *top_panel = NULL;
@@ -197,7 +228,8 @@ lv_obj_t *date_label = NULL;
 lv_obj_t *time_label = NULL;
 lv_obj_t *weather_loc_label = NULL;
 lv_obj_t *weather_desc_label = NULL;
-lv_obj_t *status_label = NULL;
+lv_obj_t *battery_label = NULL;
+lv_obj_t *refresh_label = NULL;
 
 lv_obj_t *carousel_container = NULL;
 lv_obj_t *top_card = NULL;
@@ -207,6 +239,25 @@ lv_obj_t *bottom_headline_lbl = NULL;
 
 lv_obj_t *top_meta_lbl = NULL;
 lv_obj_t *bottom_meta_lbl = NULL;
+
+void save_settings(void);
+
+// Low-battery auto-shutdown: prevents lithium over-discharge
+void check_low_battery_shutdown() {
+  float v = get_battery_voltage();
+  if (v > 0.5 && v < 3.2) { // v > 0.5 excludes USB-only (no battery)
+    Serial.println("[Power] CRITICAL: Battery below 3.2V! Saving state and shutting down.");
+    save_settings();
+    if (lvgl_port_lock(200)) {
+      lv_label_set_text(top_headline_lbl, is_asia ? "電量過低，即將關機..." : "Battery Critical - Shutting Down...");
+      lv_label_set_text(bottom_headline_lbl, "");
+      lvgl_port_unlock();
+    }
+    delay(2000);
+    setUpduty(0);
+    esp_deep_sleep_start(); // No wakeup source = stay off until power button
+  }
+}
 
 // Functions declarations
 void init_ui_styles(void);
@@ -231,6 +282,17 @@ void handle_ota_get(void);
 void handle_ota_post(void);
 void handle_ota_upload(void);
 void show_ap_mode_ui(void);
+void handle_api_status(void);
+void handle_api_set_theme(void);
+void handle_api_export(void);
+void handle_api_import(void);
+void sync_system_time_from_rtc(void);
+void sync_rtc_from_system_time(void);
+void rtc_set_time(int year, int month, int day, int hour, int minute, int second);
+bool rtc_get_time(int &year, int &month, int &day, int &hour, int &minute, int &second);
+bool resolve_custom_city_coords(String city, float &lat, float &lon, String &resolved_name, String &country);
+void save_settings(void);
+void check_low_battery_shutdown(void);
 
 // Add these definitions before setup()
 // Power management pins for ESP32-S3-Touch-LCD-3.49
@@ -256,6 +318,110 @@ void init_power_management() {
     Serial.println("Power management configured.");
 }
 
+// RTC and Time Sync Helpers
+void rtc_set_time(int year, int month, int day, int hour, int minute, int second) {
+  uint8_t buf[7];
+  buf[0] = ((second / 10) << 4) | (second % 10);
+  buf[1] = ((minute / 10) << 4) | (minute % 10);
+  buf[2] = ((hour / 10) << 4) | (hour % 10);
+  buf[3] = ((day / 10) << 4) | (day % 10);
+  buf[4] = 0; // Weekday
+  buf[5] = ((month / 10) << 4) | (month % 10);
+  buf[6] = (((year % 100) / 10) << 4) | ((year % 100) % 10);
+
+  i2c_write_buff(rtc_dev_handle, 0x04, buf, 7);
+  Serial.printf("[RTC] Set RTC: %04d-%02d-%02d %02d:%02d:%02d\n", year, month, day, hour, minute, second);
+}
+
+bool rtc_get_time(int &year, int &month, int &day, int &hour, int &minute, int &second) {
+  uint8_t buf[7];
+  if (i2c_read_buff(rtc_dev_handle, 0x04, buf, 7) == 0) {
+    second = ((buf[0] & 0x7F) >> 4) * 10 + (buf[0] & 0x0F);
+    minute = ((buf[1] & 0x7F) >> 4) * 10 + (buf[1] & 0x0F);
+    hour = ((buf[2] & 0x3F) >> 4) * 10 + (buf[2] & 0x0F);
+    day = ((buf[3] & 0x3F) >> 4) * 10 + (buf[3] & 0x0F);
+    month = ((buf[5] & 0x1F) >> 4) * 10 + (buf[5] & 0x0F);
+    year = 2000 + ((buf[6] & 0xFF) >> 4) * 10 + (buf[6] & 0x0F);
+    return (year >= 2025 && year <= 2099 && month >= 1 && month <= 12 && day >= 1 && day <= 31 && hour <= 23 && minute <= 59 && second <= 59);
+  }
+  return false;
+}
+
+void sync_system_time_from_rtc() {
+  int y, m, d, hh, mm, ss;
+  if (rtc_get_time(y, m, d, hh, mm, ss)) {
+    struct tm tInfo;
+    tInfo.tm_year = y - 1900;
+    tInfo.tm_mon = m - 1;
+    tInfo.tm_mday = d;
+    tInfo.tm_hour = hh;
+    tInfo.tm_min = mm;
+    tInfo.tm_sec = ss;
+    tInfo.tm_isdst = -1;
+    
+    time_t t = mktime(&tInfo);
+    struct timeval tv = { .tv_sec = t, .tv_usec = 0 };
+    settimeofday(&tv, NULL);
+    Serial.printf("[RTC] Synced system time from RTC: %04d-%02d-%02d %02d:%02d:%02d\n", y, m, d, hh, mm, ss);
+  } else {
+    Serial.println("[RTC] Failed to read valid time from RTC.");
+  }
+}
+
+void sync_rtc_from_system_time() {
+  struct tm timeinfo;
+  if (getLocalTime(&timeinfo)) {
+    rtc_set_time(timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday, timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+    Serial.println("[RTC] Synced RTC from NTP system time.");
+  }
+}
+
+// Geocoding Custom City Resolution
+bool resolve_custom_city_coords(String city, float &lat, float &lon, String &resolved_name, String &country) {
+  HTTPClient http;
+  WiFiClient client;
+  city.replace(" ", "%20");
+  String url = "http://geocoding-api.open-meteo.com/v1/search?name=" + city + "&count=1&format=json";
+  
+  Serial.print("[Geo-API] Resolving city coordinates: ");
+  Serial.println(url);
+  
+  http.begin(client, url);
+  http.setTimeout(6000);
+  int code = http.GET();
+  if (code == HTTP_CODE_OK) {
+    String payload = http.getString();
+    http.end();
+    
+    int lat_idx = payload.indexOf("\"latitude\":");
+    int lon_idx = payload.indexOf("\"longitude\":");
+    int name_idx = payload.indexOf("\"name\":\"");
+    int country_idx = payload.indexOf("\"country\":\"");
+    
+    if (lat_idx != -1 && lon_idx != -1) {
+      int lat_end = payload.indexOf(",", lat_idx);
+      lat = payload.substring(lat_idx + 11, lat_end).toFloat();
+      
+      int lon_end = payload.indexOf(",", lon_idx);
+      if (lon_end == -1) lon_end = payload.indexOf("}", lon_idx);
+      lon = payload.substring(lon_idx + 12, lon_end).toFloat();
+      
+      if (name_idx != -1) {
+        int name_end = payload.indexOf("\"", name_idx + 8);
+        resolved_name = payload.substring(name_idx + 8, name_end);
+      }
+      if (country_idx != -1) {
+        int country_end = payload.indexOf("\"", country_idx + 11);
+        country = payload.substring(country_idx + 11, country_end);
+      }
+      return true;
+    }
+  } else {
+    http.end();
+  }
+  return false;
+}
+
 
 // Add to loop() or create a task for battery monitoring
 void check_battery_status() {
@@ -271,7 +437,7 @@ void check_battery_status() {
         
         // Update UI if battery is low
         if (bat_voltage < 3.3 && lvgl_port_lock(100)) {
-            lv_label_set_text(status_label, "Low Battery!");
+            lv_label_set_text(refresh_label, "Low Bat!");
             lvgl_port_unlock();
         }
     }
@@ -469,6 +635,14 @@ void setup()
 
   tca9554_init();
 
+  // Clear PCF85063 control register stop bit to ensure clock ticks
+  {
+    uint8_t ctrl = 0x00;
+    i2c_write_buff(rtc_dev_handle, 0x00, &ctrl, 1);
+  }
+  sync_system_time_from_rtc();
+
+  load_settings();
   load_cached_news();
 
   // Initialize Onboard Dual I2C buses (Touch & Sensors)
@@ -507,7 +681,7 @@ void setup()
   lvgl_port_unlock();
 
   // Start background Wi-Fi and News Fetching Task on Core 0
-  xTaskCreatePinnedToCore(fetch_news_task, "NewsTask", 10240, NULL, 1, NULL, 0);
+  xTaskCreatePinnedToCore(fetch_news_task, "NewsTask", 6144, NULL, 1, NULL, 0);
 }
 
 bool check_for_sound(void) {
@@ -567,6 +741,120 @@ void loop()
 // ----------------------------------------------------
 // UI Styles & Layout Configurations (LVGL9)
 // ----------------------------------------------------
+int current_theme = 0;
+
+void apply_theme_styles() {
+  lv_color_t bg_screen_color, bg_screen_grad;
+  lv_color_t bg_panel_color, border_panel_color;
+  lv_color_t bg_card_color, bg_card_grad, border_card_color;
+  lv_color_t title_text_color, main_text_color, sub_text_color;
+  
+  switch(current_theme) {
+    case 1: // Sunset Coral (Warm Peach & Slate)
+      bg_screen_color = lv_color_make(26, 26, 46);
+      bg_screen_grad = lv_color_make(36, 36, 62);
+      bg_panel_color = lv_color_make(47, 47, 84);
+      border_panel_color = lv_color_make(61, 61, 109);
+      bg_card_color = lv_color_make(36, 36, 62);
+      bg_card_grad = lv_color_make(26, 26, 46);
+      border_card_color = lv_color_make(61, 61, 109);
+      title_text_color = lv_color_make(255, 126, 103); // Soft Coral
+      main_text_color = lv_color_make(226, 226, 240); // Ice White
+      sub_text_color = lv_color_make(139, 139, 168);  // Slate Gray
+      break;
+      
+    case 2: // Retro Terminal (Amber Orange)
+      bg_screen_color = lv_color_make(18, 18, 18);
+      bg_screen_grad = lv_color_make(28, 28, 28);
+      bg_panel_color = lv_color_make(32, 32, 32);
+      border_panel_color = lv_color_make(60, 60, 60);
+      bg_card_color = lv_color_make(26, 26, 26);
+      bg_card_grad = lv_color_make(18, 18, 18);
+      border_card_color = lv_color_make(70, 70, 70);
+      title_text_color = lv_color_make(255, 159, 0); // Neon Amber
+      main_text_color = lv_color_make(255, 191, 70); // Light Amber
+      sub_text_color = lv_color_make(180, 140, 90);
+      break;
+      
+    case 3: // Forest Calcite (Mint Green)
+      bg_screen_color = lv_color_make(12, 26, 26);
+      bg_screen_grad = lv_color_make(18, 38, 38);
+      bg_panel_color = lv_color_make(24, 50, 50);
+      border_panel_color = lv_color_make(38, 80, 80);
+      bg_card_color = lv_color_make(18, 38, 38);
+      bg_card_grad = lv_color_make(12, 26, 26);
+      border_card_color = lv_color_make(38, 80, 80);
+      title_text_color = lv_color_make(102, 205, 170); // Mint Green
+      main_text_color = lv_color_make(204, 227, 222);  // Pale Sage
+      sub_text_color = lv_color_make(140, 180, 175);
+      break;
+      
+    case 4: // Royal Monarch (Orchid Gold)
+      bg_screen_color = lv_color_make(16, 5, 30);
+      bg_screen_grad = lv_color_make(26, 10, 48);
+      bg_panel_color = lv_color_make(38, 15, 68);
+      border_panel_color = lv_color_make(70, 28, 120);
+      bg_card_color = lv_color_make(26, 10, 48);
+      bg_card_grad = lv_color_make(16, 5, 30);
+      border_card_color = lv_color_make(88, 36, 160);
+      title_text_color = lv_color_make(255, 215, 0); // Rich Gold
+      main_text_color = lv_color_make(248, 240, 255); // Pearlescent White
+      sub_text_color = lv_color_make(180, 140, 210);  // Lavender
+      break;
+
+    case 0:
+    default: // Cyberpunk Neon Green (Default)
+      bg_screen_color = lv_color_make(15, 17, 22);
+      bg_screen_grad = lv_color_make(25, 30, 40);
+      bg_panel_color = lv_color_make(24, 28, 37);
+      border_panel_color = lv_color_make(45, 52, 68);
+      bg_card_color = lv_color_make(33, 38, 48);
+      bg_card_grad = lv_color_make(24, 28, 35);
+      border_card_color = lv_color_make(55, 63, 80);
+      title_text_color = lv_color_make(0, 255, 102); // Cyberpunk Neon Green
+      main_text_color = lv_color_white();
+      sub_text_color = lv_color_make(180, 180, 180);
+      break;
+  }
+
+  if (main_screen) {
+    lv_obj_set_style_bg_color(main_screen, bg_screen_color, 0);
+    lv_obj_set_style_bg_grad_color(main_screen, bg_screen_grad, 0);
+  }
+  if (top_panel) {
+    lv_obj_set_style_bg_color(top_panel, bg_panel_color, 0);
+    lv_obj_set_style_border_color(top_panel, border_panel_color, 0);
+  }
+  if (top_card) {
+    lv_obj_set_style_bg_color(top_card, bg_card_color, 0);
+    lv_obj_set_style_bg_grad_color(top_card, bg_card_grad, 0);
+    lv_obj_set_style_border_color(top_card, border_card_color, 0);
+  }
+  if (bottom_card) {
+    lv_obj_set_style_bg_color(bottom_card, bg_card_color, 0);
+    lv_obj_set_style_bg_grad_color(bottom_card, bg_card_grad, 0);
+    lv_obj_set_style_border_color(bottom_card, border_card_color, 0);
+  }
+
+  // Update styles properties dynamically
+  lv_style_set_text_color(&main_style, main_text_color);
+  lv_style_set_text_color(&title_style, title_text_color);
+  lv_style_set_text_color(&sub_style, sub_text_color);
+  lv_style_set_text_color(&indicator_style, sub_text_color);
+
+  // Notify objects to refresh style cache
+  if (top_headline_lbl) lv_obj_refresh_style(top_headline_lbl, LV_PART_ANY, LV_STYLE_PROP_ANY);
+  if (top_meta_lbl) lv_obj_refresh_style(top_meta_lbl, LV_PART_ANY, LV_STYLE_PROP_ANY);
+  if (bottom_headline_lbl) lv_obj_refresh_style(bottom_headline_lbl, LV_PART_ANY, LV_STYLE_PROP_ANY);
+  if (bottom_meta_lbl) lv_obj_refresh_style(bottom_meta_lbl, LV_PART_ANY, LV_STYLE_PROP_ANY);
+  if (date_label) lv_obj_refresh_style(date_label, LV_PART_ANY, LV_STYLE_PROP_ANY);
+  if (time_label) lv_obj_refresh_style(time_label, LV_PART_ANY, LV_STYLE_PROP_ANY);
+  if (weather_loc_label) lv_obj_refresh_style(weather_loc_label, LV_PART_ANY, LV_STYLE_PROP_ANY);
+  if (weather_desc_label) lv_obj_refresh_style(weather_desc_label, LV_PART_ANY, LV_STYLE_PROP_ANY);
+  if (battery_label) lv_obj_refresh_style(battery_label, LV_PART_ANY, LV_STYLE_PROP_ANY);
+  if (refresh_label) lv_obj_refresh_style(refresh_label, LV_PART_ANY, LV_STYLE_PROP_ANY);
+}
+
 void init_ui_styles(void) {
   // Base text style using PingFang size 20 font (linked as lv_font_source_han_sans_sc_16_cjk)
   lv_style_init(&main_style);
@@ -582,6 +870,11 @@ void init_ui_styles(void) {
   lv_style_init(&sub_style);
   lv_style_set_text_font(&sub_style, &lv_font_source_han_sans_sc_16_cjk);
   lv_style_set_text_color(&sub_style, lv_color_make(180, 180, 180)); // Muted Gray
+
+  // Indicator style (custom 14px size)
+  lv_style_init(&indicator_style);
+  lv_style_set_text_font(&indicator_style, &lv_font_indicator_14);
+  lv_style_set_text_color(&indicator_style, lv_color_make(150, 150, 150));
 }
 
 void create_layout(void) {
@@ -646,10 +939,22 @@ void create_layout(void) {
   lv_obj_add_style(weather_desc_label, &main_style, 0);
   lv_label_set_text(weather_desc_label, "Fetching");
 
-  // 5. Status Label (Countdown)
-  status_label = lv_label_create(top_panel);
-  lv_obj_add_style(status_label, &sub_style, 0);
-  lv_label_set_text(status_label, "Initializing...");
+  // 5. Stacked Status Panel (Far right)
+  lv_obj_t *status_panel = lv_obj_create(top_panel);
+  lv_obj_remove_style_all(status_panel);
+  lv_obj_set_size(status_panel, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+  lv_obj_set_flex_flow(status_panel, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_flex_align(status_panel, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+  lv_obj_set_style_pad_all(status_panel, 0, 0);
+  lv_obj_set_style_pad_row(status_panel, 3, 0); // 3px gap between battery and refresh
+
+  battery_label = lv_label_create(status_panel);
+  lv_obj_add_style(battery_label, &indicator_style, 0);
+  lv_label_set_text(battery_label, "B: □□□□");
+
+  refresh_label = lv_label_create(status_panel);
+  lv_obj_add_style(refresh_label, &indicator_style, 0);
+  lv_label_set_text(refresh_label, "R: □□□□");
 
   // News Container - fills all remaining vertical space below top_panel
   carousel_container = lv_obj_create(main_screen);
@@ -735,6 +1040,9 @@ void create_layout(void) {
   lv_obj_set_flex_grow(bottom_meta_lbl, 1);
   lv_label_set_long_mode(bottom_meta_lbl, LV_LABEL_LONG_DOT);
   lv_label_set_text(bottom_meta_lbl, "");
+
+  // Apply active theme colors
+  apply_theme_styles();
 }
 
 // ----------------------------------------------------
@@ -807,6 +1115,13 @@ void update_ui_news_labels(void) {
     lv_label_set_text(bottom_meta_lbl, "");
   }
 
+  // Check for breaking news keywords to flash red alert animation
+  if (top_idx < news_count) {
+    const char* h = news_list[top_idx].headline;
+    if (strstr(h, "BREAKING") || strstr(h, "突發") || strstr(h, "緊急") || strstr(h, "Alert") || strstr(h, "FLASH")) {
+      flash_breaking_news();
+    }
+  }
 }
 
 // ----------------------------------------------------
@@ -869,13 +1184,60 @@ String truncate_utf8(String str, int max_chars) {
 // true relative "2h ago" - computing that reliably would need the article's
 // full date compared against NTP time, which the feed doesn't give us
 // precisely enough to do safely.
+// Parse RSS pubDate (e.g. "Sat, 02 Aug 2026 10:30:00 GMT") into epoch seconds.
+// Returns 0 on parse failure.
+static time_t parse_rss_date(const char* dateStr) {
+  if (!dateStr || dateStr[0] == '\0') return 0;
+  struct tm tm_parsed = {};
+  // RFC 822 format: "Day, DD Mon YYYY HH:MM:SS TZ"
+  const char* months[] = {"Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"};
+  // Skip day name (find first space after comma)
+  const char* p = strchr(dateStr, ',');
+  if (!p) p = dateStr; else p++;
+  while (*p == ' ') p++;
+  int day_val = 0, year_val = 0, hour_val = 0, min_val = 0, sec_val = 0;
+  char mon_str[4] = "";
+  if (sscanf(p, "%d %3s %d %d:%d:%d", &day_val, mon_str, &year_val, &hour_val, &min_val, &sec_val) >= 5) {
+    tm_parsed.tm_mday = day_val;
+    tm_parsed.tm_year = year_val - 1900;
+    tm_parsed.tm_hour = hour_val;
+    tm_parsed.tm_min = min_val;
+    tm_parsed.tm_sec = sec_val;
+    for (int i = 0; i < 12; i++) {
+      if (strcasecmp(mon_str, months[i]) == 0) { tm_parsed.tm_mon = i; break; }
+    }
+    return mktime(&tm_parsed);
+  }
+  return 0;
+}
+
+// Format a human-readable relative age string from pubDate
+static String format_relative_age(const char* pubDate) {
+  time_t pub_epoch = parse_rss_date(pubDate);
+  if (pub_epoch == 0) return String(pubDate); // fallback to raw string
+  
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) return String(pubDate);
+  time_t now_epoch = mktime(&timeinfo);
+  
+  long diff = (long)(now_epoch - pub_epoch);
+  if (diff < 0) diff = 0;
+  
+  if (diff < 60) return "Just now";
+  if (diff < 3600) return String(diff / 60) + "m ago";
+  if (diff < 86400) return String(diff / 3600) + "h ago";
+  if (diff < 172800) return "Yesterday";
+  return String(diff / 86400) + "d ago";
+}
+
 String build_news_meta(const NewsItem &item) {
   bool has_source = item.source[0] != '\0';
   bool has_date = item.pubDate[0] != '\0';
   if (!has_source && !has_date) return "";
-  if (!has_source) return String(item.pubDate);
+  String age = has_date ? format_relative_age(item.pubDate) : "";
+  if (!has_source) return age;
   if (!has_date) return String(item.source);
-  return String(item.source) + " · " + String(item.pubDate);
+  return String(item.source) + " · " + age;
 }
 
 // Weather code mapping
@@ -1015,7 +1377,7 @@ void resolve_region(String country) {
 // Uses fixed char buffers (no String churn per-character) and explicitly
 // handles <![CDATA[ ... ]]> wrapped titles, which Google News uses.
 // ----------------------------------------------------
-int parse_rss_stream(WiFiClientSecure *stream, int limit, int start_count) {
+int parse_rss_stream(Client *stream, int limit, int start_count) {
   int count = start_count;
 
   char tag_buf[24];
@@ -1230,12 +1592,68 @@ static void flash_top_panel(void) {
   lv_anim_start(&a);
 }
 
+// Flash top card red for 2 seconds on breaking news
+static void breaking_news_anim_cb(void * var, int32_t v) {
+  lv_obj_t * obj = (lv_obj_t *)var;
+  lv_color_t base = lv_color_make(33, 38, 48);
+  lv_color_t red_accent = lv_color_make(220, 30, 30);
+  lv_color_t mixed = lv_color_mix(base, red_accent, (lv_opa_t)v);
+  lv_obj_set_style_bg_color(obj, mixed, 0);
+}
+
+static void flash_breaking_news(void) {
+  if (!top_card) return;
+  lv_anim_t a;
+  lv_anim_init(&a);
+  lv_anim_set_var(&a, top_card);
+  lv_anim_set_values(&a, 0, 255);
+  lv_anim_set_duration(&a, 2000);
+  lv_anim_set_exec_cb(&a, breaking_news_anim_cb);
+  lv_anim_start(&a);
+}
+
+// Unified RSS stream fetcher with redirect following and TLS memory management
+// AFTER
+static int fetch_and_parse_rss_url(WiFiClientSecure& secure_client, const String& url, int limit, int start_idx) {
+  if (url.length() == 0) return start_idx;
+  int parsed_count = start_idx;
+
+  // Short pause just lets lwIP release the previous TCP socket. TLS
+  // RX/TX buffers are NOT reallocated here anymore since secure_client
+  // is passed in by reference and reused across all source fetches -
+  // that reuse is what actually fixes the SSL memory-allocation failures.
+  vTaskDelay(pdMS_TO_TICKS(300));
+
+  Serial.println("[RSS] Fetching: " + url);
+
+  HTTPClient http_news;
+  http_news.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  http_news.begin(secure_client, url);
+  http_news.setTimeout(8000);
+
+  int code = http_news.GET();
+  if (code == HTTP_CODE_OK) {
+    Client *stream = http_news.getStreamPtr();
+    parsed_count = parse_rss_stream(stream, limit, start_idx);
+  } else {
+    char err_buf[128] = "";
+    secure_client.lastError(err_buf, sizeof(err_buf));
+    Serial.printf("[RSS] Fetch failed for %s, HTTP code: %d, TLS error: %s, Free heap: %d\n", url.c_str(), code, err_buf, ESP.getFreeHeap());
+  }
+
+  http_news.end();
+  // stop() closes the TCP/TLS session but keeps the already-allocated
+  // buffers around on the object for the next fetch to reuse.
+  secure_client.stop();
+  return parsed_count;
+}
+
 void fetch_news_task(void *pvParameters) {
   // Load settings from NVS
   load_settings();
 
   if (lvgl_port_lock(-1)) {
-    lv_label_set_text(status_label, "Connecting Wi-Fi...");
+    lv_label_set_text(refresh_label, "WiFi...");
     lvgl_port_unlock();
   }
 
@@ -1266,6 +1684,10 @@ void fetch_news_task(void *pvParameters) {
     Serial.print("AP IP Address: ");
     Serial.println(WiFi.softAPIP());
     
+    // Captive Portal: redirect all DNS queries to our AP IP
+    dnsServer.start(53, "*", WiFi.softAPIP());
+    dns_server_active = true;
+    
     // Show AP instructions on the screen
     show_ap_mode_ui();
     
@@ -1274,11 +1696,21 @@ void fetch_news_task(void *pvParameters) {
     server.on("/save", HTTP_POST, handle_save);
     server.on("/update", HTTP_GET, handle_ota_get);
     server.on("/update", HTTP_POST, handle_ota_post, handle_ota_upload);
+    server.on("/api/status", handle_api_status);
+    server.on("/api/set_theme", handle_api_set_theme);
+    server.on("/api/export", handle_api_export);
+    server.on("/api/import", HTTP_POST, handle_api_import);
+    // Captive portal: redirect any unknown path to root
+    server.onNotFound([]() {
+      server.sendHeader("Location", "http://" + WiFi.softAPIP().toString() + "/", true);
+      server.send(302, "text/plain", "");
+    });
     server.begin();
     WiFi.scanNetworks(true);
     
     // Loop in AP mode indefinitely until user configures Wi-Fi
     for (;;) {
+      dnsServer.processNextRequest(); // Captive portal DNS
       server.handleClient();
       vTaskDelay(pdMS_TO_TICKS(10));
     }
@@ -1291,7 +1723,7 @@ void fetch_news_task(void *pvParameters) {
   if (lvgl_port_lock(-1)) {
     char ip_str[32];
     sprintf(ip_str, "IP: %s", WiFi.localIP().toString().c_str());
-    lv_label_set_text(status_label, ip_str);
+    lv_label_set_text(refresh_label, ip_str);
     lvgl_port_unlock();
   }
   wifi_was_connected = true; // baseline state for the health-tracking logic
@@ -1299,13 +1731,49 @@ void fetch_news_task(void *pvParameters) {
   // Configure NTP Local Chinese Time (Beijing/Hong Kong time: GMT+8)
   configTzTime("CST-8", "pool.ntp.org", "ntp.aliyun.com");
 
+  // Wait up to 5 seconds for NTP clock synchronization
+  {
+    int retry = 0;
+    struct tm timeinfo;
+    while (!getLocalTime(&timeinfo) && retry < 10) {
+      vTaskDelay(pdMS_TO_TICKS(500));
+      retry++;
+    }
+    if (getLocalTime(&timeinfo)) {
+      sync_rtc_from_system_time();
+    }
+  }
+
   // Start Web Server in Station Mode
   server.on("/", handle_root);
   server.on("/save", HTTP_POST, handle_save);
   server.on("/update", HTTP_GET, handle_ota_get);
   server.on("/update", HTTP_POST, handle_ota_post, handle_ota_upload);
+  server.on("/api/status", handle_api_status);
+  server.on("/api/set_theme", handle_api_set_theme);
+  server.on("/api/export", handle_api_export);
+  server.on("/api/import", HTTP_POST, handle_api_import);
   server.begin();
   WiFi.scanNetworks(true);
+
+  // Register mDNS hostname so the portal is reachable at newsticker.local
+  if (MDNS.begin("newsticker")) {
+    MDNS.addService("http", "tcp", 80);
+    Serial.println("[mDNS] Registered: http://newsticker.local");
+  } else {
+    Serial.println("[mDNS] Failed to start mDNS");
+  }
+
+  // Reconfigure or initialize watchdog timer (60s timeout) for this task
+  esp_task_wdt_config_t twdt_config = {
+    .timeout_ms = 60000,
+    .idle_core_mask = 0,
+    .trigger_panic = true
+  };
+  if (esp_task_wdt_reconfigure(&twdt_config) != ESP_OK) {
+    esp_task_wdt_init(&twdt_config);
+  }
+  esp_task_wdt_add(NULL); // Add current task to watchdog
 
   unsigned long last_fetch_time = 0;
   unsigned long last_scroll_time = 0;
@@ -1313,7 +1781,35 @@ void fetch_news_task(void *pvParameters) {
 
 
   for(;;) {
+    esp_task_wdt_reset(); // Feed the watchdog every loop iteration
     server.handleClient(); // Serve config page requests
+
+    // Low-battery auto-shutdown check (every loop = every 1 second)
+    check_low_battery_shutdown();
+
+    // Burn-in protection: shift content by 1-2px every 30 minutes
+    if (millis() - last_burnin_shift_time >= 1800000) { // 30 minutes
+      last_burnin_shift_time = millis();
+      burnin_offset_x = (burnin_offset_x + 1) % 3; // cycles 0, 1, 2
+      burnin_offset_y = (burnin_offset_y + 1) % 3;
+      if (lvgl_port_lock(100)) {
+        if (carousel_container) lv_obj_set_style_translate_x(carousel_container, burnin_offset_x - 1, 0);
+        if (carousel_container) lv_obj_set_style_translate_y(carousel_container, burnin_offset_y - 1, 0);
+        if (top_panel) lv_obj_set_style_translate_x(top_panel, burnin_offset_x - 1, 0);
+        lvgl_port_unlock();
+      }
+      Serial.printf("[Burnin] Pixel shift: x=%d, y=%d\n", burnin_offset_x - 1, burnin_offset_y - 1);
+    }
+
+    // Stack high-water-mark monitoring (every 60 seconds)
+    {
+      static unsigned long last_stack_log = 0;
+      if (millis() - last_stack_log > 60000) {
+        last_stack_log = millis();
+        UBaseType_t hwm = uxTaskGetStackHighWaterMark(NULL);
+        Serial.printf("[Stack] NewsTask high-water-mark: %u bytes remaining\n", hwm * 4);
+      }
+    }
 
     // 1. Periodically update NTP clock every second
     if (WiFi.status() == WL_CONNECTED) {
@@ -1406,50 +1902,51 @@ void fetch_news_task(void *pvParameters) {
       }
     }
 
-    // 3. Update refresh countdown label - only touch LVGL when the text
-    // actually changed, avoiding redundant redraws (e.g. every tick while
-    // "is_updating" stays true for the whole fetch cycle).
+    // 3. Update battery and refresh indicators on top bar (4-dot squares with B: and R:)
     {
-      static char last_status_str[48] = "";
-      char new_status_str[48] = "";
+      static char last_bat_str[32] = "";
+      static char last_ref_str[32] = "";
+      
+      char new_bat_str[32] = "";
+      char new_ref_str[32] = "";
 
-      static int status_rotation_state = 0;
-      static unsigned long last_status_rotate_time = 0;
+      int bat = get_battery_percentage();
+      int bat_dots = 1;
+      if (bat >= 75) bat_dots = 4;
+      else if (bat >= 50) bat_dots = 3;
+      else if (bat >= 25) bat_dots = 2;
 
-      unsigned long now_ms = millis();
-      if (now_ms - last_status_rotate_time >= 3000) {
-        last_status_rotate_time = now_ms;
-        status_rotation_state = (status_rotation_state + 1) % 3;
+      int ref_dots = 1;
+      strcpy(new_ref_str, "R:");
+      if (is_updating) {
+        strcat(new_ref_str, "....");
+      } else {
+        if (seconds_to_refresh > 225) ref_dots = 4;
+        else if (seconds_to_refresh > 150) ref_dots = 3;
+        else if (seconds_to_refresh > 75) ref_dots = 2;
+        
+        for (int i = 0; i < 4; i++) {
+          strcat(new_ref_str, (i < ref_dots) ? "■" : "□");
+        }
       }
 
-      if (status_rotation_state == 0) {
-        if (is_updating) {
-          strncpy(new_status_str, is_asia ? "正在更新..." : "Updating...", sizeof(new_status_str) - 1);
-        } else if (active_page == 1) {
-          strncpy(new_status_str, is_asia ? "左右滑動切換" : "Swipe for News", sizeof(new_status_str) - 1);
-        } else if (is_asia) {
-          snprintf(new_status_str, sizeof(new_status_str), "%d秒後更新", seconds_to_refresh);
-        } else {
-          snprintf(new_status_str, sizeof(new_status_str), "Refresh in %ds", seconds_to_refresh);
-        }
-      } else if (status_rotation_state == 1) {
-        if (WiFi.status() == WL_CONNECTED) {
-          int rssi = WiFi.RSSI();
-          snprintf(new_status_str, sizeof(new_status_str), "WiFi: %d dBm", rssi);
-        } else {
-          strncpy(new_status_str, "WiFi: Offline", sizeof(new_status_str) - 1);
-        }
-      } else { // State 2: Battery
-        int bat = get_battery_percentage();
-        snprintf(new_status_str, sizeof(new_status_str), "Battery: %d%%", bat);
+      strcpy(new_bat_str, "B:");
+      for (int i = 0; i < 4; i++) {
+        strcat(new_bat_str, (i < bat_dots) ? "■" : "□");
       }
-      new_status_str[sizeof(new_status_str) - 1] = '\0';
 
-      if (strcmp(new_status_str, last_status_str) != 0) {
-        strncpy(last_status_str, new_status_str, sizeof(last_status_str) - 1);
-        last_status_str[sizeof(last_status_str) - 1] = '\0';
+      if (strcmp(new_bat_str, last_bat_str) != 0) {
+        strcpy(last_bat_str, new_bat_str);
         if (lvgl_port_lock(100)) {
-          lv_label_set_text(status_label, new_status_str);
+          lv_label_set_text(battery_label, new_bat_str);
+          lvgl_port_unlock();
+        }
+      }
+
+      if (strcmp(new_ref_str, last_ref_str) != 0) {
+        strcpy(last_ref_str, new_ref_str);
+        if (lvgl_port_lock(100)) {
+          lv_label_set_text(refresh_label, new_ref_str);
           lvgl_port_unlock();
         }
       }
@@ -1468,10 +1965,25 @@ void fetch_news_task(void *pvParameters) {
     if (fetch_requested) {
       fetch_requested = false;
       
-      // If smart sleep is active, skip fetching news to conserve battery!
-      if (is_sleep_time_active()) {
-        Serial.println("[Power] Sleep mode active. Skipping news fetch to conserve battery.");
-        seconds_to_refresh = 3600; // Check again in 1 hour
+      // If smart sleep is active (and not within 2 mins of boot), put CPU to Light Sleep to save maximum battery!
+      if (is_sleep_time_active() && millis() > 120000) {
+        Serial.println("[Power] Smart Sleep active. Turning off backlight and entering Light Sleep for 1 hour...");
+        
+        // Turn off backlight directly
+        setUpduty(0);
+        last_applied_brightness = 0;
+        
+        // Disable Wi-Fi radio to save extra power during sleep
+        WiFi.disconnect(true);
+        
+        // Configure wake timer for 1 hour (3600 seconds)
+        esp_sleep_enable_timer_wakeup(3600ULL * 1000000ULL);
+        esp_light_sleep_start();
+        
+        Serial.println("[Power] Woke up from Smart Sleep! Re-enabling Wi-Fi...");
+        WiFi.begin(wifi_ssid.c_str(), wifi_pass.c_str());
+        
+        seconds_to_refresh = 10; // Trigger news fetch quickly upon waking
         is_updating = false;
         continue;
       }
@@ -1519,91 +2031,104 @@ void fetch_news_task(void *pvParameters) {
         is_updating = true;
         Serial.println("Refreshing news and weather...");
         if (lvgl_port_lock(-1)) {
-          lv_label_set_text(status_label, "正在更新...");
+          lv_label_set_text(refresh_label, ".....");
           lvgl_port_unlock();
         }
 
-        WiFiClientSecure secure_client;
-        secure_client.setInsecure(); // Disable SSL verification for simple parsing
-        
-        WiFiClient client; // Non-SSL client for HTTP API calls
 
         double lat = 22.3193; // Default Hong Kong coordinates
         double lon = 114.1694;
+        bool geo_resolved = false;
 
-        // A. Geolocation: Get location coordinates from external IP
-        HTTPClient http;
-        Serial.println("Querying IP Geolocation API...");
-        http.begin(client, "http://ip-api.com/json/");
-        http.setTimeout(6000); // fail fast instead of hanging on a slow/stalled response
-        int httpCode = http.GET();
-        if (httpCode == HTTP_CODE_OK) {
-          String payload = http.getString();
-          Serial.println("[Geo] Response: " + payload);
-
-          // Parse City Name
-          int city_idx = payload.indexOf("\"city\":\"");
-          if (city_idx != -1) {
-            int start = city_idx + 8;
-            int end = payload.indexOf("\"", start);
-            local_city = payload.substring(start, end);
+        if (custom_city.length() > 0) {
+          float clat = 0, clon = 0;
+          String resolved_name = "", rcountry = "";
+          if (resolve_custom_city_coords(custom_city, clat, clon, resolved_name, rcountry)) {
+            lat = clat;
+            lon = clon;
+            local_city = resolved_name;
+            resolve_region(rcountry);
+            geo_resolved = true;
+            Serial.printf("[Geo-Custom] City resolved: %s, Lat: %.4f, Lon: %.4f, Country: %s\n", local_city.c_str(), lat, lon, rcountry.c_str());
           }
-
-          // Parse Lat
-          int lat_idx = payload.indexOf("\"lat\":");
-          if (lat_idx != -1) {
-            int start = lat_idx + 6;
-            int end = payload.indexOf(",", start);
-            lat = payload.substring(start, end).toDouble();
-          }
-
-          // Parse Lon
-          int lon_idx = payload.indexOf("\"lon\":");
-          if (lon_idx != -1) {
-            int start = lon_idx + 6;
-            int end = payload.indexOf(",", start);
-            lon = payload.substring(start, end).toDouble();
-          }
-
-          // Parse Timezone for Asia check
-          int tz_idx = payload.indexOf("\"timezone\":\"");
-          if (tz_idx != -1) {
-            int start = tz_idx + 12;
-            int end = payload.indexOf("\"", start);
-            String local_timezone = payload.substring(start, end);
-            is_asia = local_timezone.startsWith("Asia");
-            Serial.printf("[Geo] Timezone: %s, Is Asia: %s\n", local_timezone.c_str(), is_asia ? "Yes" : "No");
-          }
-
-          // Parse Country (used to resolve the correct metro area for news search)
-          // Parse Country (used to resolve the correct region: news city,
-          // Google News feed params, and UI language)
-          String local_country = "";
-          int country_idx = payload.indexOf("\"country\":\"");
-          if (country_idx != -1) {
-            int start = country_idx + 11;
-            int end = payload.indexOf("\"", start);
-            local_country = payload.substring(start, end);
-          }
-
-          resolve_region(local_country);
-          Serial.printf("[Geo] Region resolved from country '%s' -> city=%s hl=%s gl=%s ceid=%s asia_ui=%s\n",
-                         local_country.c_str(), news_query_city.c_str(), news_hl.c_str(),
-                         news_gl.c_str(), news_ceid.c_str(), is_asia ? "yes" : "no");
-
-          Serial.printf("[Geo] City: %s, Lat: %.4f, Lon: %.4f\n", local_city.c_str(), lat, lon);
-        } else {
-          Serial.printf("[Geo] Failed, HTTP code: %d\n", httpCode);
-          local_city = "Toronto"; // Fallback city name
-          resolve_region("Canada"); // Sets news_query_city/hl/gl/ceid/is_asia consistently
         }
 
-        http.end();
+        if (!geo_resolved) {
+          // A. Geolocation: Get location coordinates from external IP
+          WiFiClient client;
+          HTTPClient http;
+          Serial.println("Querying IP Geolocation API...");
+          http.begin(client, "http://ip-api.com/json/");
+          http.setTimeout(6000); // fail fast instead of hanging on a slow/stalled response
+          int httpCode = http.GET();
+          if (httpCode == HTTP_CODE_OK) {
+            String payload = http.getString();
+            Serial.println("[Geo] Response: " + payload);
+
+            // Parse City Name
+            int city_idx = payload.indexOf("\"city\":\"");
+            if (city_idx != -1) {
+              int start = city_idx + 8;
+              int end = payload.indexOf("\"", start);
+              local_city = payload.substring(start, end);
+            }
+
+            // Parse Lat
+            int lat_idx = payload.indexOf("\"lat\":");
+            if (lat_idx != -1) {
+              int start = lat_idx + 6;
+              int end = payload.indexOf(",", start);
+              lat = payload.substring(start, end).toDouble();
+            }
+
+            // Parse Lon
+            int lon_idx = payload.indexOf("\"lon\":");
+            if (lon_idx != -1) {
+              int start = lon_idx + 6;
+              int end = payload.indexOf(",", start);
+              lon = payload.substring(start, end).toDouble();
+            }
+
+            // Parse Timezone for Asia check
+            int tz_idx = payload.indexOf("\"timezone\":\"");
+            if (tz_idx != -1) {
+              int start = tz_idx + 12;
+              int end = payload.indexOf("\"", start);
+              String local_timezone = payload.substring(start, end);
+              is_asia = local_timezone.startsWith("Asia");
+              Serial.printf("[Geo] Timezone: %s, Is Asia: %s\n", local_timezone.c_str(), is_asia ? "Yes" : "No");
+            }
+
+            // Parse Country (used to resolve the correct region: news city,
+            // Google News feed params, and UI language)
+            String local_country = "";
+            int country_idx = payload.indexOf("\"country\":\"");
+            if (country_idx != -1) {
+              int start = country_idx + 11;
+              int end = payload.indexOf("\"", start);
+              local_country = payload.substring(start, end);
+            }
+
+            resolve_region(local_country);
+            Serial.printf("[Geo] Region resolved from country '%s' -> city=%s hl=%s gl=%s ceid=%s asia_ui=%s\n",
+                           local_country.c_str(), news_query_city.c_str(), news_hl.c_str(),
+                           news_gl.c_str(), news_ceid.c_str(), is_asia ? "yes" : "no");
+
+            Serial.printf("[Geo] City: %s, Lat: %.4f, Lon: %.4f\n", local_city.c_str(), lat, lon);
+          } else {
+            Serial.printf("[Geo] Failed, HTTP code: %d\n", httpCode);
+            local_city = "Toronto"; // Fallback city name
+            resolve_region("Canada"); // Sets news_query_city/hl/gl/ceid/is_asia consistently
+          }
+          http.end();
+        }
 
         // B. Weather: Query Open-Meteo API using parsed coordinates
         Serial.println("Querying Weather API...");
         String weather_url = "http://api.open-meteo.com/v1/forecast?latitude=" + String(lat, 4) + 
                              "&longitude=" + String(lon, 4) + "&current=temperature_2m,weather_code&daily=temperature_2m_max,temperature_2m_min,weather_code";
+        WiFiClient client;
+        HTTPClient http;
         http.begin(client, weather_url);
         http.setTimeout(6000);
         int weatherCode = http.GET();
@@ -1701,10 +2226,8 @@ void fetch_news_task(void *pvParameters) {
           lvgl_port_unlock();
         }
 
-        // Fetch Local News search feed based on the resolved metro-area city
-        // (districts/suburbs are mapped to their parent city for better results)
-// Fetch Local News search feed using the region-matched city and
-        // its correct Google News hl/gl/ceid edition params.
+ // AFTER
+        // Fetch Local News search feed using HTTP/HTTPS auto-detection
         String feed_url = "";
         int current_count = 0;
         int active_sources = 0;
@@ -1714,6 +2237,18 @@ void fetch_news_task(void *pvParameters) {
           }
         }
 
+        // ONE WiFiClientSecure reused for every feed fetch below (default
+        // feed or up to 5 custom sources). A fresh WiFiClientSecure has to
+        // malloc TLS RX/TX buffers + mbedTLS context every time it's
+        // constructed - doing that 5x back-to-back was what exhausted/
+        // fragmented the heap and caused "SSL - Memory allocation failed".
+        // Reusing one instance means that allocation happens once per
+        // refresh cycle, not once per source.
+        WiFiClientSecure secure_client;
+        secure_client.setInsecure();
+        secure_client.setHandshakeTimeout(10);
+        //secure_client.setBufferSizes(2048, 1024);
+
         if (active_sources == 0) {
           String query_city = news_query_city;
           query_city.replace(" ", "%20");
@@ -1722,16 +2257,7 @@ void fetch_news_task(void *pvParameters) {
                              "&nocache=" + String(millis());
 
           Serial.println("Fetching local news from default feed: " + feed_url);
-          http.begin(secure_client, feed_url);
-          http.setTimeout(8000);
-          int httpCodeNews = http.GET();
-          if (httpCodeNews == HTTP_CODE_OK) {
-            WiFiClientSecure *stream = (WiFiClientSecure*)http.getStreamPtr();
-            current_count = parse_rss_stream(stream, 50, 0);
-          } else {
-            Serial.printf("HTTP news request failed, code: %d\n", httpCodeNews);
-          }
-          http.end();
+          current_count = fetch_and_parse_rss_url(secure_client, feed_url, 50, 0);
         } else {
           int sources_processed = 0;
           for (int i = 0; i < 5; i++) {
@@ -1746,17 +2272,15 @@ void fetch_news_task(void *pvParameters) {
                 limit = 10;
               }
               
-              Serial.printf("Fetching source %d: %s (limit: %d, start_idx: %d)\n", i + 1, custom_rss_urls[i].c_str(), limit, current_count);
-              http.begin(secure_client, custom_rss_urls[i]);
-              http.setTimeout(8000);
-              int httpCodeNews = http.GET();
-              if (httpCodeNews == HTTP_CODE_OK) {
-                WiFiClientSecure *stream = (WiFiClientSecure*)http.getStreamPtr();
-                current_count = parse_rss_stream(stream, limit, current_count);
-              } else {
-                Serial.printf("HTTP request failed for source %d, code: %d\n", i + 1, httpCodeNews);
+              if (sources_processed > 0) {
+                // Short gap just to let lwIP tear down the previous TCP
+                // socket cleanly - secure_client itself is reused so no
+                // TLS buffer realloc happens here anymore.
+                vTaskDelay(pdMS_TO_TICKS(300));
               }
-              http.end();
+              
+              Serial.printf("Fetching source %d: %s (limit: %d, start_idx: %d)\n", i + 1, custom_rss_urls[i].c_str(), limit, current_count);
+              current_count = fetch_and_parse_rss_url(secure_client, custom_rss_urls[i], limit, current_count);
               sources_processed++;
             }
           }
@@ -1764,26 +2288,30 @@ void fetch_news_task(void *pvParameters) {
 
         if (current_count > 0) {
           news_count = current_count;
+          fetch_fail_count = 0; // Reset fail counter on success
           Serial.printf("Successfully parsed %d news items total.\n", news_count);
           if (lvgl_port_lock(-1)) {
             update_ui_news();
             lvgl_port_unlock();
           }
           save_news_cache(); // Persist latest headlines to NVS for next boot
+          seconds_to_refresh = 300; // Reset countdown to 5 min
         } else {
-          Serial.println("No news items parsed.");
+          fetch_fail_count++;
+          int backoff = (fetch_fail_count == 1) ? 30 : ((fetch_fail_count == 2) ? 60 : 120);
+          Serial.printf("No news items parsed. Exponential backoff retry in %d seconds (attempt %d).\n", backoff, fetch_fail_count);
           if (lvgl_port_lock(-1)) {
-            lv_label_set_text(status_label, is_asia ? "解析失敗" : "Parse failed");
+            lv_label_set_text(refresh_label, is_asia ? "失敗" : "Failed");
             lvgl_port_unlock();
           }
+          seconds_to_refresh = backoff;
         }
         http.end();
         is_updating = false;
-        seconds_to_refresh = 300; // Reset countdown
       } else {
         Serial.println("Cannot fetch data: Wi-Fi is offline.");
         if (lvgl_port_lock(-1)) {
-          lv_label_set_text(status_label, is_asia ? "網路離線" : "Offline");
+          lv_label_set_text(refresh_label, is_asia ? "離線" : "Offline");
           lvgl_port_unlock();
         }
       }
@@ -1813,6 +2341,8 @@ void load_settings() {
   custom_rss_urls[2] = newsPrefs.getString("rss_url3", "");
   custom_rss_urls[3] = newsPrefs.getString("rss_url4", "");
   custom_rss_urls[4] = newsPrefs.getString("rss_url5", "");
+  custom_city = newsPrefs.getString("custom_city", "");
+  current_theme = newsPrefs.getInt("theme", 0);
   newsPrefs.end();
 
   update_blacklist_array();
@@ -1835,6 +2365,8 @@ void save_settings() {
   newsPrefs.putString("rss_url3", custom_rss_urls[2]);
   newsPrefs.putString("rss_url4", custom_rss_urls[3]);
   newsPrefs.putString("rss_url5", custom_rss_urls[4]);
+  newsPrefs.putString("custom_city", custom_city);
+  newsPrefs.putInt("theme", current_theme);
   newsPrefs.end();
 
   update_blacklist_array();
@@ -1847,17 +2379,6 @@ void switch_page(int page) {
   active_page = page;
   if (lvgl_port_lock(100)) {
     update_ui_news_labels();
-    if (active_page == 1) {
-      lv_label_set_text(status_label, is_asia ? "左右滑動切換" : "Swipe for News");
-    } else {
-      char countdown_str[32];
-      if (is_asia) {
-        sprintf(countdown_str, "%d秒後更新", seconds_to_refresh);
-      } else {
-        sprintf(countdown_str, "Refresh in %ds", seconds_to_refresh);
-      }
-      lv_label_set_text(status_label, countdown_str);
-    }
     lvgl_port_unlock();
   }
 }
@@ -1880,9 +2401,11 @@ body {
   margin: 0;
   padding: 20px;
   display: flex;
-  justify-content: center;
+  flex-direction: column;
   align-items: center;
+  justify-content: flex-start;
   min-height: 100vh;
+  box-sizing: border-box;
 }
 .card {
   background: rgba(33, 38, 48, 0.7);
@@ -2046,9 +2569,52 @@ function addSuggestion(url) {
   let first = document.getElementById('rss_url_1');
   if (first) first.value = url;
 }
+function updateDashboard() {
+  fetch('/api/status')
+    .then(r => r.json())
+    .then(d => {
+      document.getElementById('dash_bat').innerText = d.battery_pct;
+      document.getElementById('dash_wifi').innerText = d.wifi_rssi;
+      document.getElementById('dash_cnt').innerText = d.news_count;
+      document.getElementById('dash_status').innerText = d.is_updating ? 'Updating...' : 'Active';
+      
+      let list = document.getElementById('dash_headlines');
+      list.innerHTML = '';
+      if (d.headlines.length === 0) {
+        list.innerHTML = '<li>No news loaded yet</li>';
+      } else {
+        d.headlines.forEach(h => {
+          let li = document.createElement('li');
+          li.innerText = h;
+          list.appendChild(li);
+        });
+      }
+    })
+    .catch(e => console.error(e));
+}
+window.onload = function() {
+  updateDashboard();
+  setInterval(updateDashboard, 5000);
+};
 </script>
 </head>
 <body>
+<div class="card" style="margin-bottom:20px;">
+  <h2>Live Status Dashboard</h2>
+  <div style="display:grid;grid-template-columns:1fr 1fr;gap:15px;margin-bottom:15px;text-align:left;">
+    <div><strong>Battery:</strong> <span id="dash_bat">--</span>%</div>
+    <div><strong>Wi-Fi Signal:</strong> <span id="dash_wifi">--</span> dBm</div>
+    <div><strong>News Count:</strong> <span id="dash_cnt">--</span> items</div>
+    <div><strong>Status:</strong> <span id="dash_status">--</span></div>
+  </div>
+  <div style="text-align:left;">
+    <strong>Latest Headlines:</strong>
+    <ul id="dash_headlines" style="max-height:120px;overflow-y:auto;background:rgba(20,24,30,0.6);padding:10px 10px 10px 25px;border-radius:8px;border:1px solid rgba(55,63,80,0.6);margin:8px 0 0 0;font-size:13px;color:#a0a0a0;line-height:1.4;">
+      <li>Loading...</li>
+    </ul>
+  </div>
+</div>
+
 <div class="card">
   <h2>News Ticker Setup</h2>
   <form action="/save" method="POST">
@@ -2066,6 +2632,10 @@ function addSuggestion(url) {
     <div class="form-group">
       <label>Wi-Fi Password</label>
       <input type="password" name="pass" value="{{PASS}}" placeholder="Enter Wi-Fi Password">
+    </div>
+    <div class="form-group">
+      <label>Custom Weather Location (City Name)</label>
+      <input type="text" name="custom_city" value="{{CUSTOM_CITY}}" placeholder="e.g. Tokyo, London (Leave blank to use GPS)">
     </div>
     <div class="form-group">
       <label>Blacklisted Sources (Comma-separated)</label>
@@ -2149,8 +2719,20 @@ function addSuggestion(url) {
       <input type="number" name="scroll_int" min="3" max="60" value="{{SCROLL_INT}}" required style="width:100%;padding:12px;background:rgba(20, 24, 30, 0.8);border:1px solid rgba(55, 63, 80, 0.8);border-radius:8px;color:#ffffff;box-sizing:border-box;font-size:16px;">
     </div>
     
+    <div class="form-group">
+      <label>LCD Color Theme (Applies instantly)</label>
+      <select name="theme" onchange="fetch('/api/set_theme?val=' + this.value)">
+        {{THEME_OPTIONS}}
+      </select>
+    </div>
+    
     <button type="submit" class="btn">Save & Reboot</button>
   </form>
+  <div style="display:flex;gap:10px;margin-top:15px;">
+    <a href="/api/export" download class="sug-btn" style="flex:1;text-decoration:none;display:inline-block;padding:10px;text-align:center;">Export Config</a>
+    <button type="button" class="sug-btn" style="flex:1;padding:10px;" onclick="document.getElementById('import_file').click()">Import Config</button>
+    <input type="file" id="import_file" style="display:none" accept=".json" onchange="let f=this.files[0];if(f){let r=new FileReader();r.onload=e=>fetch('/api/import',{method:'POST',body:e.target.result}).then(()=>alert('Config imported successfully! Rebooting...')).then(()=>location.reload());r.readAsText(f);}">
+  </div>
   <div style="text-align:center;margin-top:15px;">
     <a href="/update" style="color:#00ff66;text-decoration:none;font-size:14px;">Go to Firmware Update (OTA)</a>
   </div>
@@ -2159,6 +2741,107 @@ function addSuggestion(url) {
 </body>
 </html>
 )rawliteral";
+
+void handle_api_status() {
+  String json = "{";
+  json += "\"battery_pct\":" + String(get_battery_percentage()) + ",";
+  
+  int rssi = (WiFi.status() == WL_CONNECTED) ? WiFi.RSSI() : 0;
+  json += "\"wifi_rssi\":" + String(rssi) + ",";
+  json += "\"news_count\":" + String(news_count) + ",";
+  json += "\"is_updating\":" + String(is_updating ? "true" : "false") + ",";
+  
+  json += "\"headlines\":[";
+  for (int i = 0; i < news_count; i++) {
+    String headline = String(news_list[i].headline);
+    headline.replace("\\", "\\\\");
+    headline.replace("\"", "\\\"");
+    headline.replace("\n", "\\n");
+    headline.replace("\r", "\\r");
+    json += "\"" + headline + "\"";
+    if (i < news_count - 1) json += ",";
+  }
+  json += "]";
+  json += "}";
+  
+  server.send(200, "application/json; charset=utf-8", json);
+}
+
+void handle_api_set_theme() {
+  if (server.hasArg("val")) {
+    int new_theme = server.arg("val").toInt();
+    if (new_theme >= 0 && new_theme < 5) {
+      if (new_theme != current_theme) {
+        current_theme = new_theme;
+        if (lvgl_port_lock(-1)) {
+          apply_theme_styles();
+          lvgl_port_unlock();
+        }
+        save_settings();
+      }
+      server.send(200, "text/plain", "OK");
+      return;
+    }
+  }
+  server.send(400, "text/plain", "Bad Request");
+}
+
+void handle_api_export() {
+  String json = "{";
+  json += "\"ssid\":\"" + wifi_ssid + "\",";
+  json += "\"pass\":\"" + wifi_pass + "\",";
+  json += "\"blacklist\":\"" + blacklist_str + "\",";
+  json += "\"sleep_on\":" + String(sleep_enabled ? "true" : "false") + ",";
+  json += "\"sleep_start\":" + String(sleep_start) + ",";
+  json += "\"sleep_end\":" + String(sleep_end) + ",";
+  json += "\"auto_bright\":" + String(auto_bright ? "true" : "false") + ",";
+  json += "\"day_bright\":" + String(day_bright) + ",";
+  json += "\"night_bright\":" + String(night_bright) + ",";
+  json += "\"scroll_int\":" + String(scroll_interval_seconds) + ",";
+  json += "\"custom_city\":\"" + custom_city + "\",";
+  json += "\"theme\":" + String(current_theme) + ",";
+  json += "\"rss_urls\":[";
+  for (int i = 0; i < 5; i++) {
+    json += "\"" + custom_rss_urls[i] + "\"";
+    if (i < 4) json += ",";
+  }
+  json += "]}";
+  server.sendHeader("Content-Disposition", "attachment; filename=newsticker_config.json");
+  server.send(200, "application/json; charset=utf-8", json);
+}
+
+void handle_api_import() {
+  if (server.hasArg("plain")) {
+    String body = server.arg("plain");
+    int idx;
+    if ((idx = body.indexOf("\"ssid\":\"")) != -1) {
+      int end = body.indexOf("\"", idx + 8);
+      if (end != -1) wifi_ssid = body.substring(idx + 8, end);
+    }
+    if ((idx = body.indexOf("\"pass\":\"")) != -1) {
+      int end = body.indexOf("\"", idx + 8);
+      if (end != -1) wifi_pass = body.substring(idx + 8, end);
+    }
+    if ((idx = body.indexOf("\"blacklist\":\"")) != -1) {
+      int end = body.indexOf("\"", idx + 13);
+      if (end != -1) blacklist_str = body.substring(idx + 13, end);
+    }
+    if ((idx = body.indexOf("\"custom_city\":\"")) != -1) {
+      int end = body.indexOf("\"", idx + 15);
+      if (end != -1) custom_city = body.substring(idx + 15, end);
+    }
+    if ((idx = body.indexOf("\"theme\":")) != -1) {
+      current_theme = body.substring(idx + 8).toInt();
+    }
+    if ((idx = body.indexOf("\"scroll_int\":")) != -1) {
+      scroll_interval_seconds = body.substring(idx + 13).toInt();
+    }
+    save_settings();
+    server.send(200, "text/plain", "OK");
+    return;
+  }
+  server.send(400, "text/plain", "Missing body");
+}
 
 void handle_root() {
   // Read scan results from background async scan (non-blocking)
@@ -2215,6 +2898,21 @@ void handle_root() {
   html.replace("{{RSS_URL3}}", custom_rss_urls[2]);
   html.replace("{{RSS_URL4}}", custom_rss_urls[3]);
   html.replace("{{RSS_URL5}}", custom_rss_urls[4]);
+  html.replace("{{CUSTOM_CITY}}", custom_city);
+
+  String theme_opts = "";
+  const char* theme_names[] = {
+    "🟢 Cyberpunk Neon Green (Default)",
+    "🌅 Sunset Coral (Warm Peach)",
+    "🟧 Retro Terminal (Amber Orange)",
+    "🍃 Forest Calcite (Mint Green)",
+    "👑 Royal Monarch (Orchid Gold)"
+  };
+  for (int i = 0; i < 5; i++) {
+    String sel = (i == current_theme) ? "selected" : "";
+    theme_opts += "<option value=\"" + String(i) + "\" " + sel + ">" + String(theme_names[i]) + "</option>\n";
+  }
+  html.replace("{{THEME_OPTIONS}}", theme_opts);
 
   server.send(200, "text/html; charset=utf-8", html);
 }
@@ -2263,6 +2961,19 @@ void handle_save() {
   if (server.hasArg("rss_url5")) {
     custom_rss_urls[4] = server.arg("rss_url5");
   }
+  if (server.hasArg("custom_city")) {
+    custom_city = server.arg("custom_city");
+  }
+  if (server.hasArg("theme")) {
+    int new_theme = server.arg("theme").toInt();
+    if (new_theme != current_theme) {
+      current_theme = new_theme;
+      if (lvgl_port_lock(-1)) {
+        apply_theme_styles();
+        lvgl_port_unlock();
+      }
+    }
+  }
 
   save_settings();
 
@@ -2280,7 +2991,7 @@ void handle_save() {
 
 void show_ap_mode_ui() {
   if (lvgl_port_lock(-1)) {
-    lv_label_set_text(status_label, "Setup Mode (192.168.4.1)");
+    lv_label_set_text(refresh_label, "Setup Mode");
     lv_label_set_text(top_headline_lbl, "Wi-Fi disconnected. Connect to Hotspot:\nSSID: ESP32_News_Ticker");
     lv_label_set_text(bottom_headline_lbl, "Open browser and configure device at:\nhttp://192.168.4.1/");
     lvgl_port_unlock();

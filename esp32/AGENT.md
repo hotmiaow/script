@@ -68,5 +68,24 @@ This project is an **ESP32-S3 Google News Ticker** built for the **Waveshare ESP
 - [x] Configured CPU boot frequency to 80 MHz (lowest stable frequency that preserves correct SPI LCD & I2C Touch peripheral bus operations)
 - [x] Bypassed Wi-Fi connection and HTTP news fetches during Smart Sleep Hours to maximize battery saving (checking only once per hour instead of every 5 minutes)
 - [x] Disabled touch screen polling and hardware driver initialization in lvgl_port.c to conserve CPU wake cycles and I2C bus traffic
+- [x] Implemented 5 selectable LCD display color themes (Cyberpunk Green, Sunset Coral, Retro Amber, Forest Calcite, Royal Monarch) configured from the Web Portal and applied instantly without device reboot
+- [x] Removed on-screen weather symbols (keeping only text) and disabled local screen Wi-Fi RSSI rotation (Wi-Fi strength is visible on the web dashboard)
+- [x] Integrated a stacked, half-size 4-dot square rating system (■ and □) modeled after the iPhone secondary SIM signal indicator for battery level (B:) and refresh timer (R:) on the far right of the top bar with 5px row padding and larger CJK font rendering
+- [x] Fixed theme persistence by loading NVS settings early during setup() before create_layout() runs
+- [x] Reduced SSL/TLS socket buffer sizes to 4KB/1KB to resolve memory allocation failures during secure news handshakes
+- [x] Implemented 16-sample ADC moving average filter for smooth battery voltage readings
+- [x] Implemented low-battery auto-shutdown (< 3.2V) to protect lithium battery from over-discharge
+- [x] Added HTTP/HTTPS auto-detection for RSS feeds (using plain WiFiClient for http:// to save 32KB TLS buffer per fetch)
+- [x] Added 500ms delay between consecutive RSS source fetches to prevent SRAM fragmentation
+- [x] Implemented exponential backoff retry on news fetch failures (30s → 60s → 120s)
+- [x] Added Task Watchdog Timer (60s timeout) on NewsTask to auto-recover from stalled network sockets
+- [x] Added stack high-water-mark memory monitoring log every 60s
+- [x] Implemented relative headline age formatter ("2h ago", "Just now", "Yesterday") parsed from RSS pubDate
+- [x] Implemented breaking news alert animation (flashing red top card on keywords like BREAKING/突發/緊急)
+- [x] Implemented LCD burn-in pixel-shifting protection (shifting container translate by 1-2px every 30 mins)
+- [x] Configured mDNS responder (`http://newsticker.local`) for easy Web Portal access without knowing device IP
+- [x] Integrated DNS Captive Portal in AP mode (auto-redirecting connected phones to setup page)
+- [x] Added Web Portal Configuration Export (`/api/export`) & Import (`/api/import`) JSON backup/restore
+- [x] Added visual color indicators/icons to LCD theme dropdown options in the Web Portal
 
 

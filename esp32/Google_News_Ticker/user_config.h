@@ -56,7 +56,8 @@
 #define LCD_NOROT_VRES             640
 
 // Buffers sized for RGB565 color format (2 bytes per pixel)
-#define LVGL_DMA_BUFF_LEN          (LCD_NOROT_HRES * 64 * 2)
+// 16 lines instead of 64 lines frees 16.5KB of internal DMA SRAM for HTTPS TLS handshakes
+#define LVGL_DMA_BUFF_LEN          (LCD_NOROT_HRES * 16 * 2)
 #define LVGL_SPIRAM_BUFF_LEN       (EXAMPLE_LCD_H_RES * EXAMPLE_LCD_V_RES * 2)
 
 #endif
