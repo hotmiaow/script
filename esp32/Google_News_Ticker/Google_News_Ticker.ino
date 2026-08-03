@@ -16,6 +16,8 @@
 #include "src/lcd_bl_bsp/lcd_bl_pwm_bsp.h"
 #include "lvgl.h"
 
+#include "esp_heap_caps.h"
+
 // Audio & Codec Includes
 #include "src/tca9554/esp_io_expander_tca9554.h"
 #include "src/codec_board/codec_board.h"
@@ -46,7 +48,7 @@ struct NewsItem {
 
 #define MAX_NEWS_ITEMS 50
 #define MAX_CACHED_NEWS 10
-NewsItem news_list[MAX_NEWS_ITEMS];
+NewsItem* news_list = nullptr;   // was: NewsItem news_list[MAX_NEWS_ITEMS];
 
 int news_count = 0;
 bool is_updating = false;
@@ -115,6 +117,38 @@ void update_blacklist_array() {
   }
 }
 
+bool allocate_news_buffer(void) {
+  // Try PSRAM first (external 8MB SPIRAM)
+  if (psramFound()) {
+    size_t psram_total = ESP.getPsramSize();
+    size_t psram_free  = ESP.getFreePsram();
+    Serial.printf("[PSRAM] Detected %d KB total, %d KB free\n", 
+                  psram_total / 1024, psram_free / 1024);
+
+    news_list = (NewsItem*)ps_malloc(MAX_NEWS_ITEMS * sizeof(NewsItem));
+    if (news_list) {
+      Serial.printf("[PSRAM] news_list allocated at %p (%d bytes)\n",
+                    news_list, MAX_NEWS_ITEMS * (int)sizeof(NewsItem));
+    }
+  }
+
+  // Fallback to internal RAM if PSRAM missing or failed
+  if (!news_list) {
+    Serial.println("[PSRAM] WARNING: Falling back to internal RAM for news_list");
+    news_list = (NewsItem*)malloc(MAX_NEWS_ITEMS * sizeof(NewsItem));
+  }
+
+  if (!news_list) {
+    Serial.println("[FATAL] Could not allocate news_list. Halting.");
+    return false;
+  }
+
+  // ps_malloc does NOT zero memory (unlike static BSS arrays).
+  // Zero it now so empty strings behave safely.
+  memset(news_list, 0, MAX_NEWS_ITEMS * sizeof(NewsItem));
+  return true;
+}
+
 // Battery ADC smoothing: 16-sample ring buffer for stable readings
 #define BAT_SAMPLE_COUNT 16
 static float bat_samples[BAT_SAMPLE_COUNT];
@@ -136,9 +170,16 @@ float get_battery_voltage() {
 
 int get_battery_percentage() {
   float v = get_battery_voltage();
-  if (v >= 4.2) return 100;
-  if (v <= 3.3) return 0;
-  return (int)((v - 3.3) / (4.2 - 3.3) * 100.0);
+  if (v >= 4.20) return 100;
+  if (v >= 4.10) return 90 + (v - 4.10) * 100;
+  if (v >= 4.00) return 80 + (v - 4.00) * 100;
+  if (v >= 3.90) return 60 + (v - 3.90) * 200;
+  if (v >= 3.80) return 40 + (v - 3.80) * 200;
+  if (v >= 3.70) return 20 + (v - 3.70) * 200;
+  if (v >= 3.60) return 10 + (v - 3.60) * 100;
+  if (v >= 3.50) return 5  + (v - 3.50) * 50;
+  if (v >= 3.30) return (v - 3.30) * 25;
+  return 0;
 }
 
 // Burn-in protection: pixel shift offset applied every 30 minutes
@@ -173,7 +214,7 @@ bool is_duplicate_headline(const char* headline, int current_count) {
   return false;
 }
 volatile bool fetch_requested = true;
-int seconds_to_refresh = 300; // 5 minutes refresh interval
+int seconds_to_refresh = 3600; // 60 minutes refresh interval
 int current_page = 0;
 
 static void brightness_anim_cb(void * var, int32_t v);
@@ -455,6 +496,90 @@ static char* trim_inplace(char* s) {
   return s;
 }
 
+// Decodes common HTML entities in-place inside a null-terminated buffer.
+// Handles named (&quot; &amp; &lt; &gt; &apos; &nbsp;) and numeric
+// (&#39; &#x27; &#x2019; etc.) entities. Unknown entities are left as-is
+// to avoid corrupting existing UTF-8 CJK text.
+static void decode_html_entities_inplace(char* str) {
+  char* r = str;   // read head
+  char* w = str;   // write head
+
+  while (*r) {
+    if (*r == '&') {
+      // Look ahead for ';' within a sane window (max 10 chars)
+      char* semi = r + 1;
+      int scan = 0;
+      while (*semi && *semi != ';' && scan < 10) {
+        semi++;
+        scan++;
+      }
+
+      if (*semi == ';' && scan > 0) {
+        char decoded = '\0';
+        int len = semi - r - 1; // length between & and ;
+
+        // ----- Named entities -----
+        if (len == 4 && strncmp(r + 1, "quot", 4) == 0)       decoded = '"';
+        else if (len == 4 && strncmp(r + 1, "apos", 4) == 0)  decoded = '\'';
+        else if (len == 3 && strncmp(r + 1, "amp", 3) == 0)   decoded = '&';
+        else if (len == 2 && strncmp(r + 1, "lt", 2) == 0)    decoded = '<';
+        else if (len == 2 && strncmp(r + 1, "gt", 2) == 0)    decoded = '>';
+        else if (len == 4 && strncmp(r + 1, "nbsp", 4) == 0)  decoded = ' ';
+
+        // ----- Numeric entities (&#123; or &#x7B;) -----
+        else if (r[1] == '#') {
+          unsigned int code = 0;
+          if (len > 2 && (r[2] == 'x' || r[2] == 'X')) {
+            // Hex: &#xNNNN;
+            for (int i = 3; i <= len; i++) {
+              char c = r[i];
+              if (c >= '0' && c <= '9')       code = code * 16 + (c - '0');
+              else if (c >= 'a' && c <= 'f')  code = code * 16 + (c - 'a' + 10);
+              else if (c >= 'A' && c <= 'F')  code = code * 16 + (c - 'A' + 10);
+              else break;
+            }
+          } else {
+            // Decimal: &#NNNN;
+            for (int i = 2; i <= len; i++) {
+              char c = r[i];
+              if (c >= '0' && c <= '9') code = code * 10 + (c - '0');
+              else break;
+            }
+          }
+
+          // Whitelist: only map safe punctuation / ASCII.
+          // CJK codepoints are intentionally skipped (left raw) so we
+          // never break multi-byte UTF-8 sequences.
+          if      (code == 34)   decoded = '"';     // &#34;
+          else if (code == 39)   decoded = '\'';    // &#39;
+          else if (code == 38)   decoded = '&';     // &#38;
+          else if (code == 60)   decoded = '<';     // &#60;
+          else if (code == 62)   decoded = '>';     // &#62;
+          else if (code == 160)  decoded = ' ';     // non-breaking space
+          else if (code == 8217) decoded = '\'';    // ’ right single quote
+          else if (code == 8220) decoded = '"';     // “ left double quote
+          else if (code == 8221) decoded = '"';     // ” right double quote
+          else if (code == 8230) {                  // … horizontal ellipsis
+            *w++ = '.'; *w++ = '.'; *w++ = '.';
+            r = semi + 1;
+            continue;
+          }
+          else if (code >= 32 && code <= 126) decoded = (char)code;
+        }
+
+        if (decoded) {
+          *w++ = decoded;
+          r = semi + 1;   // skip past the ';'
+          continue;
+        }
+      }
+    }
+    *w++ = *r++;
+  }
+  *w = '\0';
+}
+
+
 // Finds the LAST occurrence of needle in haystack (like strstr but reversed).
 static char* strrstr_custom(const char* haystack, const char* needle) {
   if (!*needle) return NULL;
@@ -627,7 +752,11 @@ void setup()
   Serial.begin(115200);
   delay(100);
   Serial.println("Initializing ESP32-S3 Google News Ticker...");
+  
   init_power_management();
+
+  if (!allocate_news_buffer()) return;   // Fatal if no RAM at all
+
   // Load any cached news from a previous session BEFORE anything else,
   // so we have something to show the instant the UI is created —
   // no waiting on Wi-Fi/RSS fetch for the first paint.
@@ -652,6 +781,7 @@ void setup()
 
   // Initialize LVGL Port (AXS15231B LCD & CST328 Touch Panel)
   lvgl_port_init();
+  
 
   // Lock the panel to landscape (640x172). The AXS15231B is natively
   // 172x640 portrait, so rotate to get the wide horizontal strip this
@@ -1460,7 +1590,7 @@ int parse_rss_stream(Client *stream, int limit, int start_count) {
           if (count < start_count + limit && count < MAX_NEWS_ITEMS && item_title_len > 0) {
             item_title_buf[item_title_len] = '\0';
             item_pubdate_buf[item_pubdate_len] = '\0';
-
+            decode_html_entities_inplace(item_title_buf);
             char* trimmed_title = trim_inplace(item_title_buf);
             char* trimmed_pubdate = trim_inplace(item_pubdate_buf);
 
@@ -1809,6 +1939,10 @@ void fetch_news_task(void *pvParameters) {
         UBaseType_t hwm = uxTaskGetStackHighWaterMark(NULL);
         Serial.printf("[Stack] NewsTask high-water-mark: %u bytes remaining\n", hwm * 4);
       }
+      Serial.printf("[Memory] Internal DRAM: %d KB free | PSRAM: %d KB free\n",
+              ESP.getFreeHeap() / 1024,
+              ESP.getFreePsram() / 1024);
+
     }
 
     // 1. Periodically update NTP clock every second
@@ -2016,7 +2150,7 @@ void fetch_news_task(void *pvParameters) {
             Serial.println("[WiFi] Still down after 8s+5s of waiting. Forcing reconnect...");
             WiFi.disconnect();
             vTaskDelay(pdMS_TO_TICKS(200));
-            WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+            WiFi.begin(wifi_ssid.c_str(), wifi_pass.c_str());
             vTaskDelay(pdMS_TO_TICKS(3000));
           }
         }
@@ -2866,7 +3000,9 @@ void handle_root() {
     WiFi.scanNetworks(true);
   }
 
-  String html = String(config_html);
+  String html;
+  html.reserve(16384);   // Pre-allocate ~16KB to reduce reallocations
+  html = FPSTR(config_html);
   html.replace("{{WIFI_OPTIONS}}", wifi_opts);
   html.replace("{{SSID}}", wifi_ssid);
   html.replace("{{PASS}}", wifi_pass);

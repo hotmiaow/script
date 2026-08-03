@@ -1,6 +1,8 @@
 #ifndef USER_CONFIG_H
 #define USER_CONFIG_H
 
+#define BOARD_VERSION_2   // Comment out for V1
+
 // SPI host configuration
 #define LCD_HOST SPI3_HOST
 
