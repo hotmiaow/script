@@ -46,8 +46,8 @@ struct NewsItem {
   char pubDate[MAX_PUBDATE_LEN];
 };
 
-#define MAX_NEWS_ITEMS 50
-#define MAX_CACHED_NEWS 10
+#define MAX_NEWS_ITEMS 200
+#define MAX_CACHED_NEWS 50
 NewsItem* news_list = nullptr;   // was: NewsItem news_list[MAX_NEWS_ITEMS];
 
 int news_count = 0;
@@ -1939,9 +1939,9 @@ void fetch_news_task(void *pvParameters) {
         UBaseType_t hwm = uxTaskGetStackHighWaterMark(NULL);
         Serial.printf("[Stack] NewsTask high-water-mark: %u bytes remaining\n", hwm * 4);
       }
-      Serial.printf("[Memory] Internal DRAM: %d KB free | PSRAM: %d KB free\n",
-              ESP.getFreeHeap() / 1024,
-              ESP.getFreePsram() / 1024);
+    //   Serial.printf("[Memory] Internal DRAM: %d KB free | PSRAM: %d KB free\n",
+    //           ESP.getFreeHeap() / 1024,
+    //           ESP.getFreePsram() / 1024);
 
     }
 
@@ -2885,8 +2885,9 @@ void handle_api_status() {
   json += "\"news_count\":" + String(news_count) + ",";
   json += "\"is_updating\":" + String(is_updating ? "true" : "false") + ",";
   
-  json += "\"headlines\":[";
-  for (int i = 0; i < news_count; i++) {
+json += "\"headlines\":[";
+int api_limit = (news_count > 20) ? 20 : news_count;
+  for (int i = 0; i < api_limit; i++) {
     String headline = String(news_list[i].headline);
     headline.replace("\\", "\\\\");
     headline.replace("\"", "\\\"");
@@ -3000,9 +3001,7 @@ void handle_root() {
     WiFi.scanNetworks(true);
   }
 
-  String html;
-  html.reserve(16384);   // Pre-allocate ~16KB to reduce reallocations
-  html = FPSTR(config_html);
+  String html = String(config_html);   // Copies ~12KB from PROGMEM to RAM
   html.replace("{{WIFI_OPTIONS}}", wifi_opts);
   html.replace("{{SSID}}", wifi_ssid);
   html.replace("{{PASS}}", wifi_pass);
