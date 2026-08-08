@@ -87,5 +87,17 @@ This project is an **ESP32-S3 Google News Ticker** built for the **Waveshare ESP
 - [x] Integrated DNS Captive Portal in AP mode (auto-redirecting connected phones to setup page)
 - [x] Added Web Portal Configuration Export (`/api/export`) & Import (`/api/import`) JSON backup/restore
 - [x] Added visual color indicators/icons to LCD theme dropdown options in the Web Portal
+- [x] Moved `news_list` array allocation to **16MB External OPI PSRAM** (`ps_malloc`)
+- [x] Added instant offline Weather & City NVS Cache (`wtrcache`) for instant boot UI rendering
+- [x] Implemented tap-to-toggle numeric battery voltage (`B: 85%`) & refresh countdown (`R: 240s`) on status panel
+- [x] Implemented Web Portal Live Status Dashboard (weather, city, countdown) and instant "⚡ Refresh News Now" button (`/api/refresh`)
+- [x] Added daily 3:00 AM automatic NTP time re-synchronization with hardware RTC update
+- [x] Added configurable page transition animations (Fade vs Slide Up/Down) in Web Portal and NVS
+- [x] Optimized `LVGL_DMA_BUFF_LEN` (16 lines) in `user_config.h` freeing 16.5KB of internal SRAM for TLS handshakes
+- [x] Configured 16MB Flash / 3MB App Partition (`PartitionScheme=app3M_fat9M_16MB`) for clean 2.7MB binary compilation
+- [x] Corrected LCD Backlight PWM pin definition in `user_config.h` to **GPIO 8** (for Waveshare ESP32-S3-Touch-LCD-3.49 V2 / Rev1.1 hardware, where Waveshare swapped `LCD_BL` on GPIO 8 and `EXIO_INT` on GPIO 42)
+- [x] Configured LEDC timer with `LEDC_AUTO_CLK` and 5kHz PWM frequency in `lcd_bl_pwm_bsp.c`
+- [x] Replaced Web Portal slider `oninput` HTTP fetch spam with `onchange` so dragging brightness sliders sends clean real-time requests (`/api/set_brightness?val=XXX`) without overwhelming ESP32 WebServer
+- [x] Added "System Sleeping 💤" / "系統休眠中 💤" on-screen text display when entering Smart Sleep mode (restores news instantly when screen is woken by tap or sound)
 
 

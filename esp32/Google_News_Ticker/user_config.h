@@ -22,6 +22,7 @@
 #define EXAMPLE_PIN_NUM_LCD_DATA2  (GPIO_NUM_13)
 #define EXAMPLE_PIN_NUM_LCD_DATA3  (GPIO_NUM_14)
 #define EXAMPLE_PIN_NUM_LCD_RST    (GPIO_NUM_21)
+// LCD Backlight PWM pin (V2 board = GPIO 8, V1 board = GPIO 42)
 #define EXAMPLE_PIN_NUM_BK_LIGHT   (GPIO_NUM_8) 
 
 // Onboard I2C Device Addresses

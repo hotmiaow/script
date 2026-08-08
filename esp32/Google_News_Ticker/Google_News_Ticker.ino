@@ -69,6 +69,8 @@ int night_bright = 50;
 int scroll_interval_seconds = 10;
 String custom_rss_urls[5] = {"", "", "", "", ""};
 String custom_city = "";
+bool show_numeric_status = false;
+int anim_type = 0; // 0 = Fade, 1 = Slide
 
 #define MAX_BLACKLIST_COUNT 16
 char blacklist_items[MAX_BLACKLIST_COUNT][MAX_SOURCE_LEN];
@@ -327,6 +329,10 @@ void handle_api_status(void);
 void handle_api_set_theme(void);
 void handle_api_export(void);
 void handle_api_import(void);
+void handle_api_refresh(void);
+void handle_api_set_brightness(void);
+void load_cached_weather(void);
+void save_weather_cache(void);
 void sync_system_time_from_rtc(void);
 void sync_rtc_from_system_time(void);
 void rtc_set_time(int year, int month, int day, int hour, int minute, int second);
@@ -649,6 +655,14 @@ static void refresh_btn_event_handler(lv_event_t * e) {
   }
 }
 
+// Status Panel Click Event Handler (Toggle Numeric Battery & Countdown)
+static void status_panel_click_event_handler(lv_event_t * e) {
+  if (lv_event_get_code(e) == LV_EVENT_CLICKED) {
+    show_numeric_status = !show_numeric_status;
+    Serial.printf("[UI] Numeric status toggled: %s\n", show_numeric_status ? "ON" : "OFF");
+  }
+}
+
 bool is_sleep_time_active() {
   if (!sleep_enabled) return false;
   struct tm timeinfo;
@@ -691,6 +705,10 @@ void reset_dim_timer(void) {
     is_dimmed = false;
     last_applied_brightness = target_bright;
     set_brightness_smooth(10, target_bright, 250);
+    if (lvgl_port_lock(100)) {
+      update_ui_news_labels();
+      lvgl_port_unlock();
+    }
     Serial.printf("[Power] Screen woke up: ramping to %d.\n", target_bright);
   }
 }
@@ -773,6 +791,7 @@ void setup()
 
   load_settings();
   load_cached_news();
+  load_cached_weather();
 
   // Initialize Onboard Dual I2C buses (Touch & Sensors)
 
@@ -1077,6 +1096,10 @@ void create_layout(void) {
   lv_obj_set_flex_align(status_panel, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
   lv_obj_set_style_pad_all(status_panel, 0, 0);
   lv_obj_set_style_pad_row(status_panel, 3, 0); // 3px gap between battery and refresh
+  
+  // Make status panel clickable to toggle numeric voltage / countdown
+  lv_obj_add_flag(status_panel, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(status_panel, status_panel_click_event_handler, LV_EVENT_CLICKED, NULL);
 
   battery_label = lv_label_create(status_panel);
   lv_obj_add_style(battery_label, &indicator_style, 0);
@@ -1438,6 +1461,31 @@ void save_news_cache(void) {
   newsPrefs.end();
 
   Serial.printf("[Cache] Saved %d headline(s) to NVS.\n", to_save);
+}
+
+void load_cached_weather(void) {
+  newsPrefs.begin("wtrcache", true);
+  String cached_city = newsPrefs.getString("city", "");
+  if (cached_city.length() > 0) {
+    local_city = cached_city;
+    local_temp = newsPrefs.getDouble("temp", 0.0);
+    local_weather_desc = newsPrefs.getString("desc", "Fetching");
+    weather_fetched = newsPrefs.getBool("fetched", false);
+    is_asia = newsPrefs.getBool("asia", false);
+  }
+  newsPrefs.end();
+  Serial.printf("[WtrCache] Loaded cached weather: %s, %.1f°C %s\n", local_city.c_str(), local_temp, local_weather_desc.c_str());
+}
+
+void save_weather_cache(void) {
+  newsPrefs.begin("wtrcache", false);
+  newsPrefs.putString("city", local_city);
+  newsPrefs.putDouble("temp", local_temp);
+  newsPrefs.putString("desc", local_weather_desc);
+  newsPrefs.putBool("fetched", weather_fetched);
+  newsPrefs.putBool("asia", is_asia);
+  newsPrefs.end();
+  Serial.println("[WtrCache] Saved weather cache to NVS.");
 }
 
 // ----------------------------------------------------
@@ -1830,6 +1878,8 @@ void fetch_news_task(void *pvParameters) {
     server.on("/api/set_theme", handle_api_set_theme);
     server.on("/api/export", handle_api_export);
     server.on("/api/import", HTTP_POST, handle_api_import);
+    server.on("/api/refresh", handle_api_refresh);
+    server.on("/api/set_brightness", handle_api_set_brightness);
     // Captive portal: redirect any unknown path to root
     server.onNotFound([]() {
       server.sendHeader("Location", "http://" + WiFi.softAPIP().toString() + "/", true);
@@ -1883,6 +1933,8 @@ void fetch_news_task(void *pvParameters) {
   server.on("/api/set_theme", handle_api_set_theme);
   server.on("/api/export", handle_api_export);
   server.on("/api/import", HTTP_POST, handle_api_import);
+  server.on("/api/refresh", handle_api_refresh);
+  server.on("/api/set_brightness", handle_api_set_brightness);
   server.begin();
   WiFi.scanNetworks(true);
 
@@ -1971,13 +2023,38 @@ void fetch_news_task(void *pvParameters) {
     // Apply sleep scheduling
     bool sleep_active = is_sleep_time_active();
     int current_target = base_brightness;
+    static bool sleeping_labels_set = false;
     if (sleep_active) {
       if (millis() - last_sleep_bypass_time < 30000) {
         current_target = is_dimmed ? 10 : base_brightness;
+        if (sleeping_labels_set) {
+          sleeping_labels_set = false;
+          if (lvgl_port_lock(100)) {
+            update_ui_news_labels();
+            lvgl_port_unlock();
+          }
+        }
       } else {
         current_target = 0;
+        if (!sleeping_labels_set) {
+          sleeping_labels_set = true;
+          if (lvgl_port_lock(100)) {
+            lv_label_set_text(top_headline_lbl, is_asia ? "系統休眠中 💤" : "System Sleeping 💤");
+            lv_label_set_text(top_meta_lbl, is_asia ? "觸控螢幕或聲音喚醒" : "Tap screen or make sound to wake");
+            lv_label_set_text(bottom_headline_lbl, is_asia ? "進入定時省電休眠模式" : "Scheduled Sleep Mode Active");
+            lv_label_set_text(bottom_meta_lbl, is_asia ? "休眠中" : "Sleeping");
+            lvgl_port_unlock();
+          }
+        }
       }
     } else {
+      if (sleeping_labels_set) {
+        sleeping_labels_set = false;
+        if (lvgl_port_lock(100)) {
+          update_ui_news_labels();
+          lvgl_port_unlock();
+        }
+      }
       current_target = is_dimmed ? 10 : base_brightness;
     }
     
@@ -2036,7 +2113,7 @@ void fetch_news_task(void *pvParameters) {
       }
     }
 
-    // 3. Update battery and refresh indicators on top bar (4-dot squares with B: and R:)
+    // 3. Update battery and refresh indicators on top bar (supports dot matrix & numeric toggle)
     {
       static char last_bat_str[32] = "";
       static char last_ref_str[32] = "";
@@ -2044,29 +2121,40 @@ void fetch_news_task(void *pvParameters) {
       char new_bat_str[32] = "";
       char new_ref_str[32] = "";
 
-      int bat = get_battery_percentage();
-      int bat_dots = 1;
-      if (bat >= 75) bat_dots = 4;
-      else if (bat >= 50) bat_dots = 3;
-      else if (bat >= 25) bat_dots = 2;
-
-      int ref_dots = 1;
-      strcpy(new_ref_str, "R:");
-      if (is_updating) {
-        strcat(new_ref_str, "....");
-      } else {
-        if (seconds_to_refresh > 225) ref_dots = 4;
-        else if (seconds_to_refresh > 150) ref_dots = 3;
-        else if (seconds_to_refresh > 75) ref_dots = 2;
-        
-        for (int i = 0; i < 4; i++) {
-          strcat(new_ref_str, (i < ref_dots) ? "■" : "□");
+      if (show_numeric_status) {
+        float v = get_battery_voltage();
+        int bat_pct = get_battery_percentage();
+        snprintf(new_bat_str, sizeof(new_bat_str), "B:%d%%", bat_pct);
+        if (is_updating) {
+          snprintf(new_ref_str, sizeof(new_ref_str), "R:Fetch");
+        } else {
+          snprintf(new_ref_str, sizeof(new_ref_str), "R:%ds", seconds_to_refresh);
         }
-      }
+      } else {
+        int bat = get_battery_percentage();
+        int bat_dots = 1;
+        if (bat >= 75) bat_dots = 4;
+        else if (bat >= 50) bat_dots = 3;
+        else if (bat >= 25) bat_dots = 2;
 
-      strcpy(new_bat_str, "B:");
-      for (int i = 0; i < 4; i++) {
-        strcat(new_bat_str, (i < bat_dots) ? "■" : "□");
+        int ref_dots = 1;
+        strcpy(new_ref_str, "R:");
+        if (is_updating) {
+          strcat(new_ref_str, "....");
+        } else {
+          if (seconds_to_refresh > 225) ref_dots = 4;
+          else if (seconds_to_refresh > 150) ref_dots = 3;
+          else if (seconds_to_refresh > 75) ref_dots = 2;
+          
+          for (int i = 0; i < 4; i++) {
+            strcat(new_ref_str, (i < ref_dots) ? "■" : "□");
+          }
+        }
+
+        strcpy(new_bat_str, "B:");
+        for (int i = 0; i < 4; i++) {
+          strcat(new_bat_str, (i < bat_dots) ? "■" : "□");
+        }
       }
 
       if (strcmp(new_bat_str, last_bat_str) != 0) {
@@ -2096,12 +2184,35 @@ void fetch_news_task(void *pvParameters) {
       }
     }
 
+    // 4b. Daily 3:00 AM NTP Auto-sync
+    {
+      static int last_synced_day = -1;
+      struct tm tinfo;
+      if (getLocalTime(&tinfo)) {
+        if (tinfo.tm_hour == 3 && tinfo.tm_min == 0 && tinfo.tm_mday != last_synced_day && WiFi.status() == WL_CONNECTED) {
+          last_synced_day = tinfo.tm_mday;
+          Serial.println("[NTP] Daily 3:00 AM re-syncing system time with NTP...");
+          configTzTime("CST-8", "pool.ntp.org", "ntp.aliyun.com");
+          sync_rtc_from_system_time();
+        }
+      }
+    }
+
     if (fetch_requested) {
       fetch_requested = false;
       
       // If smart sleep is active (and not within 2 mins of boot), put CPU to Light Sleep to save maximum battery!
       if (is_sleep_time_active() && millis() > 120000) {
-        Serial.println("[Power] Smart Sleep active. Turning off backlight and entering Light Sleep for 1 hour...");
+        Serial.println("[Power] Smart Sleep active. Displaying sleep message and entering Light Sleep for 1 hour...");
+        
+        // Show Sleeping message on LCD before screen backlight turns off
+        if (lvgl_port_lock(100)) {
+          lv_label_set_text(top_headline_lbl, is_asia ? "系統休眠中 💤" : "System Sleeping 💤");
+          lv_label_set_text(top_meta_lbl, is_asia ? "觸控螢幕或聲音喚醒" : "Tap screen or make sound to wake");
+          lv_label_set_text(bottom_headline_lbl, is_asia ? "進入定時省電休眠模式" : "Scheduled Sleep Mode Active");
+          lv_label_set_text(bottom_meta_lbl, is_asia ? "休眠中" : "Sleeping");
+          lvgl_port_unlock();
+        }
         
         // Turn off backlight directly
         setUpduty(0);
@@ -2359,6 +2470,9 @@ void fetch_news_task(void *pvParameters) {
           lv_label_set_text(weather_desc_label, weather_str);
           lvgl_port_unlock();
         }
+        if (weather_fetched) {
+          save_weather_cache();
+        }
 
  // AFTER
         // Fetch Local News search feed using HTTP/HTTPS auto-detection
@@ -2477,6 +2591,7 @@ void load_settings() {
   custom_rss_urls[4] = newsPrefs.getString("rss_url5", "");
   custom_city = newsPrefs.getString("custom_city", "");
   current_theme = newsPrefs.getInt("theme", 0);
+  anim_type = newsPrefs.getInt("anim_type", 0);
   newsPrefs.end();
 
   update_blacklist_array();
@@ -2501,6 +2616,7 @@ void save_settings() {
   newsPrefs.putString("rss_url5", custom_rss_urls[4]);
   newsPrefs.putString("custom_city", custom_city);
   newsPrefs.putInt("theme", current_theme);
+  newsPrefs.putInt("anim_type", anim_type);
   newsPrefs.end();
 
   update_blacklist_array();
@@ -2709,8 +2825,10 @@ function updateDashboard() {
     .then(d => {
       document.getElementById('dash_bat').innerText = d.battery_pct;
       document.getElementById('dash_wifi').innerText = d.wifi_rssi;
-      document.getElementById('dash_cnt').innerText = d.news_count;
-      document.getElementById('dash_status').innerText = d.is_updating ? 'Updating...' : 'Active';
+      if (document.getElementById('dash_weather')) {
+        document.getElementById('dash_weather').innerText = (d.city || '--') + ' | ' + (d.temp || '--') + '°C ' + (d.weather_desc || '');
+      }
+      document.getElementById('dash_status').innerText = d.is_updating ? 'Updating...' : ('Idle (' + (d.seconds_to_refresh || 0) + 's)');
       
       let list = document.getElementById('dash_headlines');
       list.innerHTML = '';
@@ -2726,6 +2844,13 @@ function updateDashboard() {
     })
     .catch(e => console.error(e));
 }
+function triggerRefresh() {
+  fetch('/api/refresh')
+    .then(() => {
+      document.getElementById('dash_status').innerText = 'Refresh Requested...';
+      setTimeout(updateDashboard, 1000);
+    });
+}
 window.onload = function() {
   updateDashboard();
   setInterval(updateDashboard, 5000);
@@ -2738,8 +2863,11 @@ window.onload = function() {
   <div style="display:grid;grid-template-columns:1fr 1fr;gap:15px;margin-bottom:15px;text-align:left;">
     <div><strong>Battery:</strong> <span id="dash_bat">--</span>%</div>
     <div><strong>Wi-Fi Signal:</strong> <span id="dash_wifi">--</span> dBm</div>
-    <div><strong>News Count:</strong> <span id="dash_cnt">--</span> items</div>
+    <div><strong>Location & Weather:</strong> <span id="dash_weather">--</span></div>
     <div><strong>Status:</strong> <span id="dash_status">--</span></div>
+  </div>
+  <div style="display:flex;gap:10px;margin-bottom:15px;">
+    <button type="button" class="btn" onclick="triggerRefresh()" style="width:100%;margin:0;padding:10px;background:linear-gradient(135deg,#00b894,#00cec9);">⚡ Refresh News Now</button>
   </div>
   <div style="text-align:left;">
     <strong>Latest Headlines:</strong>
@@ -2833,17 +2961,17 @@ window.onload = function() {
     </div>
 
     <div class="form-group">
-      <label>Day Brightness</label>
+      <label>Day Brightness (Applies instantly)</label>
       <div class="slider-val">
-        <input type="range" name="day_bright" min="10" max="255" value="{{DAY_BRIGHT}}" oninput="this.nextElementSibling.innerText = this.value">
+        <input type="range" name="day_bright" min="0" max="255" value="{{DAY_BRIGHT}}" oninput="this.nextElementSibling.innerText = this.value" onchange="fetch('/api/set_brightness?val=' + this.value)">
         <span style="width: 30px; text-align: right;">{{DAY_BRIGHT}}</span>
       </div>
     </div>
 
     <div class="form-group">
-      <label>Night Brightness</label>
+      <label>Night Brightness (Applies instantly)</label>
       <div class="slider-val">
-        <input type="range" name="night_bright" min="10" max="255" value="{{NIGHT_BRIGHT}}" oninput="this.nextElementSibling.innerText = this.value">
+        <input type="range" name="night_bright" min="0" max="255" value="{{NIGHT_BRIGHT}}" oninput="this.nextElementSibling.innerText = this.value" onchange="fetch('/api/set_brightness?val=' + this.value)">
         <span style="width: 30px; text-align: right;">{{NIGHT_BRIGHT}}</span>
       </div>
     </div>
@@ -2884,9 +3012,13 @@ void handle_api_status() {
   json += "\"wifi_rssi\":" + String(rssi) + ",";
   json += "\"news_count\":" + String(news_count) + ",";
   json += "\"is_updating\":" + String(is_updating ? "true" : "false") + ",";
+  json += "\"seconds_to_refresh\":" + String(seconds_to_refresh) + ",";
+  json += "\"city\":\"" + local_city + "\",";
+  json += "\"temp\":" + String(local_temp, 1) + ",";
+  json += "\"weather_desc\":\"" + local_weather_desc + "\",";
   
-json += "\"headlines\":[";
-int api_limit = (news_count > 20) ? 20 : news_count;
+  json += "\"headlines\":[";
+  int api_limit = (news_count > 20) ? 20 : news_count;
   for (int i = 0; i < api_limit; i++) {
     String headline = String(news_list[i].headline);
     headline.replace("\\", "\\\\");
@@ -2894,12 +3026,35 @@ int api_limit = (news_count > 20) ? 20 : news_count;
     headline.replace("\n", "\\n");
     headline.replace("\r", "\\r");
     json += "\"" + headline + "\"";
-    if (i < news_count - 1) json += ",";
+    if (i < api_limit - 1) json += ",";
   }
   json += "]";
   json += "}";
   
   server.send(200, "application/json; charset=utf-8", json);
+}
+
+void handle_api_refresh() {
+  fetch_requested = true;
+  seconds_to_refresh = 0;
+  server.send(200, "text/plain", "OK");
+}
+
+void handle_api_set_brightness() {
+  if (server.hasArg("val")) {
+    int val = server.arg("val").toInt();
+    if (val >= 0 && val <= 255) {
+      day_bright = val;
+      night_bright = val;
+      last_applied_brightness = val;
+      setUpduty(val);
+      save_settings();
+      Serial.printf("[Web] Instant brightness updated to %d\n", val);
+      server.send(200, "text/plain", "OK");
+      return;
+    }
+  }
+  server.send(400, "text/plain", "Bad Request");
 }
 
 void handle_api_set_theme() {
