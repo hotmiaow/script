@@ -1,0 +1,11 @@
+id,name,category,email,department
+1,Alice Johnson,Engineering,alice@example.com,Software Development
+2,Bob Smith,Marketing,bob@example.com,Digital Strategy
+3,Charlie Brown,Finance,charlie@example.com,Accounting
+4,David Miller,Engineering,david@example.com,Infrastructure
+5,Eva Green,Human Resources,eva@example.com,Talent Acquisition
+6,Frank White,Sales,frank@example.com,Regional Sales
+7,Grace Hopper,Engineering,grace@example.com,Core Systems
+8,Hank Schrader,Security,hank@example.com,Compliance
+9,Ivy Chen,Design,ivy@example.com,Product Design
+10,Jack Sparrow,Logistics,jack@example.com,Fleet Operations
