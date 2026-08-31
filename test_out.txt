@@ -1,0 +1,4 @@
+⚠ DNS config file 'dns_config.json' not found.
+  Using in-memory defaults.
+Domains (subnets=False): ['10.1.1.1', '10.1.1.2', 'hkf1.aaa.com', 'hkf2.aaa.com']
+Domains (subnets=True): ['10.1.1.1', '10.1.1.2', 'hkf1.aaa.com', 'hkf2.aaa.com']

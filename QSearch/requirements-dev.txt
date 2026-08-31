@@ -1,0 +1,28 @@
+# =================================================================
+# QSearch - Development, Performance & Packaging Requirements
+# =================================================================
+
+# Base Runtime Requirements
+-r requirements.txt
+
+# --- Core Development, Linting & Type Checking ---
+mypy>=1.10.0                 # Static type checking
+ruff>=0.4.0                  # Fast linter and formatter
+pytest>=8.0.0                # Automated unit and integration testing
+pytest-cov>=5.0.0            # Test coverage reporting
+
+# --- Standalone Binary Packaging ---
+pyinstaller>=6.5.0           # Build standalone single-file executables (.exe, .app, ELF)
+
+# --- Optional Performance Enhancements (Future Improvements) ---
+rapidfuzz>=3.8.0             # C-accelerated Levenshtein & fuzzy string matching (10-100x faster than difflib)
+watchdog>=4.0.0              # Native OS filesystem event watching (inotify / FSEvents / ReadDirectoryChangesW)
+orjson>=3.10.0               # High-speed JSON serialization for column headers & metadata
+
+# --- Optional Extended Format Support (Future Improvements) ---
+openpyxl>=3.1.2              # Index and search Excel spreadsheet (.xlsx) records
+pypdf>=4.2.0                 # Index and search text from PDF files
+
+# --- Optional Modern Terminal UI / CLI Enhancements ---
+rich>=13.7.0                 # Rich terminal tables, syntax highlighting, and progress bars
+prompt-toolkit>=3.0.43       # Advanced interactive CLI with autosuggestions and history

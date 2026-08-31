@@ -1,1 +1,4 @@
-esp32/Google_News_Ticker/secrets.h
+.gi_bak/
+.DS_Store
+*.pyc
+__pycache__/

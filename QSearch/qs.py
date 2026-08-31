@@ -17,11 +17,14 @@ Features:
 - Direct CLI output in terminal, JSON, or CSV
 """
 
+from __future__ import annotations
+
 import os
 import sys
 import csv
 import json
 import time
+import datetime
 import queue
 import sqlite3
 import threading
@@ -30,6 +33,23 @@ import difflib
 import re
 import argparse
 from pathlib import Path
+from typing import List, Tuple, Optional, Dict, Any, Union, Set
+
+
+
+# Windows ANSI terminal & UTF-8 output setup
+if sys.platform == "win32":
+    try:
+        os.system("")  # Enables Virtual Terminal / ANSI colors in Windows cmd & PowerShell
+    except Exception:
+        pass
+    try:
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(encoding="utf-8")
+        if hasattr(sys.stderr, "reconfigure"):
+            sys.stderr.reconfigure(encoding="utf-8")
+    except Exception:
+        pass
 
 # Increase CSV field size limit to max
 try:
@@ -66,6 +86,36 @@ DEFAULT_CONTENT_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # ================= Helper & String Functions =================
+
+def format_timestamp(ts: Optional[float], format_str: str = "%Y-%m-%d %H:%M:%S") -> str:
+    """Formats epoch float timestamp into local readable string."""
+    if not ts or ts <= 0:
+        return "Never"
+    try:
+        dt = datetime.datetime.fromtimestamp(ts)
+        return dt.strftime(format_str)
+    except Exception:
+        return "Unknown"
+
+
+def format_relative_time(ts: Optional[float]) -> str:
+    """Formats epoch float timestamp into relative 'X mins ago' human-readable string."""
+    if not ts or ts <= 0:
+        return "Never"
+    try:
+        diff = max(0, time.time() - ts)
+        if diff < 2:
+            return "just now"
+        if diff < 60:
+            return f"{int(diff)}s ago"
+        if diff < 3600:
+            return f"{int(diff // 60)}m ago"
+        if diff < 86400:
+            return f"{int(diff // 3600)}h ago"
+        return f"{int(diff // 86400)}d ago"
+    except Exception:
+        return "Unknown"
+
 
 def _fuzzy_score(query, text):
     """Calculates fuzzy similarity ratio (0-100) between query and text line."""
@@ -221,6 +271,47 @@ def open_containing_folder(filename, content_dir=DEFAULT_CONTENT_DIR):
         return False
 
 
+def balance_results_by_file(results: List[Tuple[Any, ...]], limit: int = 1000, unique_files: bool = False) -> List[Tuple[Any, ...]]:
+    """
+    Interleaves search result rows across different files so that all matching files
+    are represented in top search results instead of a single file monopolizing all result slots.
+    If unique_files is True, only the first/highest-scoring match for each unique file is included.
+    """
+    if not results:
+        return []
+
+    score_groups: Dict[int, List[Tuple[Any, ...]]] = {}
+    for r in results:
+        score = r[3] if len(r) > 3 else 100
+        score_groups.setdefault(score, []).append(r)
+
+    final_results = []
+    seen = set()
+    seen_files = set()
+
+    for score in sorted(score_groups.keys(), reverse=True):
+        group = score_groups[score]
+        file_groups: Dict[str, List[Tuple[Any, ...]]] = {}
+        for r in group:
+            file_groups.setdefault(str(r[0]), []).append(r)
+
+        max_rows = max(len(g) for g in file_groups.values())
+        for i in range(max_rows):
+            for fname, f_rows in file_groups.items():
+                if unique_files and fname in seen_files:
+                    continue
+                if i < len(f_rows):
+                    row_key = (f_rows[i][0], f_rows[i][1])
+                    if row_key not in seen:
+                        seen.add(row_key)
+                        seen_files.add(fname)
+                        final_results.append(f_rows[i])
+                        if len(final_results) >= limit:
+                            return final_results
+
+    return final_results[:limit]
+
+
 # ================= Database & Search Engine =================
 
 class SearchEngine:
@@ -281,13 +372,25 @@ class SearchEngine:
                 mtime REAL,
                 size INTEGER,
                 row_count INTEGER,
-                headers TEXT
+                headers TEXT,
+                indexed_at REAL
             );
         """)
         try:
             cur.execute("ALTER TABLE file_meta ADD COLUMN headers TEXT;")
         except sqlite3.OperationalError:
             pass
+        try:
+            cur.execute("ALTER TABLE file_meta ADD COLUMN indexed_at REAL;")
+        except sqlite3.OperationalError:
+            pass
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS db_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            );
+        """)
 
         # Check existing fts_idx definition
         try:
@@ -295,7 +398,7 @@ class SearchEngine:
             row = cur.fetchone()
             if row:
                 sql_def = row[0].lower()
-                if "trigram" not in sql_def or "file_name unindexed" not in sql_def:
+                if "trigram" not in sql_def or "file_name unindexed" in sql_def:
                     cur.execute("DROP TABLE fts_idx;")
                     cur.execute("DELETE FROM file_meta;")
         except Exception:
@@ -305,7 +408,7 @@ class SearchEngine:
         try:
             cur.execute("""
                 CREATE VIRTUAL TABLE IF NOT EXISTS fts_idx USING fts5(
-                    file_name UNINDEXED,
+                    file_name,
                     row_num UNINDEXED,
                     line_text,
                     tokenize='trigram'
@@ -349,7 +452,61 @@ class SearchEngine:
                 pass
         return []
 
-    def _parse_boolean_query_sql(self, query_str: str) -> Tuple[Optional[str], Optional[str], List[str]]:
+    def set_db_meta(self, key: str, value: str):
+        """Sets a key-value pair in db_meta."""
+        try:
+            conn = self.get_connection()
+            cur = conn.cursor()
+            cur.execute("INSERT OR REPLACE INTO db_meta (key, value) VALUES (?, ?);", (key, str(value)))
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
+
+    def get_db_meta(self, key: str, default=None):
+        """Gets a value by key from db_meta."""
+        try:
+            conn = self.get_connection()
+            cur = conn.cursor()
+            cur.execute("SELECT value FROM db_meta WHERE key = ? LIMIT 1;", (key,))
+            row = cur.fetchone()
+            conn.close()
+            return row[0] if row else default
+        except Exception:
+            return default
+
+    def get_file_info(self, file_name: str) -> Optional[Dict[str, Any]]:
+        """Retrieves detailed file metadata (mtime, size, row_count, headers, indexed_at) from file_meta."""
+        try:
+            conn = self.get_connection()
+            cur = conn.cursor()
+            base = os.path.basename(file_name)
+            cur.execute(
+                "SELECT mtime, size, row_count, headers, indexed_at, file_path FROM file_meta WHERE file_path = ? OR file_path LIKE ? LIMIT 1;",
+                (file_name, f"%{base}")
+            )
+            row = cur.fetchone()
+            conn.close()
+            if row:
+                headers = []
+                if row[3]:
+                    try:
+                        headers = json.loads(row[3])
+                    except Exception:
+                        headers = []
+                return {
+                    "mtime": row[0],
+                    "size": row[1],
+                    "row_count": row[2],
+                    "headers": headers,
+                    "indexed_at": row[4],
+                    "file_path": row[5]
+                }
+        except Exception:
+            pass
+        return None
+
+    def _parse_boolean_query_sql(self, query_str: str) -> Tuple[Optional[str], Tuple[Optional[str], List[Any]], List[str]]:
         """
         Parses query containing 'AND', 'OR', 'NOT', '|', '&' into:
         - FTS5 MATCH expression
@@ -358,7 +515,7 @@ class SearchEngine:
         """
         keywords = extract_search_keywords(query_str)
         if not keywords:
-            return None, None, []
+            return None, (None, []), []
 
         # Split into OR branches
         or_parts = re.split(r'\s+(?:OR|or|\|)\s+', query_str)
@@ -379,24 +536,26 @@ class SearchEngine:
             if fts_tokens_branch:
                 fts_or_clauses.append("(" + " AND ".join(fts_tokens_branch) + ")")
 
-            # LIKE clause for this branch
-            branch_likes = ["line_text LIKE ?" for _ in valid_and]
+            # LIKE clause for this branch (matching line_text OR file_name)
+            branch_likes = ["(line_text LIKE ? OR file_name LIKE ?)" for _ in valid_and]
             like_or_clauses.append("(" + " AND ".join(branch_likes) + ")")
-            like_params.extend([f"%{t}%" for t in valid_and])
+            for t in valid_and:
+                like_params.extend([f"%{t}%", f"%{t}%"])
 
         fts_query = " OR ".join(fts_or_clauses) if fts_or_clauses else None
         like_sql = "(" + " OR ".join(like_or_clauses) + ")" if like_or_clauses else None
 
         return fts_query, (like_sql, like_params), keywords
 
-    def search(self, query_str, limit=300, file_type="csv", is_regex=False):
+    def search(self, query_str, limit=1000, file_type="all", is_regex=False, unique_files=False):
         """
-        Performs multi-stage search:
+        Performs multi-stage search across all files:
         - Boolean AND / OR / NOT search (e.g. 'server OR user', 'sw01 AND 10.1')
         - Regular expression pattern matching
         - File-specific filtering (e.g. 'file:switch')
-        - Multi-token LIKE fallback
+        - Multi-token LIKE fallback (checking both content and file path)
         - Bounded Fuzzy search fallback
+        - Unique files deduplication when unique_files=True
         """
         raw_query = query_str.strip()
         if not raw_query:
@@ -443,9 +602,9 @@ class SearchEngine:
                     cur.execute(f"""
                         SELECT file_name, row_num, line_text
                         FROM {table_name}
-                        WHERE regexp(?, line_text){base_filter_sql}
+                        WHERE (regexp(?, line_text) OR regexp(?, file_name)){base_filter_sql}
                         LIMIT ?;
-                    """, (effective_query, limit))
+                    """, (effective_query, effective_query, limit * 2))
                     raw_rows = cur.fetchall()
                     results = [(r[0], r[1], r[2], 100) for r in raw_rows]
                 except sqlite3.OperationalError as e:
@@ -465,7 +624,7 @@ class SearchEngine:
                             FROM fts_idx
                             WHERE fts_idx MATCH ?{base_filter_sql}
                             LIMIT ?;
-                        """, (fts_expr, limit))
+                        """, (fts_expr, limit * 2))
                         raw = cur.fetchall()
                         # Validate short tokens (<3 chars)
                         short_keywords = [k.lower() for k in keywords if len(k) < 3]
@@ -473,20 +632,28 @@ class SearchEngine:
                             filtered = []
                             for r in raw:
                                 l_low = r[2].lower()
-                                if all(st in l_low for st in short_keywords):
+                                f_low = r[0].lower()
+                                if all(st in l_low or st in f_low for st in short_keywords):
                                     filtered.append((r[0], r[1], r[2], 100))
-                            results = filtered[:limit]
+                            results = filtered
                         else:
                             results = [(r[0], r[1], r[2], 100) for r in raw]
                     except sqlite3.Error:
                         results = []
 
-                # Stage 2: Fast Multi-LIKE Fallback
-                if not results and like_sql:
-                    sql_stmt = f"SELECT file_name, row_num, line_text FROM {table_name} WHERE {like_sql}{base_filter_sql} LIMIT ?;"
-                    cur.execute(sql_stmt, (*like_params, limit))
-                    raw = cur.fetchall()
-                    results = [(r[0], r[1], r[2], 100) for r in raw]
+                # Stage 2: Fast Multi-LIKE Fallback / Supplemental Search
+                if (not results or len(results) < limit) and like_sql:
+                    try:
+                        sql_stmt = f"SELECT file_name, row_num, line_text FROM {table_name} WHERE {like_sql}{base_filter_sql} LIMIT ?;"
+                        cur.execute(sql_stmt, (*like_params, limit * 2))
+                        raw_like = cur.fetchall()
+                        existing_keys = {(r[0], r[1]) for r in results}
+                        for r in raw_like:
+                            if (r[0], r[1]) not in existing_keys:
+                                results.append((r[0], r[1], r[2], 100))
+                                existing_keys.add((r[0], r[1]))
+                    except sqlite3.Error:
+                        pass
 
                 # Stage 3: Bounded Fuzzy Search Fallback (only for single word queries >= 4 chars without boolean operators)
                 has_boolean_ops = any(op in effective_query.upper() for op in ("OR", "AND", "NOT", "|", "&"))
@@ -494,14 +661,14 @@ class SearchEngine:
                     match_type = "fuzzy"
                     cur.execute(f"""
                         SELECT file_name, row_num, line_text, score FROM (
-                            SELECT file_name, row_num, line_text, fuzzy_score(?, line_text) as score
+                            SELECT file_name, row_num, line_text, max(fuzzy_score(?, line_text), fuzzy_score(?, file_name)) as score
                             FROM {table_name}
-                            LIMIT 3000
+                            LIMIT 5000
                         )
                         WHERE score >= 60{base_filter_sql}
                         ORDER BY score DESC
                         LIMIT ?;
-                    """, (keywords[0], limit))
+                    """, (keywords[0], keywords[0], limit * 2))
                     fuzzy_raw = cur.fetchall()
                     results = [(r[0], r[1], r[2], int(r[3])) for r in fuzzy_raw]
 
@@ -512,7 +679,7 @@ class SearchEngine:
                     FROM {table_name}
                     WHERE 1=1{base_filter_sql}
                     LIMIT ?;
-                """, (limit,))
+                """, (limit * 2,))
                 raw = cur.fetchall()
                 results = [(r[0], r[1], r[2], 100) for r in raw]
 
@@ -522,17 +689,30 @@ class SearchEngine:
         finally:
             conn.close()
 
+        balanced_results = balance_results_by_file(results, limit=limit, unique_files=unique_files)
+
         elapsed_ms = (time.perf_counter() - start_time) * 1000.0
-        return results, elapsed_ms, match_type
+        return balanced_results, elapsed_ms, match_type
 
     def get_stats(self):
-        """Returns total files and total rows indexed."""
-        conn = self.get_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT COUNT(*), COALESCE(SUM(row_count), 0) FROM file_meta;")
-        file_cnt, row_cnt = cur.fetchone()
-        conn.close()
-        return file_cnt, row_cnt
+        """Returns total files, total rows, last db update timestamp, and last scan timestamp."""
+        try:
+            conn = self.get_connection()
+            cur = conn.cursor()
+            cur.execute("SELECT COUNT(*), COALESCE(SUM(row_count), 0), MAX(indexed_at), MAX(mtime) FROM file_meta;")
+            row = cur.fetchone()
+            file_cnt = row[0] if row else 0
+            row_cnt = row[1] if row else 0
+            last_db_update = row[2] if (row and row[2]) else (row[3] if (row and row[3]) else None)
+
+            cur.execute("SELECT value FROM db_meta WHERE key = 'last_scan_time' LIMIT 1;")
+            s_row = cur.fetchone()
+            last_scan_ts = float(s_row[0]) if s_row and s_row[0] else None
+
+            conn.close()
+            return file_cnt, row_cnt, last_db_update, last_scan_ts
+        except Exception:
+            return 0, 0, None, None
 
 
 # ================= Background Indexer Service =================
@@ -552,8 +732,12 @@ EXCLUDED_FILENAMES = {
 EXCLUDED_SUFFIXES = (
     ".min.js", ".min.css", ".map", ".bundle.js"
 )
+EXCLUDED_DIRS = {
+    ".git", ".idea", ".vscode", "__pycache__", "node_modules", "dist", "build",
+    ".gemini", ".venv", "venv", "env", ".next", ".cache", ".pytest_cache"
+}
 
-MAX_LINE_LENGTH = 1200
+MAX_LINE_LENGTH = 10000
 
 
 def is_text_file(filepath):
@@ -572,8 +756,14 @@ def is_text_file(filepath):
             return True
         with open(path, "rb") as f:
             chunk = f.read(2048)
+            if chunk.startswith((b'\xff\xfe', b'\xfe\xff')):
+                return True
             if b"\x00" in chunk:
-                return False
+                try:
+                    chunk.decode("utf-16")
+                    return True
+                except Exception:
+                    return False
             try:
                 chunk.decode("utf-8")
                 return True
@@ -601,6 +791,8 @@ class BackgroundIndexer(threading.Thread):
         self.total_files = 0
         self.files_left = 0
         self.percent = 100
+        self.last_scan_time = None
+        self.last_db_update_time = None
 
     def update_content_dir(self, new_dir):
         """Changes watched content folder."""
@@ -618,7 +810,7 @@ class BackgroundIndexer(threading.Thread):
             time.sleep(sleep_time)
 
     def sync_content_directory(self):
-        """Checks for new, updated, or removed text files."""
+        """Checks for new, updated, or removed text files with directory pruning."""
         conn = self.engine.get_connection()
         cur = conn.cursor()
 
@@ -627,13 +819,19 @@ class BackgroundIndexer(threading.Thread):
 
         disk_files = {}
         if self.content_dir.exists():
-            for entry in self.content_dir.rglob("*"):
-                if entry.is_file() and is_text_file(entry):
-                    try:
-                        stat = entry.stat()
-                        disk_files[str(entry)] = (round(stat.st_mtime, 3), stat.st_size)
-                    except OSError:
+            for root, dirs, files in os.walk(str(self.content_dir)):
+                # Prune hidden and build/cache folders early
+                dirs[:] = [d for d in dirs if d not in EXCLUDED_DIRS and not d.startswith(".")]
+                for fname in files:
+                    if fname.startswith(".") or fname in EXCLUDED_FILENAMES:
                         continue
+                    full_path = Path(root) / fname
+                    if is_text_file(full_path):
+                        try:
+                            stat = full_path.stat()
+                            disk_files[str(full_path)] = (round(stat.st_mtime, 3), stat.st_size)
+                        except OSError:
+                            continue
 
         removed_files = set(db_files.keys()) - set(disk_files.keys())
         for rfile in removed_files:
@@ -651,8 +849,13 @@ class BackgroundIndexer(threading.Thread):
         ]
 
         has_changes = bool(changed_files or removed_files)
+        now_ts = time.time()
+        self.last_scan_time = now_ts
+        self.engine.set_db_meta("last_scan_time", str(now_ts))
 
         if has_changes:
+            self.last_db_update_time = now_ts
+            self.engine.set_db_meta("last_db_update_time", str(now_ts))
             total_changed = len(changed_files)
             self.total_files = total_changed
             self.files_left = total_changed
@@ -664,12 +867,14 @@ class BackgroundIndexer(threading.Thread):
                 self.files_left = total_changed - idx
                 self.percent = int((idx / total_changed) * 100)
 
-                if self.status_callback:
-                    file_cnt, row_cnt = self.engine.get_stats()
+                if self.status_callback and (idx % 10 == 0 or idx == total_changed):
                     try:
-                        self.status_callback(file_cnt, row_cnt, self.total_files, self.files_left, self.percent, self.is_indexing)
-                    except TypeError:
-                        self.status_callback(file_cnt, row_cnt)
+                        self.status_callback(
+                            len(disk_files), 0, self.total_files, self.files_left, self.percent, self.is_indexing,
+                            self.last_scan_time, self.last_db_update_time
+                        )
+                    except Exception:
+                        pass
 
             if self.engine.use_fts:
                 try:
@@ -683,19 +888,32 @@ class BackgroundIndexer(threading.Thread):
             self.files_left = 0
             self.percent = 100
 
+            file_cnt, row_cnt, l_update, l_scan = self.engine.get_stats()
             if self.status_callback:
-                file_cnt, row_cnt = self.engine.get_stats()
                 try:
-                    self.status_callback(file_cnt, row_cnt, 0, 0, 100, False)
-                except TypeError:
-                    self.status_callback(file_cnt, row_cnt)
+                    self.status_callback(
+                        file_cnt, row_cnt, self.total_files, 0, 100, False,
+                        self.last_scan_time, self.last_db_update_time or l_update
+                    )
+                except Exception:
+                    pass
+        else:
+            if self.status_callback:
+                file_cnt, row_cnt, l_update, l_scan = self.engine.get_stats()
+                try:
+                    self.status_callback(
+                        file_cnt, row_cnt, 0, 0, 100, False,
+                        self.last_scan_time, l_update
+                    )
+                except Exception:
+                    pass
 
         conn.close()
         return has_changes
 
     def index_single_file(self, conn, filepath):
         """Reads and indexes a single text file cleanly into SQLite."""
-        rel_name = os.path.relpath(filepath, self.content_dir) if str(filepath).startswith(str(self.content_dir)) else os.path.basename(filepath)
+        rel_name = os.path.relpath(filepath, self.content_dir) if str(filepath).startswith(str(filepath)) and str(filepath).startswith(str(self.content_dir)) else os.path.basename(filepath)
         stat = os.stat(filepath)
         ext = os.path.splitext(filepath)[1].lower()
 
@@ -704,10 +922,13 @@ class BackgroundIndexer(threading.Thread):
         total_rows = 0
         headers_json = None
 
-        try:
-            encoding_to_try = "utf-8-sig" if ext == ".csv" else "utf-8"
+        encodings_to_try = ["utf-8-sig", "utf-8", "utf-16", "latin-1"]
+        for enc in encodings_to_try:
+            parsed_batch.clear()
+            total_rows = 0
+            headers_json = None
             try:
-                with open(filepath, "r", encoding=encoding_to_try, errors="replace") as f:
+                with open(filepath, "r", encoding=enc, errors="replace") as f:
                     if ext == ".csv":
                         reader = csv.reader(f)
                         for line_idx, row in enumerate(reader, start=1):
@@ -727,31 +948,10 @@ class BackgroundIndexer(threading.Thread):
                                     line_str = line_str[:MAX_LINE_LENGTH]
                                 parsed_batch.append((rel_name, line_idx, line_str))
                                 total_rows += 1
+                if parsed_batch or total_rows == 0:
+                    break
             except Exception:
-                parsed_batch.clear()
-                total_rows = 0
-                headers_json = None
-                with open(filepath, "r", encoding="latin-1", errors="replace") as f:
-                    if ext == ".csv":
-                        reader = csv.reader(f)
-                        for line_idx, row in enumerate(reader, start=1):
-                            if line_idx == 1:
-                                headers_json = json.dumps(row)
-                            line_str = " | ".join(row).strip()
-                            if line_str:
-                                if len(line_str) > MAX_LINE_LENGTH:
-                                    line_str = line_str[:MAX_LINE_LENGTH]
-                                parsed_batch.append((rel_name, line_idx, line_str))
-                                total_rows += 1
-                    else:
-                        for line_idx, line in enumerate(f, start=1):
-                            line_str = line.strip()
-                            if line_str:
-                                if len(line_str) > MAX_LINE_LENGTH:
-                                    line_str = line_str[:MAX_LINE_LENGTH]
-                                parsed_batch.append((rel_name, line_idx, line_str))
-                                total_rows += 1
-        except Exception as e:
+                continue
             print(f"[Indexer Error] Failed to read {filepath}: {e}", file=sys.stderr)
             return
 
@@ -771,8 +971,8 @@ class BackgroundIndexer(threading.Thread):
                     cur.executemany("INSERT INTO std_idx (file_name, row_num, line_text) VALUES (?, ?, ?);", chunk)
 
             cur.execute(
-                "INSERT OR REPLACE INTO file_meta (file_path, mtime, size, row_count, headers) VALUES (?, ?, ?, ?, ?);",
-                (filepath, round(stat.st_mtime, 3), stat.st_size, total_rows, headers_json)
+                "INSERT OR REPLACE INTO file_meta (file_path, mtime, size, row_count, headers, indexed_at) VALUES (?, ?, ?, ?, ?, ?);",
+                (filepath, round(stat.st_mtime, 3), stat.st_size, total_rows, headers_json, time.time())
             )
             conn.commit()
         except Exception as e:
@@ -780,17 +980,75 @@ class BackgroundIndexer(threading.Thread):
             print(f"[Indexer DB Error] Failed to update DB for {filepath}: {e}", file=sys.stderr)
 
 
+
+
+
 # ================= GUI Mode (Tkinter) =================
 
 if HAS_TKINTER:
+    class ToolTip:
+        """Provides lightweight hover tooltip hints on Tkinter widgets."""
+
+        def __init__(self, widget, text, delay=350):
+            self.widget = widget
+            self.text = text
+            self.delay = delay
+            self.tip_window = None
+            self.id = None
+            self.widget.bind("<Enter>", self.schedule_tip)
+            self.widget.bind("<Leave>", self.hide_tip)
+            self.widget.bind("<ButtonPress>", self.hide_tip)
+
+        def schedule_tip(self, event=None):
+            self.unschedule()
+            self.id = self.widget.after(self.delay, self.show_tip)
+
+        def unschedule(self):
+            if self.id:
+                self.widget.after_cancel(self.id)
+                self.id = None
+
+        def show_tip(self, event=None):
+            if self.tip_window or not self.text:
+                return
+            x = self.widget.winfo_rootx() + 15
+            y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
+            self.tip_window = tw = tk.Toplevel(self.widget)
+            tw.wm_overrideredirect(True)
+            tw.wm_geometry(f"+{x}+{y}")
+            try:
+                tw.wm_attributes("-topmost", True)
+            except Exception:
+                pass
+            label = tk.Label(
+                tw,
+                text=self.text,
+                justify="left",
+                background="#1E293B",
+                foreground="#F8FAFC",
+                relief="flat",
+                font=("Helvetica", 9),
+                padx=8,
+                pady=4,
+                borderwidth=0
+            )
+            label.pack()
+
+        def hide_tip(self, event=None):
+            self.unschedule()
+            if self.tip_window:
+                self.tip_window.destroy()
+                self.tip_window = None
+
+
     class QSearchGUIApp:
-        """Tkinter Application for Instant Search."""
+        """Tkinter Application for Instant Search with Rich UI Hints and Guides."""
 
         def __init__(self, root, initial_dir=DEFAULT_CONTENT_DIR):
             self.root = root
             self.root.title("QSearch - Instant CSV & Text Search Engine")
-            self.root.geometry("980x660")
-            self.minsize(720, 460)
+            self.root.geometry("1020x690")
+            self.root.minsize(760, 480)
 
             self.content_dir = Path(initial_dir).resolve()
             self.engine = SearchEngine(content_dir=self.content_dir)
@@ -805,8 +1063,8 @@ if HAS_TKINTER:
             self._active_match_type = "exact"
 
             self._setup_ui()
-            self._setup_indexer()
             self._poll_queue()
+            self.root.after(50, self._setup_indexer)
 
         def _setup_ui(self):
             style = ttk.Style()
@@ -825,21 +1083,29 @@ if HAS_TKINTER:
             folder_frame.pack(fill="x", pady=(0, 6))
 
             ttk.Label(folder_frame, text="📁 Directory:", font=("Helvetica", 9, "bold")).pack(side="left")
-            self.lbl_folder_path = ttk.Label(folder_frame, text=str(self.content_dir), font=("Helvetica", 9), foreground="#333")
-            self.lbl_folder_path.pack(side="left", padx=(5, 10))
+            self.lbl_folder_path = ttk.Label(folder_frame, text=str(self.content_dir), font=("Helvetica", 9), foreground="#1E293B")
+            self.lbl_folder_path.pack(side="left", padx=(5, 8))
+            ToolTip(self.lbl_folder_path, f"Currently watched root directory:\n{self.content_dir}")
 
             btn_browse_dir = ttk.Button(folder_frame, text="Browse Folder...", command=self._on_browse_directory)
             btn_browse_dir.pack(side="left")
+            ToolTip(btn_browse_dir, "Choose a custom directory on your disk to index and search")
 
             btn_open_folder = ttk.Button(folder_frame, text="Open Folder ↗", command=lambda: open_containing_folder(str(self.content_dir)))
             btn_open_folder.pack(side="left", padx=(4, 0))
+            ToolTip(btn_open_folder, "Open this directory in macOS Finder / File Explorer")
+
+            btn_help = ttk.Button(folder_frame, text="❓ Help & Shortcuts (F1)", command=self._show_help_dialog)
+            btn_help.pack(side="right", padx=(4, 0))
+            ToolTip(btn_help, "Open complete search syntax cheat sheet and keyboard shortcuts guide [F1]")
 
             btn_save = ttk.Button(folder_frame, text="Save Results (.csv) 💾", command=self._save_results_to_csv)
             btn_save.pack(side="right")
+            ToolTip(btn_save, "Export all current search results to a .CSV spreadsheet")
 
             # Search row
             search_row = ttk.Frame(top_bar)
-            search_row.pack(fill="x")
+            search_row.pack(fill="x", pady=(0, 4))
 
             lbl_search = ttk.Label(search_row, text="🔍 Search:", font=("Helvetica", 11, "bold"))
             lbl_search.pack(side="left", padx=(0, 6))
@@ -850,26 +1116,83 @@ if HAS_TKINTER:
             self.search_entry.focus_set()
             self.search_entry.bind("<KeyRelease>", self._on_key_release)
             self.search_entry.bind("<Down>", self._on_search_down_arrow)
+            ToolTip(self.search_entry, "Type keywords to search. Supports 'AND', 'OR', exact \"quotes\", 'file:name' filters, or Regex. Press Ctrl+F / Cmd+F to focus.")
 
             # Regex toggle
             self.regex_var = tk.BooleanVar(value=False)
             regex_cb = ttk.Checkbutton(search_row, text="Regex Mode", variable=self.regex_var, command=self._perform_search)
-            regex_cb.pack(side="left", padx=(0, 8))
+            regex_cb.pack(side="left", padx=(0, 6))
+            ToolTip(regex_cb, "Enable regular expression pattern matching (e.g. ^10\\.\\d+\\.\\d+ or (error|fail))")
+
+            # Unique file toggle
+            self.unique_var = tk.BooleanVar(value=False)
+            unique_cb = ttk.Checkbutton(search_row, text="1 Match/File", variable=self.unique_var, command=self._perform_search)
+            unique_cb.pack(side="left", padx=(0, 8))
+            ToolTip(unique_cb, "Show each unique file only once in search results, even if multiple lines match in that file [Ctrl+U]")
 
             # Filter mode
-            self.filter_var = tk.StringVar(value="CSV Files Only")
+            self.filter_var = tk.StringVar(value="All Indexed Files")
             self.filter_cb = ttk.Combobox(
                 search_row,
                 textvariable=self.filter_var,
-                values=["CSV Files Only", "Text Files Only", "All Indexed Files"],
+                values=["All Indexed Files", "CSV Files Only", "Text Files Only"],
                 state="readonly",
                 width=15
             )
             self.filter_cb.pack(side="left", padx=(0, 6))
             self.filter_cb.bind("<<ComboboxSelected>>", lambda e: self._perform_search())
+            ToolTip(self.filter_cb, "Filter search results by file type (CSV tables, non-CSV text/logs, or all files)")
 
             btn_clear = ttk.Button(search_row, text="Clear", command=self._clear_search)
             btn_clear.pack(side="left")
+            ToolTip(btn_clear, "Clear current search query and reset view [Esc]")
+
+            # Quick Syntax & Hints Toolbar
+            hints_bar = ttk.Frame(top_bar)
+            hints_bar.pack(fill="x", pady=(2, 0))
+
+            ttk.Label(hints_bar, text="💡 Quick Syntax:", font=("Helvetica", 8, "bold"), foreground="#475569").pack(side="left", padx=(0, 4))
+
+            def insert_syntax_sample(template):
+                cur = self.search_var.get().strip()
+                new_val = f"{cur} {template}".strip() if cur else template
+                self.search_var.set(new_val)
+                self.search_entry.focus_set()
+                self.search_entry.icursor(tk.END)
+                self._perform_search()
+
+            # Syntax chip buttons
+            btn_chip_and = ttk.Button(hints_bar, text="AND", width=5, command=lambda: insert_syntax_sample("AND "))
+            btn_chip_and.pack(side="left", padx=2)
+            ToolTip(btn_chip_and, "Click to append AND operator: requires both keywords (e.g. 'server AND prod')")
+
+            btn_chip_or = ttk.Button(hints_bar, text="OR", width=4, command=lambda: insert_syntax_sample("OR "))
+            btn_chip_or.pack(side="left", padx=2)
+            ToolTip(btn_chip_or, "Click to append OR operator: matches either keyword (e.g. 'switch OR router')")
+
+            btn_chip_quote = ttk.Button(hints_bar, text='"Phrase"', width=8, command=lambda: insert_syntax_sample('"exact phrase"'))
+            btn_chip_quote.pack(side="left", padx=2)
+            ToolTip(btn_chip_quote, 'Click to insert exact phrase quotes: matches word sequence verbatim (e.g. "Vlan 100")')
+
+            btn_chip_file = ttk.Button(hints_bar, text="file:filter", width=9, command=lambda: insert_syntax_sample("file:log"))
+            btn_chip_file.pack(side="left", padx=2)
+            ToolTip(btn_chip_file, "Click to insert file filter: restricts results to files matching pattern (e.g. 'file:inventory')")
+
+            btn_chip_regex = ttk.Button(hints_bar, text=".* Regex", width=8, command=self._toggle_regex_mode)
+            btn_chip_regex.pack(side="left", padx=2)
+            ToolTip(btn_chip_regex, "Click to toggle Regex Mode on/off")
+
+            btn_chip_unique = ttk.Button(hints_bar, text="📄 Unique Files", width=12, command=self._toggle_unique_mode)
+            btn_chip_unique.pack(side="left", padx=2)
+            ToolTip(btn_chip_unique, "Click to toggle Unique Files mode (show each matching file only once) [Ctrl+U]")
+
+            lbl_hint_guide = ttk.Label(
+                hints_bar,
+                text="Press [F1] for Cheat Sheet  •  [Ctrl/Cmd+F] Focus  •  [↑/↓] Navigate  •  [Enter] Open File  •  [Esc] Clear",
+                font=("Helvetica", 8),
+                foreground="#64748B"
+            )
+            lbl_hint_guide.pack(side="right")
 
             # Main Split PanedWindow
             self.paned = ttk.PanedWindow(self.root, orient="vertical")
@@ -882,13 +1205,13 @@ if HAS_TKINTER:
             columns = ("file", "row", "content")
             self.tree = ttk.Treeview(table_frame, columns=columns, show="headings", selectmode="browse")
 
-            self.tree.heading("file", text="File Path")
+            self.tree.heading("file", text="File Path (Double-click to open)")
             self.tree.heading("row", text="Row #")
             self.tree.heading("content", text="Matched Content (Score In Front)")
 
-            self.tree.column("file", width=180, minwidth=110, anchor="w")
+            self.tree.column("file", width=190, minwidth=110, anchor="w")
             self.tree.column("row", width=65, minwidth=50, anchor="center")
-            self.tree.column("content", width=680, minwidth=300, anchor="w")
+            self.tree.column("content", width=700, minwidth=300, anchor="w")
 
             scrollbar = ttk.Scrollbar(table_frame, orient="vertical", command=self.tree.yview)
             self.tree.configure(yscrollcommand=scrollbar.set)
@@ -909,9 +1232,11 @@ if HAS_TKINTER:
             self.btn_load_full = ttk.Button(detail_top, text="Load Full File", command=self._load_full_text_file)
             self.btn_load_full.pack(side="right", padx=(4, 0))
             self.btn_load_full.pack_forget()
+            ToolTip(self.btn_load_full, "Load the entire text file (default shows ±50 lines context slice)")
 
             btn_copy_detail = ttk.Button(detail_top, text="Copy All Fields", command=self._copy_detail_text)
             btn_copy_detail.pack(side="right")
+            ToolTip(btn_copy_detail, "Copy formatted breakdown text to clipboard")
 
             txt_scroll = ttk.Scrollbar(detail_frame, orient="vertical")
             self.txt_detail = tk.Text(detail_frame, height=8, font=("Courier", 11), wrap="word", yscrollcommand=txt_scroll.set, bd=1, relief="solid")
@@ -923,8 +1248,19 @@ if HAS_TKINTER:
             self.txt_detail.tag_config("fuzzy_match", background="#FFAB40", foreground="#000000", font=("Courier", 11, "bold"))
             self.txt_detail.tag_config("regex_match", background="#80D8FF", foreground="#000000", font=("Courier", 11, "bold"))
 
+            # Help & guide formatting tags
+            self.txt_detail.tag_config("guide_h1", font=("Helvetica", 12, "bold"), foreground="#0F172A")
+            self.txt_detail.tag_config("guide_h2", font=("Helvetica", 10, "bold"), foreground="#1E293B")
+            self.txt_detail.tag_config("guide_code", font=("Courier", 10, "bold"), background="#E2E8F0", foreground="#0F172A")
+            self.txt_detail.tag_config("guide_tag", font=("Helvetica", 9, "bold"), background="#DBEAFE", foreground="#1E40AF")
+            self.txt_detail.tag_config("guide_dim", font=("Helvetica", 9), foreground="#64748B")
+            self.txt_detail.tag_config("guide_tip", font=("Helvetica", 9, "italic"), foreground="#047857")
+
             self.txt_detail.pack(side="left", fill="both", expand=True)
             txt_scroll.pack(side="right", fill="y")
+
+            # Show initial welcome guide in detail panel
+            self._render_welcome_guide()
 
             # Bindings & Shortcuts
             self.tree.bind("<Double-1>", self._on_row_double_click)
@@ -939,28 +1275,232 @@ if HAS_TKINTER:
             # Global Shortcuts
             self.root.bind("<Control-f>", lambda e: self._focus_search())
             self.root.bind("<Command-f>", lambda e: self._focus_search())
+            self.root.bind("<Control-u>", lambda e: self._toggle_unique_mode())
+            self.root.bind("<Command-u>", lambda e: self._toggle_unique_mode())
+            self.root.bind("<F1>", lambda e: self._show_help_dialog())
+            self.root.bind("<Control-h>", lambda e: self._show_help_dialog())
+            self.root.bind("<Command-h>", lambda e: self._show_help_dialog())
             self.root.bind("<Escape>", self._on_escape_pressed)
 
             # Right-click context menu
             self._create_context_menu()
 
+            # Quick Shortcuts Strip
+            shortcuts_strip = ttk.Frame(self.root, padding=(8, 2))
+            shortcuts_strip.pack(side="bottom", fill="x")
+            lbl_strip = ttk.Label(
+                shortcuts_strip,
+                text="⌨️  [Ctrl/Cmd+F] Search   [Ctrl/Cmd+U] 1 Match/File   [↑/↓] Navigate   [Enter] Open File   [Ctrl/Cmd+C] Copy Row   [Esc] Clear   [F1] Help Guide",
+                font=("Helvetica", 8),
+                foreground="#475569"
+            )
+            lbl_strip.pack(side="left")
+
             # Status bar
             self.status_frame = ttk.Frame(self.root, padding=6, relief="groove")
             self.status_frame.pack(side="bottom", fill="x")
 
-            self.lbl_status = ttk.Label(self.status_frame, text="Ready | Supports 'AND', 'OR', Regex, and Fuzzy search...", font=("Helvetica", 9))
+            self.lbl_status = ttk.Label(self.status_frame, text="Ready | Supports 'AND', 'OR', Regex, Fuzzy, and Unique Files search...", font=("Helvetica", 9))
             self.lbl_status.pack(side="left", padx=5)
 
             self.lbl_index_stats = ttk.Label(self.status_frame, text="Index: 0 files (0 rows)", font=("Helvetica", 9), foreground="#666666")
             self.lbl_index_stats.pack(side="right", padx=5)
 
+        def _toggle_regex_mode(self):
+            """Toggles regex mode checkbox and re-executes search."""
+            self.regex_var.set(not self.regex_var.get())
+            self._perform_search()
+
+        def _toggle_unique_mode(self):
+            """Toggles unique file mode checkbox and re-executes search."""
+            self.unique_var.set(not self.unique_var.get())
+            self._perform_search()
+
+        def _render_welcome_guide(self):
+            """Renders a formatted welcome & syntax cheat sheet in the detail text widget."""
+            self.lbl_detail_header.config(text="💡 Quick Start & Search Syntax Guide")
+            self.btn_load_full.pack_forget()
+
+            self.txt_detail.config(state="normal")
+            self.txt_detail.delete("1.0", tk.END)
+
+            self.txt_detail.insert(tk.END, "🔍 Welcome to QSearch Instant Search Engine\n", "guide_h1")
+            self.txt_detail.insert(tk.END, "Zero-delay trigram index search for CSV spreadsheets and plain text logs.\n\n", "guide_dim")
+
+            self.txt_detail.insert(tk.END, "Query Syntax Examples:\n", "guide_h2")
+
+            self.txt_detail.insert(tk.END, "  • ")
+            self.txt_detail.insert(tk.END, "AND Search:     ", "guide_tag")
+            self.txt_detail.insert(tk.END, "  sw01 AND vlan10", "guide_code")
+            self.txt_detail.insert(tk.END, "  ➔ Matches rows containing both keywords\n")
+
+            self.txt_detail.insert(tk.END, "  • ")
+            self.txt_detail.insert(tk.END, "OR Search:      ", "guide_tag")
+            self.txt_detail.insert(tk.END, "  server OR database", "guide_code")
+            self.txt_detail.insert(tk.END, "  ➔ Matches rows containing either keyword\n")
+
+            self.txt_detail.insert(tk.END, "  • ")
+            self.txt_detail.insert(tk.END, "Exact Phrase:   ", "guide_tag")
+            self.txt_detail.insert(tk.END, '  "GigabitEthernet 0/1"', "guide_code")
+            self.txt_detail.insert(tk.END, "  ➔ Matches exact multi-word sequence\n")
+
+            self.txt_detail.insert(tk.END, "  • ")
+            self.txt_detail.insert(tk.END, "File Filter:    ", "guide_tag")
+            self.txt_detail.insert(tk.END, "  file:switch 192.168", "guide_code")
+            self.txt_detail.insert(tk.END, "  ➔ Restricts search to files matching 'switch'\n")
+
+            self.txt_detail.insert(tk.END, "  • ")
+            self.txt_detail.insert(tk.END, "Regex Mode:     ", "guide_tag")
+            self.txt_detail.insert(tk.END, "  ^10\\.\\d+\\.\\d+", "guide_code")
+            self.txt_detail.insert(tk.END, "  ➔ Check 'Regex Mode' to use full regular expressions\n")
+
+            self.txt_detail.insert(tk.END, "  • ")
+            self.txt_detail.insert(tk.END, "Fuzzy Fallback: ", "guide_tag")
+            self.txt_detail.insert(tk.END, "  admnistrator", "guide_code")
+            self.txt_detail.insert(tk.END, "  ➔ Single words automatically match typos with [%] score\n\n")
+
+            self.txt_detail.insert(tk.END, "Keyboard Shortcuts:\n", "guide_h2")
+            self.txt_detail.insert(tk.END, "  [Ctrl+F / Cmd+F] Focus Search   |   [↑ / ↓] Navigate Table   |   [Enter] Open File\n", "guide_dim")
+            self.txt_detail.insert(tk.END, "  [Double-Click / Ctrl+C] Copy Row |   [Esc] Clear Query        |   [F1] Help Modal\n\n", "guide_dim")
+            self.txt_detail.insert(tk.END, "👉 Start typing in the search box above to instantly search all files.", "guide_tip")
+
+        def _render_no_results_hints(self, query: str, is_regex: bool, filter_mode: str):
+            """Renders helpful troubleshooting hints when no matches are found."""
+            self.lbl_detail_header.config(text=f"⚠️ No matches found for '{query}'")
+            self.btn_load_full.pack_forget()
+
+            self.txt_detail.config(state="normal")
+            self.txt_detail.delete("1.0", tk.END)
+
+            self.txt_detail.insert(tk.END, f"No matches found for: '{query}'\n\n", "guide_h2")
+            self.txt_detail.insert(tk.END, "💡 Suggestions & Troubleshooting Tips:\n", "guide_h1")
+
+            # Check if query looks like regex but regex mode is off
+            if not is_regex and any(c in query for c in (r"\d", r"\w", r"\s", ".*", "^", "$", "[", "]", "(", ")")):
+                self.txt_detail.insert(tk.END, "  • ")
+                self.txt_detail.insert(tk.END, "Regex Detected: ", "guide_tag")
+                self.txt_detail.insert(tk.END, " Your query looks like a regular expression pattern. Try checking ")
+                self.txt_detail.insert(tk.END, "'Regex Mode'", "guide_code")
+                self.txt_detail.insert(tk.END, " above.\n")
+
+            # Check if query uses quotes
+            if '"' in query:
+                self.txt_detail.insert(tk.END, "  • ")
+                self.txt_detail.insert(tk.END, "Quotes Filter:  ", "guide_tag")
+                self.txt_detail.insert(tk.END, " You are searching for an exact quoted phrase. Try removing the quotes to search for separate keywords.\n")
+
+            # Check file filter
+            if "file:" in query.lower() or "f:" in query.lower():
+                self.txt_detail.insert(tk.END, "  • ")
+                self.txt_detail.insert(tk.END, "File Filter:    ", "guide_tag")
+                self.txt_detail.insert(tk.END, " Verify that the filename in 'file:...' exists in your watched directory.\n")
+
+            # Filter combobox tip
+            if filter_mode != "All Indexed Files":
+                self.txt_detail.insert(tk.END, "  • ")
+                self.txt_detail.insert(tk.END, "File Mode:      ", "guide_tag")
+                self.txt_detail.insert(tk.END, f" Currently filtering by '{filter_mode}'. Try switching the dropdown to ")
+                self.txt_detail.insert(tk.END, "'All Indexed Files'", "guide_code")
+                self.txt_detail.insert(tk.END, ".\n")
+
+            # General boolean tips
+            if len(query.split()) > 1 and "OR" not in query.upper():
+                self.txt_detail.insert(tk.END, "  • ")
+                self.txt_detail.insert(tk.END, "Boolean OR:     ", "guide_tag")
+                self.txt_detail.insert(tk.END, " Default search requires all words (AND). Try using ")
+                self.txt_detail.insert(tk.END, "OR", "guide_code")
+                self.txt_detail.insert(tk.END, " (e.g. 'word1 OR word2') to broaden results.\n")
+
+            self.txt_detail.insert(tk.END, "  • ")
+            self.txt_detail.insert(tk.END, "Check Spelling: ", "guide_tag")
+            self.txt_detail.insert(tk.END, " Ensure words are spelled correctly or try shorter 3+ letter stems.\n")
+
+        def _show_help_dialog(self):
+            """Displays a modal help & shortcuts cheat sheet."""
+            dialog = tk.Toplevel(self.root)
+            dialog.title("QSearch - Search Syntax & Shortcuts Help")
+            dialog.geometry("640x520")
+            dialog.minsize(540, 400)
+            dialog.transient(self.root)
+
+            # Center dialog on parent window
+            try:
+                x = self.root.winfo_rootx() + (self.root.winfo_width() // 2) - 320
+                y = self.root.winfo_rooty() + (self.root.winfo_height() // 2) - 260
+                dialog.geometry(f"+{max(10, x)}+{max(10, y)}")
+            except Exception:
+                pass
+
+            main_frame = ttk.Frame(dialog, padding=16)
+            main_frame.pack(fill="both", expand=True)
+
+            ttk.Label(main_frame, text="📖 QSearch Search Syntax & Shortcuts Guide", font=("Helvetica", 13, "bold")).pack(anchor="w", pady=(0, 10))
+
+            help_scroll = ttk.Scrollbar(main_frame, orient="vertical")
+            help_text = tk.Text(main_frame, wrap="word", yscrollcommand=help_scroll.set, font=("Courier", 10), padx=8, pady=8)
+            help_scroll.config(command=help_text.yview)
+
+            help_text.tag_config("h1", font=("Helvetica", 11, "bold"), foreground="#0F172A")
+            help_text.tag_config("code", font=("Courier", 10, "bold"), background="#E2E8F0", foreground="#0F172A")
+            help_text.tag_config("bold", font=("Helvetica", 9, "bold"), foreground="#1E293B")
+            help_text.tag_config("desc", font=("Helvetica", 9), foreground="#334155")
+
+            content_sections = [
+                ("1. ADVANCED QUERY SYNTAX", [
+                    ("AND Operator", "server AND prod (or 'server && prod')", "Matches rows that contain ALL specified terms."),
+                    ("OR Operator", "sw01 OR sw02 (or 'sw01 | sw02')", "Matches rows that contain AT LEAST ONE of the terms."),
+                    ("Exact Phrases", '"GigabitEthernet 0/1"', "Surround in quotes to match exact words with spaces."),
+                    ("Unique Files", "1 Match/File checkbox or '📄 Unique Files' chip", "Show each matching file only once even if multiple lines match in that file."),
+                    ("File Filters", "file:switch vlan10 (or 'f:sw')", "Filters matched lines to files containing 'switch'."),
+                    ("Regex Mode", "^10\\.1\\.\\d+\\.\\d+", "Enable 'Regex Mode' checkbox for full regex patterns."),
+                    ("Fuzzy Fallback", "misspelled_word", "Single words without operators match typos with % similarity score.")
+                ]),
+                ("2. KEYBOARD SHORTCUTS", [
+                    ("Ctrl+F / Cmd+F", "Focus search input bar", "Quickly jump to the search box from anywhere."),
+                    ("Ctrl+U / Cmd+U", "Toggle Unique Files (1 Match/File)", "Toggles showing each unique file only once in results."),
+                    ("Down Arrow (↓)", "Move from search box to results table", "Navigate directly to search results."),
+                    ("Up Arrow (↑)", "Move from top row back to search box", "Jump back to editing your search query."),
+                    ("Enter", "Open selected file in default app", "Opens file in Notepad, VSCode, TextEdit, etc."),
+                    ("Ctrl+C / Cmd+C", "Copy selected matched row", "Copies full content line to clipboard."),
+                    ("Double-Click", "Copy row / inspect", "Copies row and highlights breakdown in bottom pane."),
+                    ("Right-Click", "Context menu", "Opens clipboard and folder explorer actions."),
+                    ("Esc", "Clear search", "Clears search box and restores initial guide view."),
+                    ("F1 / Ctrl+H", "Open this Help Guide", "Opens this reference cheat sheet.")
+                ]),
+                ("3. FILE & PERFORMANCE TIPS", [
+                    ("Directory Tracking", "Automatic background indexer", "Changes in the watched folder are indexed in real time."),
+                    ("Large Log Files", "±50 Lines Context Window", "Non-CSV log files show a 50-line window around matches."),
+                    ("Full File View", "Click 'Load Full File'", "Displays entire file on demand when needed."),
+                    ("CSV Export", "Save Results (.csv) 💾", "Exports all filtered results with match scores.")
+                ])
+            ]
+
+            for header, items in content_sections:
+                help_text.insert(tk.END, f"{header}\n", "h1")
+                help_text.insert(tk.END, "─" * 60 + "\n")
+                for title, example, explanation in items:
+                    help_text.insert(tk.END, f" • {title:<18} ", "bold")
+                    help_text.insert(tk.END, f"{example}\n", "code")
+                    help_text.insert(tk.END, f"   {explanation}\n\n", "desc")
+                help_text.insert(tk.END, "\n")
+
+            help_text.config(state="disabled")
+            help_text.pack(side="left", fill="both", expand=True)
+            help_scroll.pack(side="right", fill="y")
+
+            btn_close = ttk.Button(main_frame, text="Close [Esc]", command=dialog.destroy)
+            btn_close.pack(anchor="e", pady=(8, 0))
+            dialog.bind("<Escape>", lambda e: dialog.destroy())
+
         def _create_context_menu(self):
             self.context_menu = tk.Menu(self.root, tearoff=0)
-            self.context_menu.add_command(label="📋 Copy Matched Row", command=self._copy_selected_row)
+            self.context_menu.add_command(label="📋 Copy Matched Row (Ctrl+C)", command=self._copy_selected_row)
             self.context_menu.add_command(label="📑 Copy Column Breakdown", command=self._copy_detail_text)
             self.context_menu.add_separator()
-            self.context_menu.add_command(label="🖥️ Open File in Default App", command=self._open_selected_file)
+            self.context_menu.add_command(label="🖥️ Open File in Default App (Enter)", command=self._open_selected_file)
             self.context_menu.add_command(label="📂 Open Containing Folder", command=self._open_selected_folder)
+            self.context_menu.add_separator()
+            self.context_menu.add_command(label="❓ Search Syntax & Shortcuts Guide (F1)", command=self._show_help_dialog)
 
             self.tree.bind("<Button-3>", self._show_context_menu)
             self.tree.bind("<Button-2>", self._show_context_menu)
@@ -972,14 +1512,14 @@ if HAS_TKINTER:
                 self.context_menu.post(event.x_root, event.y_root)
 
         def _setup_indexer(self):
-            def on_stats_update(file_cnt, row_cnt, total_files=0, files_left=0, percent=100, is_indexing=False):
-                self._msg_queue.put(("stats", (file_cnt, row_cnt, total_files, files_left, percent, is_indexing)))
+            def on_stats_update(file_cnt, row_cnt, total_files=0, files_left=0, percent=100, is_indexing=False, last_scan=None, last_update=None):
+                self._msg_queue.put(("stats", (file_cnt, row_cnt, total_files, files_left, percent, is_indexing, last_scan, last_update)))
 
             self.indexer = BackgroundIndexer(self.engine, content_dir=self.content_dir, status_callback=on_stats_update)
             self.indexer.start()
 
-            fc, rc = self.engine.get_stats()
-            self._update_stats_display(fc, rc)
+            fc, rc, l_update, l_scan = self.engine.get_stats()
+            self._update_stats_display(fc, rc, last_scan=l_scan, last_update=l_update)
 
         def _on_browse_directory(self):
             path = filedialog.askdirectory(initialdir=str(self.content_dir), title="Select Folder to Index & Search")
@@ -1006,25 +1546,45 @@ if HAS_TKINTER:
                 pass
             self.root.after(50, self._poll_queue)
 
-        def _update_stats_display(self, file_cnt, row_cnt, total_files=0, files_left=0, percent=100, is_indexing=False):
-            filter_mode = self.filter_var.get() if hasattr(self, 'filter_var') else "CSV Files Only"
+        def _update_stats_display(self, file_cnt, row_cnt, total_files=0, files_left=0, percent=100, is_indexing=False, last_scan=None, last_update=None):
+            filter_mode = self.filter_var.get() if hasattr(self, 'filter_var') else "All Indexed Files"
+
+            scan_str = format_timestamp(last_scan, "%H:%M:%S") if last_scan else "Scanning..."
+            scan_rel = format_relative_time(last_scan)
+
+            update_str = format_timestamp(last_update, "%H:%M:%S") if last_update else "Never"
+            update_rel = format_relative_time(last_update)
+
             if is_indexing and files_left > 0:
                 self.lbl_index_stats.config(
-                    text=f"⚡ Indexing: {percent}% ({files_left} file(s) left) | {file_cnt} indexed ({row_cnt:,} rows)",
+                    text=f"⚡ Indexing: {percent}% ({files_left} left) | {file_cnt} files ({row_cnt:,} rows)",
                     foreground="#D97706"
                 )
             else:
                 self.lbl_index_stats.config(
-                    text=f"Indexed: {file_cnt} file(s), {row_cnt:,} rows | Filter: {filter_mode}",
-                    foreground="#666666"
+                    text=f"Files: {file_cnt} ({row_cnt:,} rows) | DB Updated: {update_str} ({update_rel}) | Scanned: {scan_str} ({scan_rel})",
+                    foreground="#475569"
                 )
 
+            # Update tooltip with full date/time details
+            scan_full = format_timestamp(last_scan, "%Y-%m-%d %H:%M:%S")
+            update_full = format_timestamp(last_update, "%Y-%m-%d %H:%M:%S")
+            ToolTip(
+                self.lbl_index_stats,
+                f"📊 Index & Sync Timestamps:\n"
+                f"• Total Files Indexed: {file_cnt} ({row_cnt:,} rows)\n"
+                f"• Last Filesystem Scan: {scan_full} ({scan_rel})\n"
+                f"• Last Database Sync:  {update_full} ({update_rel})\n"
+                f"• Active Filter: {filter_mode}\n"
+                f"• Watched Directory: {self.content_dir}"
+            )
+
         def _on_key_release(self, event):
-            if event.keysym in ("Up", "Down", "Left", "Right", "Return", "Escape", "Control_L", "Control_R"):
+            if event.keysym in ("Up", "Down", "Left", "Right", "Return", "Escape", "Control_L", "Control_R", "F1"):
                 return
             if self._debounce_job:
                 self.root.after_cancel(self._debounce_job)
-            
+
             q_len = len(self.search_var.get().strip())
             delay_ms = 180 if q_len < 3 else 90
             self._debounce_job = self.root.after(delay_ms, self._perform_search)
@@ -1055,22 +1615,22 @@ if HAS_TKINTER:
             if not query:
                 for item in self.tree.get_children():
                     self.tree.delete(item)
-                self.txt_detail.config(state="normal")
-                self.txt_detail.delete("1.0", tk.END)
+                self._render_welcome_guide()
                 self._current_results = []
-                self.lbl_status.config(text="Ready | Type keywords...")
+                self.lbl_status.config(text="Ready | Type keywords or click quick syntax chips above...")
                 self.btn_load_full.pack_forget()
                 return
 
-            filter_mode = self.filter_var.get() if hasattr(self, 'filter_var') else "CSV Files Only"
+            filter_mode = self.filter_var.get() if hasattr(self, 'filter_var') else "All Indexed Files"
             if filter_mode == "Text Files Only":
                 file_type = "text"
-            elif filter_mode == "All Indexed Files":
-                file_type = "all"
-            else:
+            elif filter_mode == "CSV Files Only":
                 file_type = "csv"
+            else:
+                file_type = "all"
 
             is_regex = self.regex_var.get()
+            is_unique = self.unique_var.get()
 
             with self._search_lock:
                 self._search_counter += 1
@@ -1078,20 +1638,27 @@ if HAS_TKINTER:
 
             self.lbl_status.config(text=f"Searching for '{query}'...")
 
-            def search_worker(q, ftype, regex_flag, counter):
-                results, elapsed_ms, match_type = self.engine.search(q, limit=300, file_type=ftype, is_regex=regex_flag)
+            def search_worker(q, ftype, regex_flag, unique_flag, counter):
+                results, elapsed_ms, match_type = self.engine.search(q, limit=1000, file_type=ftype, is_regex=regex_flag, unique_files=unique_flag)
                 self._msg_queue.put(("search_results", (results, elapsed_ms, match_type, q, counter)))
 
-            threading.Thread(target=search_worker, args=(query, file_type, is_regex, current_counter), daemon=True).start()
+            threading.Thread(target=search_worker, args=(query, file_type, is_regex, is_unique, current_counter), daemon=True).start()
 
         def _apply_search_results(self, results, elapsed_ms, match_type, query):
             for item in self.tree.get_children():
                 self.tree.delete(item)
 
-            self.txt_detail.config(state="normal")
-            self.txt_detail.delete("1.0", tk.END)
             self._current_results = results
             self._active_match_type = match_type
+
+            if not results:
+                filter_mode = self.filter_var.get() if hasattr(self, 'filter_var') else "All Indexed Files"
+                self._render_no_results_hints(query, self.regex_var.get(), filter_mode)
+                self.lbl_status.config(text=f"No matches found for '{query}' in {elapsed_ms:.1f} ms. See troubleshooting hints below.")
+                return
+
+            self.txt_detail.config(state="normal")
+            self.txt_detail.delete("1.0", tk.END)
 
             # Insert results putting matching percentage in front of the line
             for fname, rnum, ltext, score in results:
@@ -1099,9 +1666,10 @@ if HAS_TKINTER:
                 self.tree.insert("", "end", values=(fname, rnum, disp_text))
 
             count = len(results)
-            limit_notice = " (showing top 300)" if count >= 300 else ""
+            limit_notice = " (showing top 1000)" if count >= 1000 else ""
             tag = " (Regex Matches)" if match_type == "regex" else (" (Fuzzy Matches)" if match_type == "fuzzy" else "")
-            self.lbl_status.config(text=f"Found {count} match(es){tag}{limit_notice} in {elapsed_ms:.1f} ms for '{query}'")
+            uniq_tag = " (1 Match/File)" if self.unique_var.get() else ""
+            self.lbl_status.config(text=f"Found {count} match(es){tag}{uniq_tag}{limit_notice} in {elapsed_ms:.1f} ms for '{query}'")
 
             children = self.tree.get_children()
             if children:
@@ -1180,7 +1748,28 @@ if HAS_TKINTER:
                         self._active_match_rnum = rnum
 
                         ext = target_path.suffix.lower()
-                        self.lbl_detail_header.config(text=f"[{score}%] 📄 {fname} (Line #{rnum})")
+
+                        # Retrieve detailed file metadata
+                        info = self.engine.get_file_info(fname)
+                        mod_str = format_timestamp(info["mtime"], "%Y-%m-%d %H:%M:%S") if (info and info.get("mtime")) else "Unknown"
+                        mod_rel = format_relative_time(info["mtime"]) if (info and info.get("mtime")) else ""
+                        idx_str = format_timestamp(info["indexed_at"], "%H:%M:%S") if (info and info.get("indexed_at")) else ""
+                        size_kb = f"{info['size'] / 1024:.1f} KB" if (info and info.get("size")) else ""
+                        rows_cnt = f"{info['row_count']:,} rows" if (info and info.get("row_count")) else ""
+
+                        time_hint = f"  •  Modified: {mod_str} ({mod_rel})" if mod_rel else ""
+                        idx_hint = f"  •  DB Indexed: {idx_str}" if idx_str else ""
+                        self.lbl_detail_header.config(text=f"[{score}%] 📄 {fname} (Line #{rnum}){time_hint}{idx_hint}")
+
+                        ToolTip(
+                            self.lbl_detail_header,
+                            f"📄 File Metadata & Timestamps:\n"
+                            f"• File Name: {fname}\n"
+                            f"• Full Path: {target_path}\n"
+                            f"• File Modified on Disk: {mod_str} ({mod_rel})\n"
+                            f"• Last Indexed in DB:   {format_timestamp(info.get('indexed_at') if info else None, '%Y-%m-%d %H:%M:%S')}\n"
+                            f"• File Size: {size_kb} | Total File Rows: {rows_cnt}"
+                        )
 
                         self.txt_detail.config(state="normal")
                         self.txt_detail.delete("1.0", tk.END)
@@ -1195,7 +1784,7 @@ if HAS_TKINTER:
                             self._highlight_matches_in_text(query, self._active_match_type, is_regex)
 
                         if score < 100:
-                            self.lbl_status.config(text=f"Match Score: {score}% | {fname}:L{rnum}")
+                            self.lbl_status.config(text=f"Match Score: {score}% | {fname}:L{rnum} | Modified: {mod_str} ({mod_rel})")
                 except Exception as e:
                     print(f"[Select Error] {e}", file=sys.stderr)
 
@@ -1350,9 +1939,6 @@ if HAS_TKINTER:
         def _on_escape_pressed(self, event=None):
             self._clear_search()
 
-
-# ================= CLI Mode (Curses TUI & Interactive REPL) =================
-
 def colorize_cli_match(text: str, query: str, match_type: str, is_regex: bool) -> str:
     """Highlights and bolds matched keywords or patterns in terminal output with ANSI colors."""
     if not query or not text:
@@ -1390,7 +1976,7 @@ def run_interactive_cli(stdscr, content_dir=DEFAULT_CONTENT_DIR):
     indexer = BackgroundIndexer(engine, content_dir=content_dir)
     indexer.start()
 
-    filter_modes = ["csv", "text", "all"]
+    filter_modes = ["all", "csv", "text"]
     filter_idx = 0
 
     query = ""
@@ -1399,6 +1985,7 @@ def run_interactive_cli(stdscr, content_dir=DEFAULT_CONTENT_DIR):
     elapsed_ms = 0.0
     match_type = "exact"
     is_regex = False
+    is_unique = False
 
     while True:
         stdscr.clear()
@@ -1411,14 +1998,18 @@ def run_interactive_cli(stdscr, content_dir=DEFAULT_CONTENT_DIR):
         stdscr.addstr(2, 2, prompt, curses.A_BOLD)
         stdscr.addstr(2, 2 + len(prompt), query)
 
-        fc, rc = engine.get_stats()
+        fc, rc, l_update, l_scan = engine.get_stats()
+        scan_t = format_timestamp(l_scan, "%H:%M:%S") if l_scan else "Scanning..."
+        update_t = format_timestamp(l_update, "%H:%M:%S") if l_update else "Never"
+
         if indexer.is_indexing and indexer.files_left > 0:
             idx_str = f"Indexing: {indexer.percent}% ({indexer.files_left} left)"
         else:
-            idx_str = f"Index: {fc} files ({rc:,} rows)"
+            idx_str = f"Index: {fc} files ({rc:,} rows) | DB: {update_t} | Scan: {scan_t}"
 
         mode_label = {"csv": "CSV Only", "text": "Text Only", "all": "All Files"}[filter_modes[filter_idx]]
         reg_label = " [Regex: ON]" if is_regex else ""
+        uniq_label = " [Unique: ON]" if is_unique else ""
 
         if results and 0 <= selected_idx < len(results):
             sel_score = results[selected_idx][3]
@@ -1426,7 +2017,7 @@ def run_interactive_cli(stdscr, content_dir=DEFAULT_CONTENT_DIR):
         else:
             type_str = " (Regex)" if match_type == "regex" else (" (Fuzzy)" if match_type == "fuzzy" else "")
 
-        info_str = f" Matches: {len(results)}{type_str}{reg_label} | Time: {elapsed_ms:.1f}ms | Filter: {mode_label} [Tab/f] | {idx_str} "
+        info_str = f" Matches: {len(results)}{type_str}{reg_label}{uniq_label} | Time: {elapsed_ms:.1f}ms | Filter: {mode_label} [Tab/f] | {idx_str} "
         stdscr.addstr(3, 2, info_str[:max_x - 4], getattr(curses, 'A_DIM', curses.A_NORMAL))
 
         stdscr.addstr(4, 0, "─" * max_x)
@@ -1450,7 +2041,7 @@ def run_interactive_cli(stdscr, content_dir=DEFAULT_CONTENT_DIR):
                 else:
                     stdscr.addstr(row_y, 2, line_disp)
 
-        footer = " [Esc: Clear | Enter: Open | r: Regex | Tab/f: Filter | c: Copy | s: Save | Up/Down: Select] "
+        footer = " [Esc: Clear | Enter: Open | r: Regex | u: Unique | Tab/f: Filter | c: Copy | s: Save | Up/Down: Select] "
         try:
             stdscr.addstr(max_y - 1, 0, footer.center(max_x), curses.A_REVERSE)
         except curses.error:
@@ -1478,12 +2069,17 @@ def run_interactive_cli(stdscr, content_dir=DEFAULT_CONTENT_DIR):
         elif ch in (ord('r'), ord('R')): # Toggle Regex
             is_regex = not is_regex
             if query:
-                results, elapsed_ms, match_type = engine.search(query, file_type=filter_modes[filter_idx], is_regex=is_regex)
+                results, elapsed_ms, match_type = engine.search(query, file_type=filter_modes[filter_idx], is_regex=is_regex, unique_files=is_unique)
+                selected_idx = 0
+        elif ch in (ord('u'), ord('U')): # Toggle Unique Files mode
+            is_unique = not is_unique
+            if query:
+                results, elapsed_ms, match_type = engine.search(query, file_type=filter_modes[filter_idx], is_regex=is_regex, unique_files=is_unique)
                 selected_idx = 0
         elif ch in (9, ord('\t'), ord('f'), ord('F')): # Tab or 'f' key toggles file filter
             filter_idx = (filter_idx + 1) % len(filter_modes)
             if query:
-                results, elapsed_ms, match_type = engine.search(query, file_type=filter_modes[filter_idx], is_regex=is_regex)
+                results, elapsed_ms, match_type = engine.search(query, file_type=filter_modes[filter_idx], is_regex=is_regex, unique_files=is_unique)
                 selected_idx = 0
         elif ch in (10, 13, getattr(curses, "KEY_ENTER", 10)): # Enter opens file
             if results and 0 <= selected_idx < len(results):
@@ -1521,7 +2117,7 @@ def run_interactive_cli(stdscr, content_dir=DEFAULT_CONTENT_DIR):
         elif ch in (curses.KEY_BACKSPACE, 127, 8):
             if query:
                 query = query[:-1]
-                results, elapsed_ms, match_type = engine.search(query, file_type=filter_modes[filter_idx], is_regex=is_regex)
+                results, elapsed_ms, match_type = engine.search(query, file_type=filter_modes[filter_idx], is_regex=is_regex, unique_files=is_unique)
                 selected_idx = 0
         elif ch == curses.KEY_UP:
             if selected_idx > 0:
@@ -1531,40 +2127,78 @@ def run_interactive_cli(stdscr, content_dir=DEFAULT_CONTENT_DIR):
                 selected_idx += 1
         elif 32 <= ch <= 126:
             query += chr(ch)
-            results, elapsed_ms, match_type = engine.search(query, file_type=filter_modes[filter_idx], is_regex=is_regex)
+            results, elapsed_ms, match_type = engine.search(query, file_type=filter_modes[filter_idx], is_regex=is_regex, unique_files=is_unique)
             selected_idx = 0
 
 
-def run_interactive_repl(content_dir=DEFAULT_CONTENT_DIR, file_type="csv"):
+def run_interactive_repl(content_dir=DEFAULT_CONTENT_DIR, file_type="all", unique_files=False):
     """Continuous REPL prompt for terminal users without curses."""
     engine = SearchEngine(content_dir=content_dir)
     indexer = BackgroundIndexer(engine, content_dir=content_dir)
     indexer.sync_content_directory()
 
-    print("=" * 65)
-    print(f"  QSearch Interactive CLI REPL (Directory: {content_dir})")
-    print("  Type query (supports 'AND', 'OR', Regex) | :filter [csv|text|all] | :open <row> | :quit")
-    print("=" * 65)
+    fc, rc, l_update, l_scan = engine.get_stats()
+    scan_t = format_timestamp(l_scan, "%Y-%m-%d %H:%M:%S")
+    update_t = format_timestamp(l_update, "%Y-%m-%d %H:%M:%S")
+
+    print("=" * 75)
+    print(f"  🔍 QSearch Interactive CLI REPL (Directory: {content_dir})")
+    print(f"  📊 Index: {fc} files ({rc:,} rows) | Last DB Sync: {update_t}")
+    print(f"  📁 Last Scan: {scan_t} ({format_relative_time(l_scan)})")
+    print("  Commands: :help | :info | :filter [csv|text|all] | :regex | :unique | :open <row> | :quit")
+    print("  Syntax:   keyword1 AND keyword2 | word1 OR word2 | \"phrase\" | file:name")
+    print("=" * 75)
 
     last_results = []
     current_ftype = file_type
     is_regex = False
+    is_unique = unique_files
 
     while True:
         try:
             reg_status = " [Regex]" if is_regex else ""
-            cmd = input(f"\nqs ({current_ftype}){reg_status}> ").strip()
+            uniq_status = " [Unique]" if is_unique else ""
+            cmd = input(f"\nqs ({current_ftype}){reg_status}{uniq_status}> ").strip()
         except (EOFError, KeyboardInterrupt):
             print("\nExiting QSearch.")
             break
 
         if not cmd:
             continue
+        if cmd in (":info", ":stats", ":status"):
+            fc, rc, l_update, l_scan = engine.get_stats()
+            print("\n📊 Database Index Status & Timestamps:")
+            print(f"  • Watched Directory:   {content_dir}")
+            print(f"  • Total Indexed Files: {fc}")
+            print(f"  • Total Indexed Rows:  {rc:,}")
+            print(f"  • Last Filesystem Scan: {format_timestamp(l_scan)} ({format_relative_time(l_scan)})")
+            print(f"  • Last Database Update: {format_timestamp(l_update)} ({format_relative_time(l_update)})")
+            continue
+        if cmd in (":help", ":h", ":?"):
+            print("\n📖 QSearch CLI REPL Commands & Query Syntax:")
+            print("  :info / :stats          Show database sync & filesystem scan timestamps")
+            print("  :filter [csv|text|all]  Change active file filter")
+            print("  :regex                  Toggle regular expression search mode")
+            print("  :unique / :u            Toggle unique files mode (1 match per file)")
+            print("  :open <num>             Open matched file in default application")
+            print("  :quit / :q / exit       Exit QSearch")
+            print("\n💡 Search Syntax Examples:")
+            print("  • AND Search:    server AND prod       (requires both terms)")
+            print("  • OR Search:     vlan10 OR vlan20      (matches either term)")
+            print("  • Exact Phrase:  \"GigabitEthernet\"     (matches verbatim)")
+            print("  • File Filter:   file:switch 192.168   (matches files containing 'switch')")
+            print("  • Regex:         ^10\\.\\d+\\.\\d+         (when :regex is ON)")
+            print("  • Fuzzy:         typo_word             (fuzzy matches with % score)")
+            continue
         if cmd in (":quit", ":q", "exit", "quit"):
             break
         if cmd == ":regex":
             is_regex = not is_regex
             print(f"[Regex mode: {'ON' if is_regex else 'OFF'}]")
+            continue
+        if cmd in (":unique", ":u"):
+            is_unique = not is_unique
+            print(f"[Unique files mode: {'ON (1 match/file)' if is_unique else 'OFF (all matches)'}]")
             continue
         if cmd.startswith(":filter") or cmd.startswith(":f"):
             parts = cmd.split()
@@ -1585,11 +2219,12 @@ def run_interactive_repl(content_dir=DEFAULT_CONTENT_DIR, file_type="csv"):
                     print("Invalid result index.")
             continue
 
-        results, elapsed_ms, match_type = engine.search(cmd, limit=50, file_type=current_ftype, is_regex=is_regex)
+        results, elapsed_ms, match_type = engine.search(cmd, limit=500, file_type=current_ftype, is_regex=is_regex, unique_files=is_unique)
         last_results = results
 
         tag_str = " (Regex)" if match_type == "regex" else (" (Fuzzy)" if match_type == "fuzzy" else "")
-        print(f"\n🔍 Found {len(results)} match(es){tag_str} in {elapsed_ms:.1f} ms:")
+        uniq_tag = " (Unique Files)" if is_unique else ""
+        print(f"\n🔍 Found {len(results)} match(es){tag_str}{uniq_tag} in {elapsed_ms:.1f} ms:")
         print("─" * 70)
         if not results:
             print("No matches found.")
@@ -1602,14 +2237,14 @@ def run_interactive_repl(content_dir=DEFAULT_CONTENT_DIR, file_type="csv"):
         print("─" * 70)
 
 
-def run_direct_cli_search(query, content_dir=DEFAULT_CONTENT_DIR, file_type="csv", is_regex=False, output_format="text", csv_out_path=None):
+def run_direct_cli_search(query, content_dir=DEFAULT_CONTENT_DIR, file_type="all", is_regex=False, unique_files=False, output_format="text", csv_out_path=None):
     """Executes single search query directly from terminal arguments with front percentage & keyword highlighting."""
     engine = SearchEngine(content_dir=content_dir)
 
     indexer = BackgroundIndexer(engine, content_dir=content_dir)
     indexer.sync_content_directory()
 
-    results, elapsed_ms, match_type = engine.search(query, limit=100, file_type=file_type, is_regex=is_regex)
+    results, elapsed_ms, match_type = engine.search(query, limit=1000, file_type=file_type, is_regex=is_regex, unique_files=unique_files)
 
     # Format 1: JSON Output
     if output_format == "json":
@@ -1618,6 +2253,7 @@ def run_direct_cli_search(query, content_dir=DEFAULT_CONTENT_DIR, file_type="csv
             "count": len(results),
             "elapsed_ms": round(elapsed_ms, 2),
             "match_type": match_type,
+            "unique_files": unique_files,
             "results": [
                 {
                     "match_score": f"{r[3]}%",
@@ -1647,7 +2283,8 @@ def run_direct_cli_search(query, content_dir=DEFAULT_CONTENT_DIR, file_type="csv
 
     # Format 3: Standard Formatted Terminal Output with Front Score & Bold Highlights
     tag_str = " (Regex Matches)" if match_type == "regex" else (" (Fuzzy Matches)" if match_type == "fuzzy" else "")
-    print(f"\n🔍 QSearch Results for '{query}' ({len(results)} matched{tag_str} in {elapsed_ms:.1f} ms):\n" + "─" * 70)
+    uniq_tag = " (Unique Files Only)" if unique_files else ""
+    print(f"\n🔍 QSearch Results for '{query}' ({len(results)} matched{tag_str}{uniq_tag} in {elapsed_ms:.1f} ms):\n" + "─" * 70)
     if not results:
         print("No matches found.")
     else:
@@ -1668,10 +2305,11 @@ def main():
     parser = argparse.ArgumentParser(description="QSearch - Instant CSV & Text Search Engine")
     parser.add_argument("query", nargs="*", help="Search query keywords or pattern (supports 'AND', 'OR', Regex)")
     parser.add_argument("-d", "--dir", dest="dir", default=DEFAULT_CONTENT_DIR, help="Target directory to index and search")
-    parser.add_argument("-c", "--csv", action="store_true", help="Search only CSV files (default)")
+    parser.add_argument("-c", "--csv", action="store_true", help="Search only CSV files")
     parser.add_argument("-t", "--text", action="store_true", help="Search only non-CSV text files (.txt, .log, etc.)")
-    parser.add_argument("-a", "--all", action="store_true", help="Search all indexed text and CSV files")
+    parser.add_argument("-a", "--all", action="store_true", help="Search all indexed text and CSV files (default)")
     parser.add_argument("-r", "--regex", action="store_true", help="Enable regular expression matching")
+    parser.add_argument("-u", "--unique", action="store_true", help="Show each matching file only once (1 match per file)")
     parser.add_argument("--json", action="store_true", help="Output results in JSON format")
     parser.add_argument("--csv-out", dest="csv_out", help="Save search results directly to specified CSV file")
     parser.add_argument("--repl", action="store_true", help="Start continuous interactive CLI prompt")
@@ -1682,11 +2320,11 @@ def main():
     content_dir = Path(args.dir).resolve()
     content_dir.mkdir(parents=True, exist_ok=True)
 
-    file_type = "csv"
-    if args.text:
+    file_type = "all"
+    if args.csv:
+        file_type = "csv"
+    elif args.text:
         file_type = "text"
-    elif args.all:
-        file_type = "all"
 
     # Case 1: Direct one-shot search
     if args.query:
@@ -1697,6 +2335,7 @@ def main():
             content_dir=content_dir,
             file_type=file_type,
             is_regex=args.regex,
+            unique_files=args.unique,
             output_format=out_fmt,
             csv_out_path=args.csv_out
         )
@@ -1704,7 +2343,7 @@ def main():
 
     # Case 2: REPL prompt
     if args.repl:
-        run_interactive_repl(content_dir=content_dir, file_type=file_type)
+        run_interactive_repl(content_dir=content_dir, file_type=file_type, unique_files=args.unique)
         return
 
     # Case 3: GUI Mode
@@ -1712,9 +2351,11 @@ def main():
     if HAS_TKINTER and not args.cli:
         try:
             root = tk.Tk()
-            root.withdraw()
-            root.deiconify()
             app = QSearchGUIApp(root, initial_dir=content_dir)
+            if args.unique:
+                app.unique_var.set(True)
+            root.update_idletasks()
+            root.lift()
             gui_launched = True
             root.mainloop()
         except Exception:
@@ -1728,7 +2369,7 @@ def main():
             except KeyboardInterrupt:
                 sys.exit(0)
         else:
-            run_interactive_repl(content_dir=content_dir, file_type=file_type)
+            run_interactive_repl(content_dir=content_dir, file_type=file_type, unique_files=args.unique)
 
 
 if __name__ == "__main__":
