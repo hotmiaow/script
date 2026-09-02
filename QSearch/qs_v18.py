@@ -163,19 +163,36 @@ def is_mac_address(query: str) -> bool:
     """
     Determines if a query string represents a full or partial MAC address
     (4, 6, 8, 10, 12, or 16 hex characters with common separators or standard full MAC).
+    Strictly excludes IP addresses and decimal numbers (e.g. 192.147.55).
     """
     if not query:
         return False
     q = query.strip()
+
+    # Reject if dot-separated parts have length 3 (e.g. 192.147.55 is IP octets, not MAC)
+    if "." in q:
+        parts = [p for p in q.split(".") if p]
+        if any(len(p) == 3 for p in parts):
+            return False
+        if not all(len(p) in (2, 4) for p in parts):
+            return False
+
+    # For colons or hyphens, parts must be 2 (IEEE) or 4 (Cisco quad)
+    for sep in (":", "-"):
+        if sep in q:
+            parts = [p for p in q.split(sep) if p]
+            if not all(len(p) in (2, 4) for p in parts):
+                return False
+
     # Explicit MAC formats with separators (e.g. '11:11', 'aa:bb:cc', '1111.1111', etc.)
     has_separator = any(sep in q for sep in (":", "-", "."))
     clean = re.sub(r'[:.\-_\s]', '', q)
     if not (len(clean) in (4, 6, 8, 10, 12, 16) and all(c in "0123456789abcdefABCDEF" for c in clean)):
         return False
-    # If 12 or 16 chars, it's always a full MAC. If shorter, auto-detect if it has MAC delimiters or even length >= 4
+    # If 12 or 16 chars, it's always a full MAC. If shorter, auto-detect if it has MAC delimiters or even length in (4, 6, 8, 10)
     if len(clean) in (12, 16):
         return True
-    return has_separator or len(clean) in (6, 8, 10)
+    return has_separator or len(clean) in (4, 6, 8, 10)
 
 
 def normalize_mac(query: str) -> Optional[str]:
@@ -303,14 +320,14 @@ def extract_subnets_from_query(query: str, is_ip_mode: bool = False) -> List[Uni
     return subnets
 
 
-def is_ip_or_cidr_query(query: str) -> bool:
-    """Checks if query represents or contains at least one valid CIDR subnet (e.g. '1.0.0.0/8', '192.168.1.0/24')."""
-    return len(extract_subnets_from_query(query)) > 0
+def is_ip_or_cidr_query(query: str, is_ip_mode: bool = False) -> bool:
+    """Checks if query represents or contains at least one valid CIDR subnet (e.g. '1.0.0.0/8', '192.168.1.0/24') or IP."""
+    return len(extract_subnets_from_query(query, is_ip_mode=is_ip_mode)) > 0
 
 
 _IP_CANDIDATE_REGEX = re.compile(
-    r'(?:\b(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?:\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}(?:/\d{1,2})?\b)|'
-    r'(?:\b[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4}){1,7}(?:/\d{1,3})?\b)'
+    r'\b(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?:/\d{1,2})?\b|'
+    r'(?:::1\b|(?:::|(?:\b[0-9a-fA-F]{1,4}:+)+)(?:[0-9a-fA-F]{1,4}(?::+[0-9a-fA-F]{1,4})*)?(?:/\d{1,3})?\b)'
 )
 
 def extract_matching_ips_in_text(target_net: Union[ipaddress.IPv4Network, ipaddress.IPv6Network], text: str) -> List[str]:
@@ -321,7 +338,7 @@ def extract_matching_ips_in_text(target_net: Union[ipaddress.IPv4Network, ipaddr
         return []
     
     matched = []
-    candidates = _IP_CANDIDATE_REGEX.findall(text)
+    candidates = [m.group(0) for m in _IP_CANDIDATE_REGEX.finditer(text)]
     for cand in candidates:
         try:
             if "/" in cand:
@@ -454,11 +471,17 @@ def open_file_in_default_app(filename, content_dir=DEFAULT_CONTENT_DIR):
 
     target_path = Path(filename)
     if not target_path.is_absolute() or not target_path.exists():
-        target_path = Path(content_dir) / os.path.basename(filename)
-        if not target_path.exists():
-            matches = list(Path(content_dir).rglob(os.path.basename(filename)))
-            if matches:
-                target_path = matches[0]
+        direct = Path(content_dir) / filename
+        if direct.exists():
+            target_path = direct
+        else:
+            fallback = Path(content_dir) / os.path.basename(filename)
+            if fallback.exists():
+                target_path = fallback
+            else:
+                matches = list(Path(content_dir).rglob(os.path.basename(filename)))
+                if matches:
+                    target_path = matches[0]
 
     if not target_path.exists():
         return False
@@ -484,11 +507,17 @@ def open_containing_folder(filename, content_dir=DEFAULT_CONTENT_DIR):
 
     target_path = Path(filename)
     if not target_path.is_absolute() or not target_path.exists():
-        target_path = Path(content_dir) / os.path.basename(filename)
-        if not target_path.exists():
-            matches = list(Path(content_dir).rglob(os.path.basename(filename)))
-            if matches:
-                target_path = matches[0]
+        direct = Path(content_dir) / filename
+        if direct.exists():
+            target_path = direct
+        else:
+            fallback = Path(content_dir) / os.path.basename(filename)
+            if fallback.exists():
+                target_path = fallback
+            else:
+                matches = list(Path(content_dir).rglob(os.path.basename(filename)))
+                if matches:
+                    target_path = matches[0]
 
     folder = target_path.parent if target_path.exists() else Path(content_dir)
     folder_str = str(folder.resolve())
@@ -718,8 +747,8 @@ class SearchEngine:
             cur = conn.cursor()
             base = os.path.basename(file_name)
             cur.execute(
-                "SELECT mtime, size, row_count, headers, indexed_at, file_path FROM file_meta WHERE file_path = ? OR file_path LIKE ? LIMIT 1;",
-                (file_name, f"%{base}")
+                "SELECT mtime, size, row_count, headers, indexed_at, file_path FROM file_meta WHERE file_path = ? OR file_path LIKE ? OR file_path LIKE ? LIMIT 1;",
+                (file_name, f"%{file_name}", f"%{base}")
             )
             row = cur.fetchone()
             conn.close()
@@ -755,8 +784,8 @@ class SearchEngine:
         extracted_subnets = []
         has_mac_term = False
 
-        # Split into OR branches
-        or_parts = re.split(r'\s+(?:OR|or|\|)\s+', query_str)
+        # Split into non-empty OR branches
+        or_parts = [p.strip() for p in re.split(r'\s+(?:OR|or|\|)\s+', query_str) if p.strip()]
 
         fts_or_clauses = []
         like_or_clauses = []
@@ -867,7 +896,9 @@ class SearchEngine:
             if branch_like_parts:
                 like_or_clauses.append("(" + " AND ".join(branch_like_parts) + ")")
 
-        fts_query = " OR ".join(fts_or_clauses) if fts_or_clauses else None
+        # Only use FTS if EVERY branch has a valid positive FTS representation;
+        # otherwise a partial FTS query would permanently drop the unindexed branch(es).
+        fts_query = " OR ".join(fts_or_clauses) if (len(fts_or_clauses) == len(or_parts)) else None
         like_sql = "(" + " OR ".join(like_or_clauses) + ")" if like_or_clauses else None
 
         return fts_query, (like_sql, like_params), keywords, extracted_subnets, has_mac_term
@@ -953,35 +984,27 @@ class SearchEngine:
 
                 is_phrase = effective_query.startswith('"') and effective_query.endswith('"') and len(effective_query) >= 2
 
-                # Stage 1: FTS5 Trigram Search
+                # Stage 1: FTS5 Trigram Indexed Search with Subquery Constraint Verification
                 if self.use_fts and fts_expr:
                     try:
-                        cur.execute(f"""
-                            SELECT file_name, row_num, line_text
-                            FROM fts_idx
-                            WHERE fts_idx MATCH ?{base_filter_sql}
-                            LIMIT ?;
-                        """, (fts_expr, limit * 2))
-                        raw = cur.fetchall()
-                        if extracted_subnets:
-                            filtered = []
-                            for r in raw:
-                                l_text = r[2]
-                                if any(extract_matching_ips_in_text(net, l_text) for net in extracted_subnets):
-                                    filtered.append((r[0], r[1], r[2], 100))
-                            results = filtered
+                        if like_sql:
+                            sql_stmt = f"""
+                                SELECT file_name, row_num, line_text
+                                FROM fts_idx
+                                WHERE rowid IN (SELECT rowid FROM fts_idx WHERE fts_idx MATCH ?)
+                                  AND {like_sql}{base_filter_sql}
+                                LIMIT ?;
+                            """
+                            cur.execute(sql_stmt, (fts_expr, *like_params, limit * 2))
                         else:
-                            short_keywords = [k.lower() for k in keywords if len(k) < 3]
-                            if short_keywords and not (" OR " in effective_query.upper() or "|" in effective_query):
-                                filtered = []
-                                for r in raw:
-                                    l_low = r[2].lower()
-                                    f_low = r[0].lower()
-                                    if all(st in l_low or st in f_low for st in short_keywords):
-                                        filtered.append((r[0], r[1], r[2], 100))
-                                results = filtered
-                            else:
-                                results = [(r[0], r[1], r[2], 100) for r in raw]
+                            cur.execute(f"""
+                                SELECT file_name, row_num, line_text
+                                FROM fts_idx
+                                WHERE fts_idx MATCH ?{base_filter_sql}
+                                LIMIT ?;
+                            """, (fts_expr, limit * 2))
+                        raw = cur.fetchall()
+                        results = [(r[0], r[1], r[2], 100) for r in raw]
                     except sqlite3.Error:
                         results = []
 
@@ -1131,6 +1154,7 @@ class BackgroundIndexer(threading.Thread):
         self.status_callback = status_callback
         self.poll_interval = poll_interval
         self._running = True
+        self._sync_lock = threading.Lock()
         self.is_indexing = False
         self.total_files = 0
         self.files_left = 0
@@ -1155,105 +1179,116 @@ class BackgroundIndexer(threading.Thread):
 
     def sync_content_directory(self):
         """Checks for new, updated, or removed text files with directory pruning."""
-        conn = self.engine.get_connection()
-        cur = conn.cursor()
+        with self._sync_lock:
+            conn = self.engine.get_connection()
+            cur = conn.cursor()
 
-        cur.execute("SELECT file_path, round(mtime, 3), size FROM file_meta;")
-        db_files = {row[0]: (row[1], row[2]) for row in cur.fetchall()}
+            cur.execute("SELECT file_path, round(mtime, 3), size FROM file_meta;")
+            db_files = {row[0]: (row[1], row[2]) for row in cur.fetchall()}
 
-        disk_files = {}
-        if self.content_dir.exists():
-            for root, dirs, files in os.walk(str(self.content_dir)):
-                # Prune hidden and build/cache folders early
-                dirs[:] = [d for d in dirs if d not in EXCLUDED_DIRS and not d.startswith(".")]
-                for fname in files:
-                    if fname.startswith(".") or fname in EXCLUDED_FILENAMES:
-                        continue
-                    full_path = Path(root) / fname
-                    if is_text_file(full_path):
-                        try:
-                            stat = full_path.stat()
-                            disk_files[str(full_path)] = (round(stat.st_mtime, 3), stat.st_size)
-                        except OSError:
+            disk_files = {}
+            if self.content_dir.exists():
+                for root, dirs, files in os.walk(str(self.content_dir)):
+                    # Prune hidden and build/cache folders early
+                    dirs[:] = [d for d in dirs if d not in EXCLUDED_DIRS and not d.startswith(".")]
+                    for fname in files:
+                        if fname.startswith(".") or fname in EXCLUDED_FILENAMES:
                             continue
+                        full_path = Path(root) / fname
+                        if is_text_file(full_path):
+                            try:
+                                stat = full_path.stat()
+                                disk_files[str(full_path)] = (round(stat.st_mtime, 3), stat.st_size)
+                            except OSError:
+                                continue
 
-        removed_files = set(db_files.keys()) - set(disk_files.keys())
-        for rfile in removed_files:
-            rel_name = os.path.relpath(rfile, self.content_dir) if str(rfile).startswith(str(self.content_dir)) else os.path.basename(rfile)
-            cur.execute("DELETE FROM file_meta WHERE file_path = ?;", (rfile,))
-            if self.engine.use_fts:
-                cur.execute("DELETE FROM fts_idx WHERE file_name = ? OR file_name = ?;", (rel_name, os.path.basename(rfile)))
-            else:
-                cur.execute("DELETE FROM std_idx WHERE file_name = ? OR file_name = ?;", (rel_name, os.path.basename(rfile)))
-            conn.commit()
+            # Only remove files that belong to the watched directory scope
+            content_dir_str = str(self.content_dir)
+            removed_files = [
+                rfile for rfile in db_files
+                if (str(rfile) == content_dir_str or str(rfile).startswith(content_dir_str + os.sep))
+                and rfile not in disk_files
+            ]
+            for rfile in removed_files:
+                rel_name = os.path.relpath(rfile, self.content_dir) if str(rfile).startswith(str(self.content_dir)) else os.path.basename(rfile)
+                cur.execute("DELETE FROM file_meta WHERE file_path = ?;", (rfile,))
+                if self.engine.use_fts:
+                    cur.execute("DELETE FROM fts_idx WHERE file_name = ? OR file_name = ?;", (rel_name, os.path.basename(rfile)))
+                else:
+                    cur.execute("DELETE FROM std_idx WHERE file_name = ? OR file_name = ?;", (rel_name, os.path.basename(rfile)))
+            if removed_files:
+                conn.commit()
 
-        changed_files = [
-            filepath for filepath, (mtime, size) in disk_files.items()
-            if filepath not in db_files or db_files[filepath] != (mtime, size)
-        ]
+            changed_files = [
+                filepath for filepath, (mtime, size) in disk_files.items()
+                if filepath not in db_files or db_files[filepath] != (mtime, size)
+            ]
 
-        has_changes = bool(changed_files or removed_files)
-        now_ts = time.time()
-        self.last_scan_time = now_ts
-        self.engine.set_db_meta("last_scan_time", str(now_ts))
+            has_changes = bool(changed_files or removed_files)
+            now_ts = time.time()
+            self.last_scan_time = now_ts
+            self.engine.set_db_meta("last_scan_time", str(now_ts))
 
-        if has_changes:
-            self.last_db_update_time = now_ts
-            self.engine.set_db_meta("last_db_update_time", str(now_ts))
-            total_changed = len(changed_files)
-            self.total_files = total_changed
-            self.files_left = total_changed
-            self.is_indexing = True if total_changed > 0 else False
-            self.percent = 0 if total_changed > 0 else 100
+            if has_changes:
+                self.last_db_update_time = now_ts
+                self.engine.set_db_meta("last_db_update_time", str(now_ts))
+                total_changed = len(changed_files)
+                self.total_files = total_changed
+                self.files_left = total_changed
+                self.is_indexing = True if total_changed > 0 else False
+                self.percent = 0 if total_changed > 0 else 100
 
-            for idx, filepath in enumerate(changed_files, start=1):
-                self.index_single_file(conn, filepath)
-                self.files_left = total_changed - idx
-                self.percent = int((idx / total_changed) * 100)
+                for idx, filepath in enumerate(changed_files, start=1):
+                    self.index_single_file(conn, filepath)
+                    self.files_left = total_changed - idx
+                    self.percent = int((idx / total_changed) * 100)
 
-                if self.status_callback and (idx % 10 == 0 or idx == total_changed):
+                    if self.status_callback and (idx % 10 == 0 or idx == total_changed):
+                        try:
+                            self.status_callback(
+                                len(disk_files), 0, self.total_files, self.files_left, self.percent, self.is_indexing,
+                                self.last_scan_time, self.last_db_update_time
+                            )
+                        except Exception:
+                            pass
+
+                if self.engine.use_fts:
+                    try:
+                        cur.execute("INSERT INTO fts_idx(fts_idx) VALUES('optimize');")
+                        conn.commit()
+                    except Exception:
+                        pass
+                cur.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+
+                self.is_indexing = False
+                self.files_left = 0
+                self.percent = 100
+
+                # Refresh in-memory column headers cache for newly indexed CSVs
+                self.engine.refresh_headers_cache()
+
+                file_cnt, row_cnt, l_update, l_scan = self.engine.get_stats()
+                if self.status_callback:
                     try:
                         self.status_callback(
-                            len(disk_files), 0, self.total_files, self.files_left, self.percent, self.is_indexing,
-                            self.last_scan_time, self.last_db_update_time
+                            file_cnt, row_cnt, self.total_files, 0, 100, False,
+                            self.last_scan_time, self.last_db_update_time or l_update
+                        )
+                    except Exception:
+                        pass
+            else:
+                if self.status_callback:
+                    file_cnt, row_cnt, l_update, l_scan = self.engine.get_stats()
+                    try:
+                        self.status_callback(
+                            file_cnt, row_cnt, 0, 0, 100, False,
+                            self.last_scan_time, l_update
                         )
                     except Exception:
                         pass
 
-            if self.engine.use_fts:
-                try:
-                    cur.execute("INSERT INTO fts_idx(fts_idx) VALUES('optimize');")
-                    conn.commit()
-                except Exception:
-                    pass
-            cur.execute("PRAGMA wal_checkpoint(TRUNCATE);")
-
-            self.is_indexing = False
-            self.files_left = 0
-            self.percent = 100
-
-            file_cnt, row_cnt, l_update, l_scan = self.engine.get_stats()
-            if self.status_callback:
-                try:
-                    self.status_callback(
-                        file_cnt, row_cnt, self.total_files, 0, 100, False,
-                        self.last_scan_time, self.last_db_update_time or l_update
-                    )
-                except Exception:
-                    pass
-        else:
-            if self.status_callback:
-                file_cnt, row_cnt, l_update, l_scan = self.engine.get_stats()
-                try:
-                    self.status_callback(
-                        file_cnt, row_cnt, 0, 0, 100, False,
-                        self.last_scan_time, l_update
-                    )
-                except Exception:
-                    pass
-
-        conn.close()
-        return has_changes
+            conn.close()
+            return has_changes
 
     def index_single_file(self, conn, filepath):
         """Reads and indexes a single text file cleanly into SQLite."""
@@ -2471,9 +2506,14 @@ def colorize_cli_match(text: str, query: str, match_type: str, is_regex: bool) -
     if not query or not text:
         return text
 
+    # Strip file filter tokens if present
+    _, query = strip_file_filter(query)
+    if not query:
+        return text
+
     if is_regex or match_type == "regex":
         try:
-            return re.sub(f"({query})", r"\033[1;93;4m\1\033[0m", text, flags=re.IGNORECASE)
+            return re.sub(query, r"\033[1;93;4m\g<0>\033[0m", text, flags=re.IGNORECASE)
         except Exception:
             return text
 
@@ -2582,7 +2622,7 @@ def run_interactive_cli(stdscr, content_dir=DEFAULT_CONTENT_DIR):
             else:
                 type_str = ""
 
-        info_str = f" Matches: {len(results)}{type_str}{reg_label}{mac_label}{uniq_label} | Time: {elapsed_ms:.1f}ms | Filter: {mode_label} [Tab/f] | {idx_str} "
+        info_str = f" Matches: {len(results)}{type_str}{reg_label}{mac_label}{uniq_label} | Time: {elapsed_ms:.1f}ms | Filter: {mode_label} [Tab] | {idx_str} "
         stdscr.addstr(3, 2, info_str[:max_x - 4], getattr(curses, 'A_DIM', curses.A_NORMAL))
 
         stdscr.addstr(4, 0, "─" * max_x)
@@ -2597,7 +2637,6 @@ def run_interactive_cli(stdscr, content_dir=DEFAULT_CONTENT_DIR):
 
             for idx, (fname, rnum, ltext, score) in enumerate(visible_results):
                 row_y = start_row + idx
-                # Put matching percentage in front of the line
                 line_disp = f"[{score}%] [{fname}:L{rnum}] {ltext}"
                 line_disp = line_disp[:max_x - 4]
 
@@ -2606,7 +2645,7 @@ def run_interactive_cli(stdscr, content_dir=DEFAULT_CONTENT_DIR):
                 else:
                     stdscr.addstr(row_y, 2, line_disp)
 
-        footer = " [Esc: Clear | Enter: Open | m: MAC Mode | r: Regex | u: Unique | Tab/f: Filter | c: Copy | s: Save | Up/Down: Select] "
+        footer = " [Esc: Clear | Enter: Open | Tab: Filter | F2/Ctrl+O: MAC | F3/Ctrl+R: Regex | F4: Unique | F5: Save | ↑/↓: Select] "
         try:
             stdscr.addstr(max_y - 1, 0, footer.center(max_x), curses.A_REVERSE)
         except curses.error:
@@ -2631,26 +2670,26 @@ def run_interactive_cli(stdscr, content_dir=DEFAULT_CONTENT_DIR):
                 selected_idx = 0
             else:
                 break
-        elif ch in (ord('m'), ord('M')): # Toggle MAC search mode
+        elif ch in (getattr(curses, 'KEY_F2', 266), 15): # F2 or Ctrl+O -> Toggle MAC mode
             is_mac = not is_mac
             if is_mac:
                 is_regex = False
             if query:
                 results, elapsed_ms, match_type = engine.search(query, file_type=filter_modes[filter_idx], is_regex=is_regex, unique_files=is_unique, is_mac=is_mac)
                 selected_idx = 0
-        elif ch in (ord('r'), ord('R')): # Toggle Regex
+        elif ch in (getattr(curses, 'KEY_F3', 267), 18): # F3 or Ctrl+R -> Toggle Regex
             is_regex = not is_regex
             if is_regex:
                 is_mac = False
             if query:
                 results, elapsed_ms, match_type = engine.search(query, file_type=filter_modes[filter_idx], is_regex=is_regex, unique_files=is_unique, is_mac=is_mac)
                 selected_idx = 0
-        elif ch in (ord('u'), ord('U')): # Toggle Unique Files mode
+        elif ch in (getattr(curses, 'KEY_F4', 268), 21): # F4 or Ctrl+U -> Toggle Unique Files mode
             is_unique = not is_unique
             if query:
                 results, elapsed_ms, match_type = engine.search(query, file_type=filter_modes[filter_idx], is_regex=is_regex, unique_files=is_unique, is_mac=is_mac)
                 selected_idx = 0
-        elif ch in (9, ord('\t'), ord('f'), ord('F')): # Tab or 'f' key toggles file filter
+        elif ch in (9, ord('\t')): # Tab key toggles file filter
             filter_idx = (filter_idx + 1) % len(filter_modes)
             if query:
                 results, elapsed_ms, match_type = engine.search(query, file_type=filter_modes[filter_idx], is_regex=is_regex, unique_files=is_unique, is_mac=is_mac)
@@ -2659,7 +2698,7 @@ def run_interactive_cli(stdscr, content_dir=DEFAULT_CONTENT_DIR):
             if results and 0 <= selected_idx < len(results):
                 fname = results[selected_idx][0]
                 open_file_in_default_app(fname, content_dir=content_dir)
-        elif ch in (ord('c'), ord('C')): # Copy record
+        elif ch in (getattr(curses, 'KEY_F6', 270), 25, 11): # F6 or Ctrl+Y -> Copy record
             if results and 0 <= selected_idx < len(results):
                 fname, rnum, ltext, score = results[selected_idx]
                 if fname.lower().endswith(".csv"):
@@ -2678,7 +2717,7 @@ def run_interactive_cli(stdscr, content_dir=DEFAULT_CONTENT_DIR):
                         r.destroy()
                 except Exception:
                     pass
-        elif ch in (ord('s'), ord('S')): # Save to CSV
+        elif ch in (getattr(curses, 'KEY_F5', 269), 19): # F5 or Ctrl+S -> Save to CSV
             if results:
                 safe_query = "".join(c for c in query if c.isalnum() or c in (" ", "_", "-")).strip().replace(" ", "_")
                 filename = f"search_results_{safe_query}.csv" if safe_query else "search_results.csv"
@@ -2964,8 +3003,20 @@ def main():
     parser.add_argument("--csv-out", dest="csv_out", help="Save search results directly to specified CSV file")
     parser.add_argument("--repl", action="store_true", help="Start continuous interactive CLI prompt")
     parser.add_argument("--cli", action="store_true", help="Force Curses/CLI mode even if GUI is available")
+    parser.add_argument("--test", action="store_true", help="Run automated test suite and regression checks")
 
     args = parser.parse_args()
+
+    # Case 0: Run automated test suite
+    if args.test:
+        test_file = SCRIPT_DIR / "test_qs.py"
+        if test_file.exists():
+            import runpy
+            runpy.run_path(str(test_file), run_name="__main__")
+            return
+        else:
+            print("[Error] test_qs.py not found.", file=sys.stderr)
+            sys.exit(1)
 
     content_dir = Path(args.dir).resolve()
     content_dir.mkdir(parents=True, exist_ok=True)
@@ -3012,6 +3063,12 @@ def main():
                 app.unique_var.set(True)
             if args.regex:
                 app.regex_var.set(True)
+            if args.mac:
+                app.mac_var.set(True)
+            if file_type == "csv":
+                app.filter_var.set("CSV Files Only")
+            elif file_type == "text":
+                app.filter_var.set("Text Files Only")
             root.update_idletasks()
             root.lift()
             gui_launched = True

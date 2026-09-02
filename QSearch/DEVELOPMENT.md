@@ -70,9 +70,41 @@ openpyxl>=3.1.2       # Excel (.xlsx) format parsing (optional)
 
 ---
 
-## 4. Development Workflow
+## 4. Development Workflow & Automated Regression Testing
 
-### Running Tests & Type Checks
+> [!IMPORTANT]
+> **Mandatory Pre-Commit Rule**: Run the automated test suite each time `qs.py` is updated before committing or releasing any code change.
+
+### Running the Test Suite
+You can run the full automated test suite using either:
+```bash
+# Direct runner via QSearch flag:
+python3 QSearch/qs.py --test
+
+# Or running the standalone test suite:
+python3 QSearch/test_qs.py
+
+# Or via pytest (if installed in your environment):
+pytest QSearch/test_qs.py
+```
+
+### Test Coverage Checklist
+The test suite in `QSearch/test_qs.py` covers 17 critical test cases:
+1. **MAC Detection**: Validates all 9 MAC formats (`1111.1111.1111`, `11:11:...`, `11-11-...`, `11.11-...`, `11 11...`, flat hex) and partial MACs (`eeff`, `ee:ff`, `2233.4455`).
+2. **False Positive Guard**: Verifies that IP addresses (like `10.1.1.1`) and IP fragments (like `192.147.55`) are strictly excluded from MAC detection and never hijacked.
+3. **IPv4 & IPv6 Extraction**: Tests IPv4, CIDR ranges, full IPv6, and compressed IPv6 (`2001:db8::1`, `::1`).
+4. **Boolean & Multi-Subnet Searches**:
+   - `1.0.0.0/8 OR 10.0.0.0/8`: Verifies no OR branch is dropped even across large datasets.
+   - `10.0.0.0/8 AND sw`: Verifies exact constraint satisfaction (no false positive rows).
+   - `192.168.1.0/24 NOT 192.168.1.50`: Verifies exclusion logic.
+5. **Cross-Format Matching in MAC Mode**: Ensures searching `11:22:33:44:55:66` finds `1122.3344.5566` in the database.
+6. **Cross-Directory Persistence**: Guarantees that indexing a folder does not purge files from previously indexed external folders.
+7. **File Filters & Deduplication**: Tests `file_type="csv"`, `file_type="text"`, and `unique_files=True`.
+
+---
+
+## 5. Additional Tools & Build Commands
+
 ```bash
 # Type checking
 mypy QSearch/qs.py
@@ -80,11 +112,9 @@ mypy QSearch/qs.py
 # Linting
 ruff check QSearch/
 
-# Running QSearch CLI
+# Interactive REPL
 python3 QSearch/qs.py --repl
-```
 
-### Packaging Standalone Executables
-```bash
+# Packaging Standalone Executables
 pyinstaller --onefile --windowed --name qsearch QSearch/qs.py
 ```
