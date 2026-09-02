@@ -52,11 +52,20 @@ if sys.platform == "win32":
     except Exception:
         pass
 
-# Increase CSV field size limit to max
-try:
-    csv.field_size_limit(sys.maxsize)
-except Exception:
-    pass
+# Increase CSV field size limit to max (sys.maxsize overflows the C `long`
+# used internally on platforms where long is 32-bit, e.g. Windows — halve
+# and retry until a value the platform accepts is found).
+_field_limit = sys.maxsize
+while True:
+    try:
+        csv.field_size_limit(_field_limit)
+        break
+    except OverflowError:
+        _field_limit //= 2
+        if _field_limit < 2**20:
+            break
+    except Exception:
+        break
 
 # Try importing Tkinter safely for GUI mode
 HAS_TKINTER = False
@@ -276,14 +285,27 @@ def parse_ip_or_subnet(query: str) -> Optional[Union[ipaddress.IPv4Network, ipad
         return None
 
 
-def is_ip_or_cidr_query(query: str) -> bool:
-    """Checks if query represents a valid CIDR subnet containing a prefix slash (e.g. '1.0.0.0/8', '192.168.1.0/24')."""
+def extract_subnets_from_query(query: str, is_ip_mode: bool = False) -> List[Union[ipaddress.IPv4Network, ipaddress.IPv6Network]]:
+    """Extracts all valid CIDR subnets (or IPs if is_ip_mode) from a query string."""
+    subnets = []
     if not query:
-        return False
-    q = query.strip()
-    if "/" in q and parse_ip_or_subnet(q) is not None:
-        return True
-    return False
+        return subnets
+    clean = re.sub(r'\b(file|f):[^\s]+', '', query, flags=re.IGNORECASE)
+    tokens = re.findall(r'"[^"]+"|\S+', clean)
+    for tok in tokens:
+        t_clean = tok.strip('"\'(),')
+        if not t_clean or t_clean.upper() in ("AND", "OR", "NOT", "&&", "||", "|", "&"):
+            continue
+        if "/" in t_clean or is_ip_mode:
+            net = parse_ip_or_subnet(t_clean)
+            if net is not None and net not in subnets:
+                subnets.append(net)
+    return subnets
+
+
+def is_ip_or_cidr_query(query: str) -> bool:
+    """Checks if query represents or contains at least one valid CIDR subnet (e.g. '1.0.0.0/8', '192.168.1.0/24')."""
+    return len(extract_subnets_from_query(query)) > 0
 
 
 _IP_CANDIDATE_REGEX = re.compile(
@@ -329,6 +351,28 @@ def _sqlite_ip_in_network(target_net_str: str, text: str) -> int:
         return 0
 
 
+def strip_file_filter(raw_query: str) -> Tuple[Optional[str], str]:
+    """
+    Extracts an inline 'file:name' or 'f:name' filter token from a raw query
+    string and returns (file_filter, effective_query) where effective_query
+    has the filter token(s) removed. Shared by SearchEngine.search() and any
+    UI code that needs to reason about the same query the engine actually
+    matched against (e.g. MAC/IP detection for highlighting or hint text).
+    """
+    if not raw_query:
+        return None, ""
+    file_filter = None
+    cleaned_tokens = []
+    for token in raw_query.split():
+        if token.lower().startswith("file:") or token.lower().startswith("f:"):
+            parts = token.split(":", 1)
+            if len(parts) == 2 and parts[1]:
+                file_filter = parts[1].strip()
+        else:
+            cleaned_tokens.append(token)
+    return file_filter, " ".join(cleaned_tokens).strip()
+
+
 def extract_search_keywords(raw_query: str) -> List[str]:
     """
     Extracts individual search tokens/keywords from a query string,
@@ -344,13 +388,22 @@ def extract_search_keywords(raw_query: str) -> List[str]:
     phrases = re.findall(r'"([^"]+)"', clean_q)
     unquoted = re.sub(r'"[^"]+"', ' ', clean_q)
 
-    # Extract unquoted words
+    # Extract unquoted words, dropping operators and the term(s) excluded by NOT
     tokens = []
+    negate_next = False
     for token in re.split(r'[\s|,;]+', unquoted):
         token_clean = token.strip().strip("()").strip()
         if not token_clean:
             continue
-        if token_clean.upper() in ("AND", "OR", "NOT", "&&", "||", "|", "&"):
+        upper = token_clean.upper()
+        if upper == "NOT":
+            negate_next = True
+            continue
+        if upper in ("AND", "OR", "&&", "||", "|", "&"):
+            negate_next = False
+            continue
+        if negate_next:
+            negate_next = False
             continue
         tokens.append(token_clean)
 
@@ -689,53 +742,142 @@ class SearchEngine:
             pass
         return None
 
-    def _parse_boolean_query_sql(self, query_str: str) -> Tuple[Optional[str], Tuple[Optional[str], List[Any]], List[str]]:
+    def _parse_boolean_query_sql(self, query_str: str, is_mac: bool = False, is_ip: bool = False) -> Tuple[Optional[str], Tuple[Optional[str], List[Any]], List[str], List[Any], bool]:
         """
-        Parses query containing 'AND', 'OR', 'NOT', '|', '&' into:
+        Parses query containing 'AND', 'OR', 'NOT', '|', '&', subnets, and MAC tokens into:
         - FTS5 MATCH expression
-        - Standard SQL LIKE WHERE expression
-        - List of extracted keywords (for highlighting)
+        - Standard SQL LIKE/ip_in_network WHERE expression
+        - List of extracted keywords (for text highlighting)
+        - List of extracted CIDR networks (for IP highlighting)
+        - has_mac_term boolean
         """
         keywords = extract_search_keywords(query_str)
-        if not keywords:
-            return None, (None, []), []
+        extracted_subnets = []
+        has_mac_term = False
 
         # Split into OR branches
         or_parts = re.split(r'\s+(?:OR|or|\|)\s+', query_str)
-        
+
         fts_or_clauses = []
         like_or_clauses = []
         like_params = []
 
         for or_branch in or_parts:
-            and_tokens = [t.strip().strip('"').strip("'") for t in re.split(r'\s+(?:AND|and|&&|&)\s+|\s+', or_branch) if t.strip()]
-            valid_and = [t for t in and_tokens if t.upper() not in ("AND", "OR", "NOT", "&&", "||", "|", "&") and not t.lower().startswith(("file:", "f:"))]
-            
-            if not valid_and:
+            # Tokenize while keeping "quoted phrases" intact as a single atomic term
+            raw_tokens = re.findall(r'"[^"]+"|\S+', or_branch.strip())
+
+            positive_terms = []
+            negative_terms = []
+            negate_next = False
+            for tok in raw_tokens:
+                t_clean = tok.strip('"').strip("'")
+                upper = t_clean.upper()
+                if upper in ("AND", "&&", "&"):
+                    continue
+                if upper == "NOT":
+                    negate_next = True
+                    continue
+                if upper == "OR":
+                    negate_next = False
+                    continue
+                if not t_clean or t_clean.lower().startswith(("file:", "f:")):
+                    negate_next = False
+                    continue
+                if negate_next:
+                    negative_terms.append(t_clean)
+                else:
+                    positive_terms.append(t_clean)
+                negate_next = False
+
+            if not positive_terms and not negative_terms:
                 continue
 
-            # FTS clause for this branch
-            fts_tokens_branch = [f'"{t.replace(chr(34), chr(34)*2)}"' for t in valid_and if len(t) >= 3]
-            if fts_tokens_branch:
-                fts_or_clauses.append("(" + " AND ".join(fts_tokens_branch) + ")")
+            branch_fts_pos = []
+            branch_fts_neg = []
+            branch_like_parts = []
 
-            # LIKE clause for this branch (matching line_text OR file_name)
-            branch_likes = ["(line_text LIKE ? OR file_name LIKE ?)" for _ in valid_and]
-            like_or_clauses.append("(" + " AND ".join(branch_likes) + ")")
-            for t in valid_and:
-                like_params.extend([f"%{t}%", f"%{t}%"])
+            for t in positive_terms:
+                is_subnet_token = ("/" in t or is_ip) and parse_ip_or_subnet(t) is not None
+                if is_subnet_token:
+                    net = parse_ip_or_subnet(t)
+                    if net not in extracted_subnets:
+                        extracted_subnets.append(net)
+                    # Prefilter for IPv4 to accelerate sqlite evaluation
+                    pfx = None
+                    if net.version == 4:
+                        if net.prefixlen >= 24:
+                            pfx = str(net.network_address).rsplit('.', 1)[0] + '.'
+                        elif net.prefixlen >= 16:
+                            octs = str(net.network_address).split('.')
+                            pfx = f"{octs[0]}.{octs[1]}."
+                        elif net.prefixlen >= 8:
+                            octs = str(net.network_address).split('.')
+                            pfx = f"{octs[0]}."
+
+                    if pfx:
+                        branch_like_parts.append("(ip_in_network(?, line_text) AND line_text LIKE ?)")
+                        like_params.extend([str(net), f"%{pfx}%"])
+                        if len(pfx) >= 3:
+                            branch_fts_pos.append(f'"{pfx}"')
+                    else:
+                        branch_like_parts.append("ip_in_network(?, line_text)")
+                        like_params.append(str(net))
+
+                elif is_mac and is_mac_address(t):
+                    has_mac_term = True
+                    variants = generate_mac_variants(t)
+                    mac_subclauses = ["(line_text LIKE ? OR file_name LIKE ?)" for _ in variants]
+                    branch_like_parts.append("(" + " OR ".join(mac_subclauses) + ")")
+                    for v in variants:
+                        like_params.extend([f"%{v}%", f"%{v}%"])
+                    fts_v = [f'"{v}"' for v in variants if len(v) >= 3]
+                    if fts_v:
+                        branch_fts_pos.append("(" + " OR ".join(fts_v) + ")")
+
+                else:
+                    branch_like_parts.append("(line_text LIKE ? OR file_name LIKE ?)")
+                    like_params.extend([f"%{t}%", f"%{t}%"])
+                    if len(t) >= 3:
+                        branch_fts_pos.append(f'"{t.replace(chr(34), chr(34) * 2)}"')
+
+            for t in negative_terms:
+                is_subnet_token = ("/" in t or is_ip) and parse_ip_or_subnet(t) is not None
+                if is_subnet_token:
+                    net = parse_ip_or_subnet(t)
+                    branch_like_parts.append("NOT ip_in_network(?, line_text)")
+                    like_params.append(str(net))
+                elif is_mac and is_mac_address(t):
+                    variants = generate_mac_variants(t)
+                    mac_subclauses = ["(line_text LIKE ? OR file_name LIKE ?)" for _ in variants]
+                    branch_like_parts.append("NOT (" + " OR ".join(mac_subclauses) + ")")
+                    for v in variants:
+                        like_params.extend([f"%{v}%", f"%{v}%"])
+                else:
+                    branch_like_parts.append("NOT (line_text LIKE ? OR file_name LIKE ?)")
+                    like_params.extend([f"%{t}%", f"%{t}%"])
+                    if len(t) >= 3:
+                        branch_fts_neg.append(f'"{t.replace(chr(34), chr(34) * 2)}"')
+
+            if branch_fts_pos:
+                branch_fts = " AND ".join(branch_fts_pos)
+                for neg in branch_fts_neg:
+                    branch_fts += f" NOT {neg}"
+                fts_or_clauses.append("(" + branch_fts + ")")
+
+            if branch_like_parts:
+                like_or_clauses.append("(" + " AND ".join(branch_like_parts) + ")")
 
         fts_query = " OR ".join(fts_or_clauses) if fts_or_clauses else None
         like_sql = "(" + " OR ".join(like_or_clauses) + ")" if like_or_clauses else None
 
-        return fts_query, (like_sql, like_params), keywords
+        return fts_query, (like_sql, like_params), keywords, extracted_subnets, has_mac_term
 
     def search(self, query_str, limit=1000, file_type="all", is_regex=False, unique_files=False, is_mac=False, is_ip=False):
         """
         Performs multi-stage search across all files:
         - MAC address multi-format search (e.g. '1111.1111.1111', '11:11:11:11:11:11', etc.)
         - IP / CIDR Subnet range containment search (e.g. '1.0.0.0/8', '192.168.1.0/24')
-        - Boolean AND / OR / NOT search (e.g. 'server OR user', 'sw01 AND 10.1')
+        - Boolean AND / OR / NOT search (e.g. 'server OR user', '1.0.0.0/8 AND server', '10.0.0.0/8 OR 192.168.0.0/16')
         - Regular expression pattern matching
         - File-specific filtering (e.g. 'file:switch')
         - Multi-token LIKE fallback (checking both content and file path)
@@ -754,17 +896,7 @@ class SearchEngine:
         match_type = "exact"
 
         # Parse inline file filter syntax like 'file:ip_vlan' or 'f:sw'
-        file_filter = None
-        cleaned_tokens = []
-        for token in raw_query.split():
-            if token.lower().startswith("file:") or token.lower().startswith("f:"):
-                parts = token.split(":", 1)
-                if len(parts) == 2 and parts[1]:
-                    file_filter = parts[1].strip()
-            else:
-                cleaned_tokens.append(token)
-
-        effective_query = " ".join(cleaned_tokens).strip()
+        file_filter, effective_query = strip_file_filter(raw_query)
 
         # Build file extension clause
         type_clauses = []
@@ -781,123 +913,44 @@ class SearchEngine:
 
         # Determine mode: MAC mode only applies when is_mac is explicitly enabled
         is_mac_mode = bool(is_mac)
-        is_ip_mode = bool(is_ip) or (not is_regex and not is_mac_mode and is_ip_or_cidr_query(effective_query))
+        is_ip_mode = bool(is_ip)
 
         try:
             # Mode A: Regex Search
             if is_regex and effective_query:
                 match_type = "regex"
                 try:
-                    cur.execute(f"""
-                        SELECT file_name, row_num, line_text
-                        FROM {table_name}
-                        WHERE (regexp(?, line_text) OR regexp(?, file_name)){base_filter_sql}
-                        LIMIT ?;
-                    """, (effective_query, effective_query, limit * 2))
-                    raw_rows = cur.fetchall()
-                    results = [(r[0], r[1], r[2], 100) for r in raw_rows]
-                except sqlite3.OperationalError as e:
-                    print(f"[Regex Error] {e}", file=sys.stderr)
+                    re.compile(effective_query)
+                except re.error as e:
+                    print(f"[Regex Error] Invalid pattern '{effective_query}': {e}", file=sys.stderr)
                     results = []
-
-            # Mode B: MAC Address Multi-Format Search
-            elif is_mac_mode and effective_query:
-                match_type = "mac"
-                variants = generate_mac_variants(effective_query)
-
-                fts_clauses = [f'"{v}"' for v in variants if len(v) >= 3]
-                fts_expr = " OR ".join(fts_clauses) if fts_clauses else None
-
-                like_clauses = ["(line_text LIKE ? OR file_name LIKE ?)" for _ in variants]
-                like_sql = "(" + " OR ".join(like_clauses) + ")" if like_clauses else None
-                like_params = []
-                for v in variants:
-                    like_params.extend([f"%{v}%", f"%{v}%"])
-
-                # Stage 1: FTS5 Trigram Search across all MAC formats
-                if self.use_fts and fts_expr:
+                else:
                     try:
                         cur.execute(f"""
                             SELECT file_name, row_num, line_text
-                            FROM fts_idx
-                            WHERE fts_idx MATCH ?{base_filter_sql}
-                            LIMIT ?;
-                        """, (fts_expr, limit * 2))
-                        raw = cur.fetchall()
-                        results = [(r[0], r[1], r[2], 100) for r in raw]
-                    except sqlite3.Error:
-                        results = []
-
-                # Stage 2: Fast LIKE Fallback / Supplement
-                if (not results or len(results) < limit) and like_sql:
-                    try:
-                        sql_stmt = f"SELECT file_name, row_num, line_text FROM {table_name} WHERE {like_sql}{base_filter_sql} LIMIT ?;"
-                        cur.execute(sql_stmt, (*like_params, limit * 2))
-                        raw_like = cur.fetchall()
-                        existing_keys = {(r[0], r[1]) for r in results}
-                        for r in raw_like:
-                            if (r[0], r[1]) not in existing_keys:
-                                results.append((r[0], r[1], r[2], 100))
-                                existing_keys.add((r[0], r[1]))
-                    except sqlite3.Error:
-                        pass
-
-            # Mode C: IP Address & Subnet / CIDR Containment Search
-            elif is_ip_mode and effective_query:
-                match_type = "ip_subnet"
-                target_net = parse_ip_or_subnet(effective_query)
-                if target_net is not None:
-                    prefilter_clauses = []
-                    prefilter_params = []
-                    if target_net.version == 4:
-                        if target_net.prefixlen >= 24:
-                            pfx = str(target_net.network_address).rsplit('.', 1)[0] + '.'
-                            prefilter_clauses.append("line_text LIKE ?")
-                            prefilter_params.append(f"%{pfx}%")
-                        elif target_net.prefixlen >= 16:
-                            octs = str(target_net.network_address).split('.')
-                            pfx = f"{octs[0]}.{octs[1]}."
-                            prefilter_clauses.append("line_text LIKE ?")
-                            prefilter_params.append(f"%{pfx}%")
-                        elif target_net.prefixlen >= 8:
-                            octs = str(target_net.network_address).split('.')
-                            pfx = f"{octs[0]}."
-                            prefilter_clauses.append("line_text LIKE ?")
-                            prefilter_params.append(f"%{pfx}%")
-
-                    prefilter_sql = (" AND (" + " OR ".join(prefilter_clauses) + ")") if prefilter_clauses else ""
-
-                    try:
-                        sql_stmt = f"""
-                            SELECT file_name, row_num, line_text
                             FROM {table_name}
-                            WHERE ip_in_network(?, line_text){prefilter_sql}{base_filter_sql}
+                            WHERE (regexp(?, line_text) OR regexp(?, file_name)){base_filter_sql}
                             LIMIT ?;
-                        """
-                        cur.execute(sql_stmt, (str(target_net), *prefilter_params, limit * 2))
-                        raw_ip = cur.fetchall()
-                        results = [(r[0], r[1], r[2], 100) for r in raw_ip]
-                    except sqlite3.Error:
+                        """, (effective_query, effective_query, limit * 2))
+                        raw_rows = cur.fetchall()
+                        results = [(r[0], r[1], r[2], 100) for r in raw_rows]
+                    except sqlite3.OperationalError as e:
+                        print(f"[Regex Error] {e}", file=sys.stderr)
                         results = []
 
-                    # Fallback without prefilter if no results and prefilter was used
-                    if not results and prefilter_clauses:
-                        try:
-                            sql_stmt = f"""
-                                SELECT file_name, row_num, line_text
-                                FROM {table_name}
-                                WHERE ip_in_network(?, line_text){base_filter_sql}
-                                LIMIT ?;
-                            """
-                            cur.execute(sql_stmt, (str(target_net), limit * 2))
-                            raw_ip = cur.fetchall()
-                            results = [(r[0], r[1], r[2], 100) for r in raw_ip]
-                        except sqlite3.Error:
-                            pass
-
-            # Mode D: Boolean & Multi-Token Search
+            # Mode B: Unified Boolean, Multi-Token, Subnet / CIDR & MAC Search
             elif effective_query:
-                fts_expr, (like_sql, like_params), keywords = self._parse_boolean_query_sql(effective_query)
+                fts_expr, (like_sql, like_params), keywords, extracted_subnets, has_mac_term = self._parse_boolean_query_sql(
+                    effective_query, is_mac=is_mac_mode, is_ip=is_ip_mode
+                )
+
+                if extracted_subnets:
+                    match_type = "ip_subnet"
+                elif is_mac_mode or has_mac_term:
+                    match_type = "mac"
+                else:
+                    match_type = "exact"
+
                 is_phrase = effective_query.startswith('"') and effective_query.endswith('"') and len(effective_query) >= 2
 
                 # Stage 1: FTS5 Trigram Search
@@ -910,22 +963,29 @@ class SearchEngine:
                             LIMIT ?;
                         """, (fts_expr, limit * 2))
                         raw = cur.fetchall()
-                        # Validate short tokens (<3 chars)
-                        short_keywords = [k.lower() for k in keywords if len(k) < 3]
-                        if short_keywords and not (" OR " in effective_query.upper() or "|" in effective_query):
+                        if extracted_subnets:
                             filtered = []
                             for r in raw:
-                                l_low = r[2].lower()
-                                f_low = r[0].lower()
-                                if all(st in l_low or st in f_low for st in short_keywords):
+                                l_text = r[2]
+                                if any(extract_matching_ips_in_text(net, l_text) for net in extracted_subnets):
                                     filtered.append((r[0], r[1], r[2], 100))
                             results = filtered
                         else:
-                            results = [(r[0], r[1], r[2], 100) for r in raw]
+                            short_keywords = [k.lower() for k in keywords if len(k) < 3]
+                            if short_keywords and not (" OR " in effective_query.upper() or "|" in effective_query):
+                                filtered = []
+                                for r in raw:
+                                    l_low = r[2].lower()
+                                    f_low = r[0].lower()
+                                    if all(st in l_low or st in f_low for st in short_keywords):
+                                        filtered.append((r[0], r[1], r[2], 100))
+                                results = filtered
+                            else:
+                                results = [(r[0], r[1], r[2], 100) for r in raw]
                     except sqlite3.Error:
                         results = []
 
-                # Stage 2: Fast Multi-LIKE Fallback / Supplemental Search
+                # Stage 2: Fast LIKE & ip_in_network Fallback / Supplemental Search
                 if (not results or len(results) < limit) and like_sql:
                     try:
                         sql_stmt = f"SELECT file_name, row_num, line_text FROM {table_name} WHERE {like_sql}{base_filter_sql} LIMIT ?;"
@@ -939,9 +999,9 @@ class SearchEngine:
                     except sqlite3.Error:
                         pass
 
-                # Stage 3: Bounded Fuzzy Search Fallback (only for single word queries >= 4 chars without boolean operators)
+                # Stage 3: Bounded Fuzzy Search Fallback (only for single word queries >= 4 chars without boolean operators/subnets)
                 has_boolean_ops = any(op in effective_query.upper() for op in ("OR", "AND", "NOT", "|", "&"))
-                if not results and len(keywords) == 1 and len(keywords[0]) >= 4 and not is_phrase and not has_boolean_ops:
+                if not results and len(keywords) == 1 and len(keywords[0]) >= 4 and not is_phrase and not has_boolean_ops and not extracted_subnets and not is_mac_mode:
                     match_type = "fuzzy"
                     cur.execute(f"""
                         SELECT file_name, row_num, line_text, score FROM (
@@ -1197,7 +1257,7 @@ class BackgroundIndexer(threading.Thread):
 
     def index_single_file(self, conn, filepath):
         """Reads and indexes a single text file cleanly into SQLite."""
-        rel_name = os.path.relpath(filepath, self.content_dir) if str(filepath).startswith(str(filepath)) and str(filepath).startswith(str(self.content_dir)) else os.path.basename(filepath)
+        rel_name = os.path.relpath(filepath, self.content_dir) if str(filepath).startswith(str(self.content_dir)) else os.path.basename(filepath)
         stat = os.stat(filepath)
         ext = os.path.splitext(filepath)[1].lower()
 
@@ -1207,12 +1267,18 @@ class BackgroundIndexer(threading.Thread):
         headers_json = None
 
         encodings_to_try = ["utf-8-sig", "utf-8", "utf-16", "latin-1"]
+        read_ok = False
+        last_error = None
         for enc in encodings_to_try:
             parsed_batch.clear()
             total_rows = 0
             headers_json = None
             try:
-                with open(filepath, "r", encoding=enc, errors="replace") as f:
+                # newline='' is required for csv.reader to correctly handle
+                # embedded newlines / CRLF sequences inside quoted fields;
+                # harmless for the plain-text branch since lines are
+                # .strip()'d immediately after.
+                with open(filepath, "r", encoding=enc, newline="", errors="replace") as f:
                     if ext == ".csv":
                         reader = csv.reader(f)
                         for line_idx, row in enumerate(reader, start=1):
@@ -1232,11 +1298,15 @@ class BackgroundIndexer(threading.Thread):
                                     line_str = line_str[:MAX_LINE_LENGTH]
                                 parsed_batch.append((rel_name, line_idx, line_str))
                                 total_rows += 1
+                read_ok = True
                 if parsed_batch or total_rows == 0:
                     break
-            except Exception:
+            except Exception as e:
+                last_error = e
                 continue
-            print(f"[Indexer Error] Failed to read {filepath}: {e}", file=sys.stderr)
+
+        if not read_ok:
+            print(f"[Indexer Error] Failed to read {filepath}: {last_error}", file=sys.stderr)
             return
 
         try:
@@ -1714,8 +1784,13 @@ if HAS_TKINTER:
             self.txt_detail.insert(tk.END, f"No matches found for: '{query}'\n\n", "guide_h2")
             self.txt_detail.insert(tk.END, "💡 Suggestions & Troubleshooting Tips:\n", "guide_h1")
 
+            # Detect MAC/IP/regex patterns against the filter-stripped query,
+            # matching what SearchEngine.search() actually evaluated (a
+            # 'file:xxx' prefix would otherwise make these checks miss).
+            _, effective_q = strip_file_filter(query)
+
             # Check if query looks like regex but regex mode is off
-            if not is_regex and any(c in query for c in (r"\d", r"\w", r"\s", ".*", "^", "$", "[", "]", "(", ")")):
+            if not is_regex and any(c in effective_q for c in (r"\d", r"\w", r"\s", ".*", "^", "$", "[", "]", "(", ")")):
                 self.txt_detail.insert(tk.END, "  • ")
                 self.txt_detail.insert(tk.END, "Regex Detected: ", "guide_tag")
                 self.txt_detail.insert(tk.END, " Your query looks like a regular expression pattern. Try checking ")
@@ -1723,16 +1798,16 @@ if HAS_TKINTER:
                 self.txt_detail.insert(tk.END, " above.\n")
 
             # Check if query looks like MAC
-            if is_mac_address(query):
+            if is_mac_address(effective_q):
                 self.txt_detail.insert(tk.END, "  • ")
                 self.txt_detail.insert(tk.END, "MAC Search:     ", "guide_tag")
-                self.txt_detail.insert(tk.END, f" Searched all 9 notation variants for MAC '{query}'. Ensure the target files contain this MAC address.\n")
+                self.txt_detail.insert(tk.END, f" Searched all 9 notation variants for MAC '{effective_q}'. Ensure the target files contain this MAC address.\n")
 
             # Check if query looks like IP/CIDR
-            if is_ip_or_cidr_query(query):
+            if is_ip_or_cidr_query(effective_q):
                 self.txt_detail.insert(tk.END, "  • ")
                 self.txt_detail.insert(tk.END, "Subnet Search:  ", "guide_tag")
-                self.txt_detail.insert(tk.END, f" Searched for any IP address or subnet inside '{query}'. Check if the IP range covers your target.\n")
+                self.txt_detail.insert(tk.END, f" Searched for any IP address or subnet inside '{effective_q}'. Check if the IP range covers your target.\n")
 
             # Check if query uses quotes
             if '"' in query:
@@ -2092,6 +2167,13 @@ if HAS_TKINTER:
             if not full_text:
                 return
 
+            # Match against the filter-stripped query — the same text
+            # SearchEngine.search() actually evaluated — so a 'file:xxx'
+            # prefix doesn't break MAC/IP/regex highlighting.
+            _, query = strip_file_filter(query)
+            if not query:
+                return
+
             # Case A: Regex Highlighting
             if is_regex or match_type == "regex":
                 try:
@@ -2104,37 +2186,7 @@ if HAS_TKINTER:
                     pass
                 return
 
-            # Case B: MAC Address Highlighting (highlight all matched MAC formats)
-            if match_type == "mac":
-                variants = generate_mac_variants(query)
-                for v in variants:
-                    start_pos = "1.0"
-                    while True:
-                        start_pos = self.txt_detail.search(v, start_pos, stopindex=tk.END, nocase=True)
-                        if not start_pos:
-                            break
-                        end_pos = f"{start_pos}+{len(v)}c"
-                        self.txt_detail.tag_add("match_query", start_pos, end_pos)
-                        start_pos = end_pos
-                return
-
-            # Case C: IP / Subnet Range Highlighting
-            if match_type == "ip_subnet":
-                target_net = parse_ip_or_subnet(query)
-                if target_net:
-                    matched_ips = extract_matching_ips_in_text(target_net, full_text)
-                    for mip in matched_ips:
-                        start_pos = "1.0"
-                        while True:
-                            start_pos = self.txt_detail.search(mip, start_pos, stopindex=tk.END, nocase=False)
-                            if not start_pos:
-                                break
-                            end_pos = f"{start_pos}+{len(mip)}c"
-                            self.txt_detail.tag_add("match_query", start_pos, end_pos)
-                            start_pos = end_pos
-                    return
-
-            # Case D: Fuzzy Search Highlighting
+            # Case B: Fuzzy Search Highlighting
             if match_type == "fuzzy":
                 fuzzy_words = get_fuzzy_matched_words(query, full_text)
                 for fword in fuzzy_words:
@@ -2148,9 +2200,45 @@ if HAS_TKINTER:
                         start_pos = end_pos
                 return
 
+            # Case C: Subnets Highlighting (supports multi-subnet OR / AND queries)
+            subnets = extract_subnets_from_query(query)
+            if subnets:
+                for target_net in subnets:
+                    matched_ips = extract_matching_ips_in_text(target_net, full_text)
+                    for mip in matched_ips:
+                        start_pos = "1.0"
+                        while True:
+                            start_pos = self.txt_detail.search(mip, start_pos, stopindex=tk.END, nocase=False)
+                            if not start_pos:
+                                break
+                            end_pos = f"{start_pos}+{len(mip)}c"
+                            self.txt_detail.tag_add("match_query", start_pos, end_pos)
+                            start_pos = end_pos
+
+            # Case D: MAC Address Highlighting (if in MAC mode)
+            if match_type == "mac" or self.mac_var.get():
+                tokens = re.findall(r'"[^"]+"|\S+', query)
+                for tok in tokens:
+                    t_clean = tok.strip('"\',()')
+                    if is_mac_address(t_clean):
+                        variants = generate_mac_variants(t_clean)
+                        for v in variants:
+                            start_pos = "1.0"
+                            while True:
+                                start_pos = self.txt_detail.search(v, start_pos, stopindex=tk.END, nocase=True)
+                                if not start_pos:
+                                    break
+                                end_pos = f"{start_pos}+{len(v)}c"
+                                self.txt_detail.tag_add("match_query", start_pos, end_pos)
+                                start_pos = end_pos
+
             # Case E: Exact / Multi-token / Boolean Search Highlighting
             keywords = extract_search_keywords(query)
             for kw in keywords:
+                if "/" in kw and parse_ip_or_subnet(kw) is not None:
+                    continue
+                if (match_type == "mac" or self.mac_var.get()) and is_mac_address(kw):
+                    continue
                 if not kw:
                     continue
                 start_pos = "1.0"
@@ -2389,24 +2477,6 @@ def colorize_cli_match(text: str, query: str, match_type: str, is_regex: bool) -
         except Exception:
             return text
 
-    if match_type == "mac":
-        variants = generate_mac_variants(query)
-        result = text
-        for v in variants:
-            pat = re.escape(v)
-            result = re.sub(f"({pat})", r"\033[1;93;1m\1\033[0m", result, flags=re.IGNORECASE)
-        return result
-
-    if match_type == "ip_subnet":
-        target_net = parse_ip_or_subnet(query)
-        if target_net:
-            matched_ips = extract_matching_ips_in_text(target_net, text)
-            result = text
-            for mip in matched_ips:
-                pat = re.escape(mip)
-                result = re.sub(f"({pat})", r"\033[1;93;1m\1\033[0m", result)
-            return result
-
     if match_type == "fuzzy":
         fwords = get_fuzzy_matched_words(query, text)
         result = text
@@ -2415,11 +2485,38 @@ def colorize_cli_match(text: str, query: str, match_type: str, is_regex: bool) -
             result = re.sub(f"({pattern})", r"\033[1;91;4m\1\033[0m", result, flags=re.IGNORECASE)
         return result
 
-    keywords = extract_search_keywords(query)
     result = text
+
+    # 1. Highlight all matching IP addresses across all subnets in the query
+    subnets = extract_subnets_from_query(query)
+    if subnets:
+        for target_net in subnets:
+            matched_ips = extract_matching_ips_in_text(target_net, result)
+            for mip in matched_ips:
+                pat = re.escape(mip)
+                result = re.sub(f"({pat})", r"\033[1;93;1m\1\033[0m", result)
+
+    # 2. Highlight MAC variants if in MAC mode
+    if match_type == "mac":
+        tokens = re.findall(r'"[^"]+"|\S+', query)
+        for tok in tokens:
+            t_clean = tok.strip('"\',()')
+            if is_mac_address(t_clean):
+                variants = generate_mac_variants(t_clean)
+                for v in variants:
+                    pat = re.escape(v)
+                    result = re.sub(f"({pat})", r"\033[1;93;1m\1\033[0m", result, flags=re.IGNORECASE)
+
+    # 3. Standard text keywords (omitting CIDR subnets and MAC tokens)
+    keywords = extract_search_keywords(query)
     for kw in keywords:
+        if "/" in kw and parse_ip_or_subnet(kw) is not None:
+            continue
+        if match_type == "mac" and is_mac_address(kw):
+            continue
         pattern = re.escape(kw)
         result = re.sub(f"({pattern})", r"\033[1;93;1m\1\033[0m", result, flags=re.IGNORECASE)
+
     return result
 
 
@@ -2565,9 +2662,12 @@ def run_interactive_cli(stdscr, content_dir=DEFAULT_CONTENT_DIR):
         elif ch in (ord('c'), ord('C')): # Copy record
             if results and 0 <= selected_idx < len(results):
                 fname, rnum, ltext, score = results[selected_idx]
-                headers = engine.get_file_headers(fname)
-                col_lines = format_record_multiline(headers, ltext)
-                formatted_text = f"[{score}%] 📄 {fname} (Row #{rnum})\n" + "\n".join(col_lines)
+                if fname.lower().endswith(".csv"):
+                    headers = engine.get_file_headers(fname)
+                    col_lines = format_record_multiline(headers, ltext)
+                    formatted_text = f"[{score}%] 📄 {fname} (Row #{rnum})\n" + "\n".join(col_lines)
+                else:
+                    formatted_text = f"[{score}%] 📄 {fname} (Line #{rnum})\n  {ltext}"
                 try:
                     if HAS_TKINTER:
                         r = tk.Tk()
@@ -2833,12 +2933,16 @@ def run_direct_cli_search(query, content_dir=DEFAULT_CONTENT_DIR, file_type="all
         print("No matches found.")
     else:
         for fname, rnum, ltext, score in results:
-            headers = engine.get_file_headers(fname)
-            col_lines = format_record_multiline(headers, ltext)
             print(f"[\033[1;32m{score}%\033[0m] 📄 \033[1;34m{fname}\033[0m (Row #\033[33m{rnum}\033[0m):")
-            for cline in col_lines:
-                highlighted_cline = colorize_cli_match(cline, query, match_type, is_regex)
-                print(f"  \033[36m{highlighted_cline}\033[0m")
+            if fname.lower().endswith(".csv"):
+                headers = engine.get_file_headers(fname)
+                col_lines = format_record_multiline(headers, ltext)
+                for cline in col_lines:
+                    highlighted_cline = colorize_cli_match(cline, query, match_type, is_regex)
+                    print(f"  \033[36m{highlighted_cline}\033[0m")
+            else:
+                highlighted_line = colorize_cli_match(ltext, query, match_type, is_regex)
+                print(f"  \033[36m{highlighted_line}\033[0m")
             print()
     print("─" * 70 + "\n")
 
@@ -2871,6 +2975,10 @@ def main():
         file_type = "csv"
     elif args.text:
         file_type = "text"
+    if args.all:
+        # Explicit '-a/--all' takes precedence over '-c/-t' so the flag
+        # actually does something instead of being a documented no-op.
+        file_type = "all"
 
     # Case 1: Direct one-shot search
     if args.query:
