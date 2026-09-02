@@ -5,8 +5,12 @@
 
 ### Core Stack
 - **Language**: Python 3.8+ (Fully compatible with Python 3.12+)
-- **Runtime Dependency Philosophy**: Zero mandatory external dependencies (uses standard library `sqlite3`, `tkinter`, `curses`, `csv`, `threading`, `queue`, `re`, `difflib`).
+- **Runtime Dependency Philosophy**: Zero mandatory external dependencies (uses standard library `sqlite3`, `ipaddress`, `tkinter`, `curses`, `csv`, `threading`, `queue`, `re`, `difflib`).
 - **Storage Engine**: SQLite with FTS5 Trigram extension (`tokenize='trigram'`) and WAL mode for concurrent indexing and searching.
+- **Search Capabilities**:
+  - Full & Partial MAC Address search across all 9 notation formats (`1111.1111.1111`, `11:11:11:11:11:11`, `11.11.11.11.11.11`, `11-11-11-11-11-11`, `11 11 11 11 11 11`, `111111111111`, and last 4/6/8 hex characters like `eeff` or `ee:ff`).
+  - IP & CIDR Subnet range containment search (e.g. `1.0.0.0/8`, `192.168.1.0/24`, `10.0.0.0/16`) matching all host IPs and subnets contained within the network range.
+  - Boolean AND / OR / NOT search, exact phrases, inline file filters (`file:name`), regex mode, and bounded fuzzy match scoring.
 
 ---
 

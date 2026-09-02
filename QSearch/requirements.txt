@@ -1,9 +1,10 @@
 # QSearch Requirements
 # Python >= 3.8 (Compatible with Python 3.12+)
 
-# QSearch is built using Python Standard Library modules:
-# - sqlite3 (SQLite FTS5 Trigram Engine)
-# - tkinter (GUI mode - included with standard Python installers)
+# QSearch is built with zero mandatory external dependencies using Python Standard Library modules:
+# - sqlite3 (SQLite FTS5 Trigram Engine & Custom Functions)
+# - ipaddress (IPv4 / IPv6 Subnet & CIDR range containment matching)
+# - tkinter (GUI mode - included with standard Python installers / python3-tk)
 # - curses (TUI mode - standard on macOS and Linux)
 # - csv, json, threading, queue, difflib, re, argparse, pathlib, typing
 

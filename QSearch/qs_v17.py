@@ -34,7 +34,6 @@ import re
 import argparse
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict, Any, Union, Set
-import ipaddress
 
 
 
@@ -144,182 +143,6 @@ def _sqlite_regexp(pattern, text):
         return 0
     try:
         return 1 if re.search(pattern, text, re.IGNORECASE) else 0
-    except Exception:
-        return 0
-
-
-# ================= MAC & IP Address Helpers =================
-
-def is_mac_address(query: str) -> bool:
-    """
-    Determines if a query string represents a full or partial MAC address
-    (4, 6, 8, 10, 12, or 16 hex characters with common separators or standard full MAC).
-    """
-    if not query:
-        return False
-    q = query.strip()
-    # Explicit MAC formats with separators (e.g. '11:11', 'aa:bb:cc', '1111.1111', etc.)
-    has_separator = any(sep in q for sep in (":", "-", "."))
-    clean = re.sub(r'[:.\-_\s]', '', q)
-    if not (len(clean) in (4, 6, 8, 10, 12, 16) and all(c in "0123456789abcdefABCDEF" for c in clean)):
-        return False
-    # If 12 or 16 chars, it's always a full MAC. If shorter, auto-detect if it has MAC delimiters or even length >= 4
-    if len(clean) in (12, 16):
-        return True
-    return has_separator or len(clean) in (6, 8, 10)
-
-
-def normalize_mac(query: str) -> Optional[str]:
-    """Extracts clean lowercase hex string from full or partial MAC address candidate."""
-    if not query:
-        return None
-    clean = re.sub(r'[:.\-_\s]', '', query.strip()).lower()
-    if len(clean) in (4, 6, 8, 10, 12, 16) and all(c in "0123456789abcdef" for c in clean):
-        return clean
-    return None
-
-
-def generate_mac_variants(raw_query: str) -> List[str]:
-    """
-    Generates all standard MAC address notation formats for full or partial MAC addresses:
-    - 4 chars (e.g. last 4 'eeff'): eeff, ee:ff, ee-ff, ee.ff, ee ff
-    - 6 chars (e.g. 'ddeeff'): dd:ee:ff, dd-ee-ff, dd.ee.ff, dd ee ff, ddeeff, dd.eeff
-    - 8 chars (e.g. 'ccddeeff'): ccdd.eeff, cc:dd:ee:ff, cc-dd-ee-ff, cc.dd.ee.ff, cc dd ee ff, ccddeeff
-    - 12 chars (full MAC): Cisco . triplets, IEEE : pairs, - pairs, . pairs, spaces, flat hex
-    """
-    h = normalize_mac(raw_query)
-    if not h:
-        return [raw_query.strip()]
-
-    raw_variants = []
-
-    if len(h) == 4: # Last 4 characters / 2 octets (e.g. 'eeff' or 'ee:ff')
-        raw_variants = [
-            h,                                              # eeff (Cisco 4-char chunk / raw)
-            f"{h[0:2]}:{h[2:4]}",                           # ee:ff (Colon pair)
-            f"{h[0:2]}-{h[2:4]}",                           # ee-ff (Hyphen pair)
-            f"{h[0:2]}.{h[2:4]}",                           # ee.ff (Dotted pair)
-            f"{h[0:2]} {h[2:4]}",                           # ee ff (Space pair)
-            f".{h}",                                        # .eeff (Cisco end of MAC)
-        ]
-    elif len(h) == 6: # 3 octets / OUI prefix (e.g. 'ddeeff')
-        raw_variants = [
-            ":".join(h[i:i+2] for i in range(0, 6, 2)),     # dd:ee:ff
-            "-".join(h[i:i+2] for i in range(0, 6, 2)),     # dd-ee-ff
-            ".".join(h[i:i+2] for i in range(0, 6, 2)),     # dd.ee.ff
-            " ".join(h[i:i+2] for i in range(0, 6, 2)),     # dd ee ff
-            f"{h[0:2]}.{h[2:6]}",                           # dd.eeff (Cisco suffix)
-            f"{h[0:4]}.{h[4:6]}",                           # ddee.ff (Cisco prefix)
-            h                                               # ddeeff
-        ]
-    elif len(h) == 8: # 4 octets (e.g. 'ccddeeff')
-        raw_variants = [
-            f"{h[0:4]}.{h[4:8]}",                           # ccdd.eeff
-            ":".join(h[i:i+2] for i in range(0, 8, 2)),     # cc:dd:ee:ff
-            "-".join(h[i:i+2] for i in range(0, 8, 2)),     # cc-dd-ee-ff
-            ".".join(h[i:i+2] for i in range(0, 8, 2)),     # cc.dd.ee.ff
-            f"{h[0:4]}:{h[4:8]}",                           # ccdd:eeff
-            f"{h[0:4]}-{h[4:8]}",                           # ccdd-eeff
-            " ".join(h[i:i+2] for i in range(0, 8, 2)),     # cc dd ee ff
-            f"{h[0:4]} {h[4:8]}",                           # ccdd eeff
-            h                                               # ccddeeff
-        ]
-    elif len(h) == 10: # 5 octets
-        raw_variants = [
-            ":".join(h[i:i+2] for i in range(0, 10, 2)),    # bb:cc:dd:ee:ff
-            "-".join(h[i:i+2] for i in range(0, 10, 2)),    # bb-cc-dd-ee-ff
-            ".".join(h[i:i+2] for i in range(0, 10, 2)),    # bb.cc.dd.ee.ff
-            " ".join(h[i:i+2] for i in range(0, 10, 2)),    # bb cc dd ee ff
-            h
-        ]
-    elif len(h) == 12: # Standard 12-char Full MAC
-        raw_variants = [
-            f"{h[0:4]}.{h[4:8]}.{h[8:12]}",                # 1111.1111.1111
-            ":".join(h[i:i+2] for i in range(0, 12, 2)),   # 11:11:11:11:11:11
-            ".".join(h[i:i+2] for i in range(0, 12, 2)),   # 11.11.11.11.11.11
-            f"{h[0:4]}:{h[4:8]}:{h[8:12]}",                # 1111:1111:1111
-            "-".join(h[i:i+2] for i in range(0, 12, 2)),   # 11-11-11-11-11-11
-            f"{h[0:4]}-{h[4:8]}-{h[8:12]}",                # 1111-1111-1111
-            " ".join(h[i:i+2] for i in range(0, 12, 2)),   # 11 11 11 11 11 11
-            f"{h[0:4]} {h[4:8]} {h[8:12]}",                # 1111 1111 1111
-            h                                               # 111111111111
-        ]
-    else: # 16 hex characters (EUI-64)
-        raw_variants = [
-            ":".join(h[i:i+2] for i in range(0, 16, 2)),
-            "-".join(h[i:i+2] for i in range(0, 16, 2)),
-            ".".join(h[i:i+4] for i in range(0, 16, 4)),
-            h
-        ]
-
-    # Deduplicate while preserving order
-    seen = set()
-    result = []
-    for v in raw_variants:
-        if v not in seen:
-            seen.add(v)
-            result.append(v)
-    return result
-
-
-def parse_ip_or_subnet(query: str) -> Optional[Union[ipaddress.IPv4Network, ipaddress.IPv6Network]]:
-    """
-    Parses a string into an IPv4 or IPv6 network object if it is a valid IP or CIDR subnet
-    (e.g., '1.0.0.0/8', '192.168.1.0/24', '10.1.1.1').
-    """
-    if not query:
-        return None
-    clean = query.strip()
-    try:
-        return ipaddress.ip_network(clean, strict=False)
-    except ValueError:
-        return None
-
-
-def is_ip_or_cidr_query(query: str) -> bool:
-    """Checks if query represents a valid IP or CIDR subnet."""
-    return parse_ip_or_subnet(query) is not None
-
-
-_IP_CANDIDATE_REGEX = re.compile(
-    r'(?:\b(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?:\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}(?:/\d{1,2})?\b)|'
-    r'(?:\b[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{1,4}){1,7}(?:/\d{1,3})?\b)'
-)
-
-def extract_matching_ips_in_text(target_net: Union[ipaddress.IPv4Network, ipaddress.IPv6Network], text: str) -> List[str]:
-    """
-    Finds and returns all IP addresses or subnets in the given text line that fall inside target_net.
-    """
-    if not text:
-        return []
-    
-    matched = []
-    candidates = _IP_CANDIDATE_REGEX.findall(text)
-    for cand in candidates:
-        try:
-            if "/" in cand:
-                cand_net = ipaddress.ip_network(cand, strict=False)
-                if cand_net.version == target_net.version:
-                    if cand_net.network_address in target_net and cand_net.broadcast_address in target_net:
-                        matched.append(cand)
-            else:
-                cand_ip = ipaddress.ip_address(cand)
-                if cand_ip.version == target_net.version:
-                    if cand_ip in target_net:
-                        matched.append(cand)
-        except ValueError:
-            continue
-    return matched
-
-
-def _sqlite_ip_in_network(target_net_str: str, text: str) -> int:
-    """Custom SQLite function to check if text contains any IP/subnet within target_net_str."""
-    if not target_net_str or not text:
-        return 0
-    try:
-        target_net = ipaddress.ip_network(target_net_str.strip(), strict=False)
-        matched = extract_matching_ips_in_text(target_net, text)
-        return 1 if matched else 0
     except Exception:
         return 0
 
@@ -536,7 +359,6 @@ class SearchEngine:
         conn.execute("PRAGMA synchronous=NORMAL;")
         conn.create_function("fuzzy_score", 2, _fuzzy_score)
         conn.create_function("regexp", 2, _sqlite_regexp)
-        conn.create_function("ip_in_network", 2, _sqlite_ip_in_network)
         return conn
 
     def _init_db(self):
@@ -725,11 +547,9 @@ class SearchEngine:
 
         return fts_query, (like_sql, like_params), keywords
 
-    def search(self, query_str, limit=1000, file_type="all", is_regex=False, unique_files=False, is_mac=False, is_ip=False):
+    def search(self, query_str, limit=1000, file_type="all", is_regex=False, unique_files=False):
         """
         Performs multi-stage search across all files:
-        - MAC address multi-format search (e.g. '1111.1111.1111', '11:11:11:11:11:11', etc.)
-        - IP / CIDR Subnet range containment search (e.g. '1.0.0.0/8', '192.168.1.0/24')
         - Boolean AND / OR / NOT search (e.g. 'server OR user', 'sw01 AND 10.1')
         - Regular expression pattern matching
         - File-specific filtering (e.g. 'file:switch')
@@ -774,10 +594,6 @@ class SearchEngine:
         base_filter_sql = (" AND " + " AND ".join(type_clauses)) if type_clauses else ""
         table_name = "fts_idx" if self.use_fts else "std_idx"
 
-        # Determine mode
-        is_mac_mode = is_mac or (not is_regex and not is_ip and is_mac_address(effective_query))
-        is_ip_mode = is_ip or (not is_regex and not is_mac and is_ip_or_cidr_query(effective_query))
-
         try:
             # Mode A: Regex Search
             if is_regex and effective_query:
@@ -795,102 +611,7 @@ class SearchEngine:
                     print(f"[Regex Error] {e}", file=sys.stderr)
                     results = []
 
-            # Mode B: MAC Address Multi-Format Search
-            elif is_mac_mode and effective_query:
-                match_type = "mac"
-                variants = generate_mac_variants(effective_query)
-
-                fts_clauses = [f'"{v}"' for v in variants if len(v) >= 3]
-                fts_expr = " OR ".join(fts_clauses) if fts_clauses else None
-
-                like_clauses = ["(line_text LIKE ? OR file_name LIKE ?)" for _ in variants]
-                like_sql = "(" + " OR ".join(like_clauses) + ")" if like_clauses else None
-                like_params = []
-                for v in variants:
-                    like_params.extend([f"%{v}%", f"%{v}%"])
-
-                # Stage 1: FTS5 Trigram Search across all MAC formats
-                if self.use_fts and fts_expr:
-                    try:
-                        cur.execute(f"""
-                            SELECT file_name, row_num, line_text
-                            FROM fts_idx
-                            WHERE fts_idx MATCH ?{base_filter_sql}
-                            LIMIT ?;
-                        """, (fts_expr, limit * 2))
-                        raw = cur.fetchall()
-                        results = [(r[0], r[1], r[2], 100) for r in raw]
-                    except sqlite3.Error:
-                        results = []
-
-                # Stage 2: Fast LIKE Fallback / Supplement
-                if (not results or len(results) < limit) and like_sql:
-                    try:
-                        sql_stmt = f"SELECT file_name, row_num, line_text FROM {table_name} WHERE {like_sql}{base_filter_sql} LIMIT ?;"
-                        cur.execute(sql_stmt, (*like_params, limit * 2))
-                        raw_like = cur.fetchall()
-                        existing_keys = {(r[0], r[1]) for r in results}
-                        for r in raw_like:
-                            if (r[0], r[1]) not in existing_keys:
-                                results.append((r[0], r[1], r[2], 100))
-                                existing_keys.add((r[0], r[1]))
-                    except sqlite3.Error:
-                        pass
-
-            # Mode C: IP Address & Subnet / CIDR Containment Search
-            elif is_ip_mode and effective_query:
-                match_type = "ip_subnet"
-                target_net = parse_ip_or_subnet(effective_query)
-                if target_net is not None:
-                    prefilter_clauses = []
-                    prefilter_params = []
-                    if target_net.version == 4:
-                        if target_net.prefixlen >= 24:
-                            pfx = str(target_net.network_address).rsplit('.', 1)[0] + '.'
-                            prefilter_clauses.append("line_text LIKE ?")
-                            prefilter_params.append(f"%{pfx}%")
-                        elif target_net.prefixlen >= 16:
-                            octs = str(target_net.network_address).split('.')
-                            pfx = f"{octs[0]}.{octs[1]}."
-                            prefilter_clauses.append("line_text LIKE ?")
-                            prefilter_params.append(f"%{pfx}%")
-                        elif target_net.prefixlen >= 8:
-                            octs = str(target_net.network_address).split('.')
-                            pfx = f"{octs[0]}."
-                            prefilter_clauses.append("line_text LIKE ?")
-                            prefilter_params.append(f"%{pfx}%")
-
-                    prefilter_sql = (" AND (" + " OR ".join(prefilter_clauses) + ")") if prefilter_clauses else ""
-
-                    try:
-                        sql_stmt = f"""
-                            SELECT file_name, row_num, line_text
-                            FROM {table_name}
-                            WHERE ip_in_network(?, line_text){prefilter_sql}{base_filter_sql}
-                            LIMIT ?;
-                        """
-                        cur.execute(sql_stmt, (str(target_net), *prefilter_params, limit * 2))
-                        raw_ip = cur.fetchall()
-                        results = [(r[0], r[1], r[2], 100) for r in raw_ip]
-                    except sqlite3.Error:
-                        results = []
-
-                    # Fallback without prefilter if no results and prefilter was used
-                    if not results and prefilter_clauses:
-                        try:
-                            sql_stmt = f"""
-                                SELECT file_name, row_num, line_text
-                                FROM {table_name}
-                                WHERE ip_in_network(?, line_text){base_filter_sql}
-                                LIMIT ?;
-                            """
-                            cur.execute(sql_stmt, (str(target_net), limit * 2))
-                            raw_ip = cur.fetchall()
-                            results = [(r[0], r[1], r[2], 100) for r in raw_ip]
-                        except sqlite3.Error:
-                            pass
-
-            # Mode D: Boolean & Multi-Token Search
+            # Mode B: Boolean & Multi-Token Search
             elif effective_query:
                 fts_expr, (like_sql, like_params), keywords = self._parse_boolean_query_sql(effective_query)
                 is_phrase = effective_query.startswith('"') and effective_query.endswith('"') and len(effective_query) >= 2
@@ -1453,14 +1174,6 @@ if HAS_TKINTER:
             btn_chip_quote.pack(side="left", padx=2)
             ToolTip(btn_chip_quote, 'Click to insert exact phrase quotes: matches word sequence verbatim (e.g. "Vlan 100")')
 
-            btn_chip_ip = ttk.Button(hints_bar, text="🌐 Subnet", width=9, command=lambda: insert_syntax_sample("1.0.0.0/8"))
-            btn_chip_ip.pack(side="left", padx=2)
-            ToolTip(btn_chip_ip, "Click to insert IP Subnet/CIDR search: matches any IP or subnet inside the range (e.g. '1.0.0.0/8' or '192.168.1.0/24')")
-
-            btn_chip_mac = ttk.Button(hints_bar, text="🏷️ MAC", width=8, command=lambda: insert_syntax_sample("1111.1111.1111"))
-            btn_chip_mac.pack(side="left", padx=2)
-            ToolTip(btn_chip_mac, "Click to insert MAC search: automatically searches all 9 notation formats (1111.1111.1111, 11:11:11:11:11:11, etc.)")
-
             btn_chip_file = ttk.Button(hints_bar, text="file:filter", width=9, command=lambda: insert_syntax_sample("file:log"))
             btn_chip_file.pack(side="left", padx=2)
             ToolTip(btn_chip_file, "Click to insert file filter: restricts results to files matching pattern (e.g. 'file:inventory')")
@@ -1617,16 +1330,6 @@ if HAS_TKINTER:
             self.txt_detail.insert(tk.END, "Query Syntax Examples:\n", "guide_h2")
 
             self.txt_detail.insert(tk.END, "  • ")
-            self.txt_detail.insert(tk.END, "IP / Subnet:    ", "guide_tag")
-            self.txt_detail.insert(tk.END, "  1.0.0.0/8  or  192.168.1.0/24", "guide_code")
-            self.txt_detail.insert(tk.END, "  ➔ Matches all IP addresses / subnets contained inside the range\n")
-
-            self.txt_detail.insert(tk.END, "  • ")
-            self.txt_detail.insert(tk.END, "MAC Address:    ", "guide_tag")
-            self.txt_detail.insert(tk.END, "  1111.1111.1111  or  11:11:11:11:11:11", "guide_code")
-            self.txt_detail.insert(tk.END, "  ➔ Automatically searches all 9 MAC formats in DB (., :, -, spaces, flat)\n")
-
-            self.txt_detail.insert(tk.END, "  • ")
             self.txt_detail.insert(tk.END, "AND Search:     ", "guide_tag")
             self.txt_detail.insert(tk.END, "  sw01 AND vlan10", "guide_code")
             self.txt_detail.insert(tk.END, "  ➔ Matches rows containing both keywords\n")
@@ -1679,18 +1382,6 @@ if HAS_TKINTER:
                 self.txt_detail.insert(tk.END, " Your query looks like a regular expression pattern. Try checking ")
                 self.txt_detail.insert(tk.END, "'Regex Mode'", "guide_code")
                 self.txt_detail.insert(tk.END, " above.\n")
-
-            # Check if query looks like MAC
-            if is_mac_address(query):
-                self.txt_detail.insert(tk.END, "  • ")
-                self.txt_detail.insert(tk.END, "MAC Search:     ", "guide_tag")
-                self.txt_detail.insert(tk.END, f" Searched all 9 notation variants for MAC '{query}'. Ensure the target files contain this MAC address.\n")
-
-            # Check if query looks like IP/CIDR
-            if is_ip_or_cidr_query(query):
-                self.txt_detail.insert(tk.END, "  • ")
-                self.txt_detail.insert(tk.END, "Subnet Search:  ", "guide_tag")
-                self.txt_detail.insert(tk.END, f" Searched for any IP address or subnet inside '{query}'. Check if the IP range covers your target.\n")
 
             # Check if query uses quotes
             if '"' in query:
@@ -1756,8 +1447,6 @@ if HAS_TKINTER:
 
             content_sections = [
                 ("1. ADVANCED QUERY SYNTAX", [
-                    ("IP Subnet Search", "1.0.0.0/8 (or '192.168.1.0/24')", "Searches and matches any IP or subnet contained inside the CIDR range."),
-                    ("MAC Address Search", "1111.1111.1111 (or 11:11:11:11:11:11)", "Searches all 9 formats (Cisco, IEEE colon, dot, hyphen, space, flat raw hex)."),
                     ("AND Operator", "server AND prod (or 'server && prod')", "Matches rows that contain ALL specified terms."),
                     ("OR Operator", "sw01 OR sw02 (or 'sw01 | sw02')", "Matches rows that contain AT LEAST ONE of the terms."),
                     ("Exact Phrases", '"GigabitEthernet 0/1"', "Surround in quotes to match exact words with spaces."),
@@ -1978,16 +1667,7 @@ if HAS_TKINTER:
 
             count = len(results)
             limit_notice = " (showing top 1000)" if count >= 1000 else ""
-            if match_type == "regex":
-                tag = " (Regex Matches)"
-            elif match_type == "mac":
-                tag = " (MAC Address Matches - All Formats)"
-            elif match_type == "ip_subnet":
-                tag = " (IP / Subnet Containment Matches)"
-            elif match_type == "fuzzy":
-                tag = " (Fuzzy Matches)"
-            else:
-                tag = ""
+            tag = " (Regex Matches)" if match_type == "regex" else (" (Fuzzy Matches)" if match_type == "fuzzy" else "")
             uniq_tag = " (1 Match/File)" if self.unique_var.get() else ""
             self.lbl_status.config(text=f"Found {count} match(es){tag}{uniq_tag}{limit_notice} in {elapsed_ms:.1f} ms for '{query}'")
 
@@ -2017,37 +1697,7 @@ if HAS_TKINTER:
                     pass
                 return
 
-            # Case B: MAC Address Highlighting (highlight all matched MAC formats)
-            if match_type == "mac" or is_mac_address(query):
-                variants = generate_mac_variants(query)
-                for v in variants:
-                    start_pos = "1.0"
-                    while True:
-                        start_pos = self.txt_detail.search(v, start_pos, stopindex=tk.END, nocase=True)
-                        if not start_pos:
-                            break
-                        end_pos = f"{start_pos}+{len(v)}c"
-                        self.txt_detail.tag_add("match_query", start_pos, end_pos)
-                        start_pos = end_pos
-                return
-
-            # Case C: IP / Subnet Range Highlighting
-            if match_type == "ip_subnet" or is_ip_or_cidr_query(query):
-                target_net = parse_ip_or_subnet(query)
-                if target_net:
-                    matched_ips = extract_matching_ips_in_text(target_net, full_text)
-                    for mip in matched_ips:
-                        start_pos = "1.0"
-                        while True:
-                            start_pos = self.txt_detail.search(mip, start_pos, stopindex=tk.END, nocase=False)
-                            if not start_pos:
-                                break
-                            end_pos = f"{start_pos}+{len(mip)}c"
-                            self.txt_detail.tag_add("match_query", start_pos, end_pos)
-                            start_pos = end_pos
-                    return
-
-            # Case D: Fuzzy Search Highlighting
+            # Case B: Fuzzy Search Highlighting
             if match_type == "fuzzy":
                 fuzzy_words = get_fuzzy_matched_words(query, full_text)
                 for fword in fuzzy_words:
@@ -2061,7 +1711,7 @@ if HAS_TKINTER:
                         start_pos = end_pos
                 return
 
-            # Case E: Exact / Multi-token / Boolean Search Highlighting
+            # Case C: Exact / Multi-token / Boolean Search Highlighting
             keywords = extract_search_keywords(query)
             for kw in keywords:
                 if not kw:
@@ -2300,24 +1950,6 @@ def colorize_cli_match(text: str, query: str, match_type: str, is_regex: bool) -
         except Exception:
             return text
 
-    if match_type == "mac" or is_mac_address(query):
-        variants = generate_mac_variants(query)
-        result = text
-        for v in variants:
-            pat = re.escape(v)
-            result = re.sub(f"({pat})", r"\033[1;93;1m\1\033[0m", result, flags=re.IGNORECASE)
-        return result
-
-    if match_type == "ip_subnet" or is_ip_or_cidr_query(query):
-        target_net = parse_ip_or_subnet(query)
-        if target_net:
-            matched_ips = extract_matching_ips_in_text(target_net, text)
-            result = text
-            for mip in matched_ips:
-                pat = re.escape(mip)
-                result = re.sub(f"({pat})", r"\033[1;93;1m\1\033[0m", result)
-            return result
-
     if match_type == "fuzzy":
         fwords = get_fuzzy_matched_words(query, text)
         result = text
@@ -2383,16 +2015,7 @@ def run_interactive_cli(stdscr, content_dir=DEFAULT_CONTENT_DIR):
             sel_score = results[selected_idx][3]
             type_str = f" [Score: {sel_score}%]"
         else:
-            if match_type == "regex":
-                type_str = " (Regex)"
-            elif match_type == "mac":
-                type_str = " (MAC Formats)"
-            elif match_type == "ip_subnet":
-                type_str = " (IP/Subnet)"
-            elif match_type == "fuzzy":
-                type_str = " (Fuzzy)"
-            else:
-                type_str = ""
+            type_str = " (Regex)" if match_type == "regex" else (" (Fuzzy)" if match_type == "fuzzy" else "")
 
         info_str = f" Matches: {len(results)}{type_str}{reg_label}{uniq_label} | Time: {elapsed_ms:.1f}ms | Filter: {mode_label} [Tab/f] | {idx_str} "
         stdscr.addstr(3, 2, info_str[:max_x - 4], getattr(curses, 'A_DIM', curses.A_NORMAL))
@@ -2508,7 +2131,7 @@ def run_interactive_cli(stdscr, content_dir=DEFAULT_CONTENT_DIR):
             selected_idx = 0
 
 
-def run_interactive_repl(content_dir=DEFAULT_CONTENT_DIR, file_type="all", unique_files=False, is_mac=False, is_ip=False):
+def run_interactive_repl(content_dir=DEFAULT_CONTENT_DIR, file_type="all", unique_files=False):
     """Continuous REPL prompt for terminal users without curses."""
     engine = SearchEngine(content_dir=content_dir)
     indexer = BackgroundIndexer(engine, content_dir=content_dir)
@@ -2522,30 +2145,20 @@ def run_interactive_repl(content_dir=DEFAULT_CONTENT_DIR, file_type="all", uniqu
     print(f"  🔍 QSearch Interactive CLI REPL (Directory: {content_dir})")
     print(f"  📊 Index: {fc} files ({rc:,} rows) | Last DB Sync: {update_t}")
     print(f"  📁 Last Scan: {scan_t} ({format_relative_time(l_scan)})")
-    print("  Commands: :help | :info | :filter [csv|text|all] | :mac | :ip | :regex | :unique | :open <row> | :quit")
-    print("  Syntax:   1.0.0.0/8 | 1111.1111.1111 | server AND prod | word1 OR word2 | file:name")
+    print("  Commands: :help | :info | :filter [csv|text|all] | :regex | :unique | :open <row> | :quit")
+    print("  Syntax:   keyword1 AND keyword2 | word1 OR word2 | \"phrase\" | file:name")
     print("=" * 75)
 
     last_results = []
     current_ftype = file_type
-    regex_mode = False
-    unique_mode = unique_files
-    mac_mode = is_mac
-    ip_mode = is_ip
+    is_regex = False
+    is_unique = unique_files
 
     while True:
         try:
-            flags = []
-            if regex_mode:
-                flags.append("Regex")
-            if mac_mode:
-                flags.append("MAC")
-            if ip_mode:
-                flags.append("IP")
-            if unique_mode:
-                flags.append("Unique")
-            flag_str = f" [{', '.join(flags)}]" if flags else ""
-            cmd = input(f"\nqs ({current_ftype}){flag_str}> ").strip()
+            reg_status = " [Regex]" if is_regex else ""
+            uniq_status = " [Unique]" if is_unique else ""
+            cmd = input(f"\nqs ({current_ftype}){reg_status}{uniq_status}> ").strip()
         except (EOFError, KeyboardInterrupt):
             print("\nExiting QSearch.")
             break
@@ -2565,15 +2178,11 @@ def run_interactive_repl(content_dir=DEFAULT_CONTENT_DIR, file_type="all", uniqu
             print("\n📖 QSearch CLI REPL Commands & Query Syntax:")
             print("  :info / :stats          Show database sync & filesystem scan timestamps")
             print("  :filter [csv|text|all]  Change active file filter")
-            print("  :mac                    Toggle forced MAC address search mode")
-            print("  :ip                     Toggle forced IP / Subnet search mode")
             print("  :regex                  Toggle regular expression search mode")
             print("  :unique / :u            Toggle unique files mode (1 match per file)")
             print("  :open <num>             Open matched file in default application")
             print("  :quit / :q / exit       Exit QSearch")
             print("\n💡 Search Syntax Examples:")
-            print("  • IP Subnet:     1.0.0.0/8             (matches any IP/subnet inside 1.0.0.0/8)")
-            print("  • MAC Address:   1111.1111.1111        (searches all 9 formats: ., :, -, space, flat)")
             print("  • AND Search:    server AND prod       (requires both terms)")
             print("  • OR Search:     vlan10 OR vlan20      (matches either term)")
             print("  • Exact Phrase:  \"GigabitEthernet\"     (matches verbatim)")
@@ -2583,30 +2192,13 @@ def run_interactive_repl(content_dir=DEFAULT_CONTENT_DIR, file_type="all", uniqu
             continue
         if cmd in (":quit", ":q", "exit", "quit"):
             break
-        if cmd == ":mac":
-            mac_mode = not mac_mode
-            if mac_mode:
-                ip_mode = False
-                regex_mode = False
-            print(f"[MAC address mode: {'ON' if mac_mode else 'OFF'}]")
-            continue
-        if cmd == ":ip":
-            ip_mode = not ip_mode
-            if ip_mode:
-                mac_mode = False
-                regex_mode = False
-            print(f"[IP / Subnet mode: {'ON' if ip_mode else 'OFF'}]")
-            continue
         if cmd == ":regex":
-            regex_mode = not regex_mode
-            if regex_mode:
-                mac_mode = False
-                ip_mode = False
-            print(f"[Regex mode: {'ON' if regex_mode else 'OFF'}]")
+            is_regex = not is_regex
+            print(f"[Regex mode: {'ON' if is_regex else 'OFF'}]")
             continue
         if cmd in (":unique", ":u"):
-            unique_mode = not unique_mode
-            print(f"[Unique files mode: {'ON (1 match/file)' if unique_mode else 'OFF (all matches)'}]")
+            is_unique = not is_unique
+            print(f"[Unique files mode: {'ON (1 match/file)' if is_unique else 'OFF (all matches)'}]")
             continue
         if cmd.startswith(":filter") or cmd.startswith(":f"):
             parts = cmd.split()
@@ -2627,58 +2219,32 @@ def run_interactive_repl(content_dir=DEFAULT_CONTENT_DIR, file_type="all", uniqu
                     print("Invalid result index.")
             continue
 
-        results, elapsed_ms, match_type = engine.search(
-            cmd,
-            limit=500,
-            file_type=current_ftype,
-            is_regex=regex_mode,
-            unique_files=unique_mode,
-            is_mac=mac_mode,
-            is_ip=ip_mode
-        )
+        results, elapsed_ms, match_type = engine.search(cmd, limit=500, file_type=current_ftype, is_regex=is_regex, unique_files=is_unique)
         last_results = results
 
-        if match_type == "regex":
-            tag_str = " (Regex)"
-        elif match_type == "mac":
-            tag_str = " (MAC Formats)"
-        elif match_type == "ip_subnet":
-            tag_str = " (IP / Subnet)"
-        elif match_type == "fuzzy":
-            tag_str = " (Fuzzy)"
-        else:
-            tag_str = ""
-
-        uniq_tag = " (Unique Files)" if unique_mode else ""
+        tag_str = " (Regex)" if match_type == "regex" else (" (Fuzzy)" if match_type == "fuzzy" else "")
+        uniq_tag = " (Unique Files)" if is_unique else ""
         print(f"\n🔍 Found {len(results)} match(es){tag_str}{uniq_tag} in {elapsed_ms:.1f} ms:")
         print("─" * 70)
         if not results:
             print("No matches found.")
         else:
             for i, (fname, rnum, ltext, score) in enumerate(results[:25], 1):
-                highlighted_text = colorize_cli_match(ltext, cmd, match_type, regex_mode)
+                highlighted_text = colorize_cli_match(ltext, cmd, match_type, is_regex)
                 print(f"[\033[1;32m{score}%\033[0m] [{i}] \033[1;34m{fname}\033[0m:L\033[33m{rnum}\033[0m ➔ {highlighted_text}")
             if len(results) > 25:
                 print(f"... and {len(results) - 25} more matches.")
         print("─" * 70)
 
 
-def run_direct_cli_search(query, content_dir=DEFAULT_CONTENT_DIR, file_type="all", is_regex=False, unique_files=False, is_mac=False, is_ip=False, output_format="text", csv_out_path=None):
+def run_direct_cli_search(query, content_dir=DEFAULT_CONTENT_DIR, file_type="all", is_regex=False, unique_files=False, output_format="text", csv_out_path=None):
     """Executes single search query directly from terminal arguments with front percentage & keyword highlighting."""
     engine = SearchEngine(content_dir=content_dir)
 
     indexer = BackgroundIndexer(engine, content_dir=content_dir)
     indexer.sync_content_directory()
 
-    results, elapsed_ms, match_type = engine.search(
-        query,
-        limit=1000,
-        file_type=file_type,
-        is_regex=is_regex,
-        unique_files=unique_files,
-        is_mac=is_mac,
-        is_ip=is_ip
-    )
+    results, elapsed_ms, match_type = engine.search(query, limit=1000, file_type=file_type, is_regex=is_regex, unique_files=unique_files)
 
     # Format 1: JSON Output
     if output_format == "json":
@@ -2716,17 +2282,7 @@ def run_direct_cli_search(query, content_dir=DEFAULT_CONTENT_DIR, file_type="all
         return
 
     # Format 3: Standard Formatted Terminal Output with Front Score & Bold Highlights
-    if match_type == "regex":
-        tag_str = " (Regex Matches)"
-    elif match_type == "mac":
-        tag_str = " (MAC Address Matches - All Formats)"
-    elif match_type == "ip_subnet":
-        tag_str = " (IP / Subnet Containment Matches)"
-    elif match_type == "fuzzy":
-        tag_str = " (Fuzzy Matches)"
-    else:
-        tag_str = ""
-
+    tag_str = " (Regex Matches)" if match_type == "regex" else (" (Fuzzy Matches)" if match_type == "fuzzy" else "")
     uniq_tag = " (Unique Files Only)" if unique_files else ""
     print(f"\n🔍 QSearch Results for '{query}' ({len(results)} matched{tag_str}{uniq_tag} in {elapsed_ms:.1f} ms):\n" + "─" * 70)
     if not results:
@@ -2747,13 +2303,11 @@ def run_direct_cli_search(query, content_dir=DEFAULT_CONTENT_DIR, file_type="all
 
 def main():
     parser = argparse.ArgumentParser(description="QSearch - Instant CSV & Text Search Engine")
-    parser.add_argument("query", nargs="*", help="Search query keywords, MAC address (all formats), CIDR subnet (e.g. 1.0.0.0/8), or Regex")
+    parser.add_argument("query", nargs="*", help="Search query keywords or pattern (supports 'AND', 'OR', Regex)")
     parser.add_argument("-d", "--dir", dest="dir", default=DEFAULT_CONTENT_DIR, help="Target directory to index and search")
     parser.add_argument("-c", "--csv", action="store_true", help="Search only CSV files")
     parser.add_argument("-t", "--text", action="store_true", help="Search only non-CSV text files (.txt, .log, etc.)")
     parser.add_argument("-a", "--all", action="store_true", help="Search all indexed text and CSV files (default)")
-    parser.add_argument("-m", "--mac", action="store_true", help="Force MAC address search across all formats (1111.1111.1111, 11:11:11:11:11:11, etc.)")
-    parser.add_argument("-i", "--ip", "--net", dest="ip", action="store_true", help="Force IP / Subnet search matching all IPs/subnets inside CIDR range (e.g. 1.0.0.0/8)")
     parser.add_argument("-r", "--regex", action="store_true", help="Enable regular expression matching")
     parser.add_argument("-u", "--unique", action="store_true", help="Show each matching file only once (1 match per file)")
     parser.add_argument("--json", action="store_true", help="Output results in JSON format")
@@ -2782,8 +2336,6 @@ def main():
             file_type=file_type,
             is_regex=args.regex,
             unique_files=args.unique,
-            is_mac=args.mac,
-            is_ip=args.ip,
             output_format=out_fmt,
             csv_out_path=args.csv_out
         )
@@ -2791,7 +2343,7 @@ def main():
 
     # Case 2: REPL prompt
     if args.repl:
-        run_interactive_repl(content_dir=content_dir, file_type=file_type, unique_files=args.unique, is_mac=args.mac, is_ip=args.ip)
+        run_interactive_repl(content_dir=content_dir, file_type=file_type, unique_files=args.unique)
         return
 
     # Case 3: GUI Mode
@@ -2802,8 +2354,6 @@ def main():
             app = QSearchGUIApp(root, initial_dir=content_dir)
             if args.unique:
                 app.unique_var.set(True)
-            if args.regex:
-                app.regex_var.set(True)
             root.update_idletasks()
             root.lift()
             gui_launched = True
@@ -2819,7 +2369,7 @@ def main():
             except KeyboardInterrupt:
                 sys.exit(0)
         else:
-            run_interactive_repl(content_dir=content_dir, file_type=file_type, unique_files=args.unique, is_mac=args.mac, is_ip=args.ip)
+            run_interactive_repl(content_dir=content_dir, file_type=file_type, unique_files=args.unique)
 
 
 if __name__ == "__main__":
