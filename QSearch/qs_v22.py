@@ -344,22 +344,13 @@ def extract_search_keywords(raw_query: str) -> List[str]:
     phrases = re.findall(r'"([^"]+)"', clean_q)
     unquoted = re.sub(r'"[^"]+"', ' ', clean_q)
 
-    # Extract unquoted words, dropping operators and the term(s) excluded by NOT
+    # Extract unquoted words
     tokens = []
-    negate_next = False
     for token in re.split(r'[\s|,;]+', unquoted):
         token_clean = token.strip().strip("()").strip()
         if not token_clean:
             continue
-        upper = token_clean.upper()
-        if upper == "NOT":
-            negate_next = True
-            continue
-        if upper in ("AND", "OR", "&&", "||", "|", "&"):
-            negate_next = False
-            continue
-        if negate_next:
-            negate_next = False
+        if token_clean.upper() in ("AND", "OR", "NOT", "&&", "||", "|", "&"):
             continue
         tokens.append(token_clean)
 
@@ -704,68 +695,34 @@ class SearchEngine:
         - FTS5 MATCH expression
         - Standard SQL LIKE WHERE expression
         - List of extracted keywords (for highlighting)
-
-        'NOT <term>' excludes rows containing <term> instead of being folded
-        into the AND clause like a normal included term.
         """
         keywords = extract_search_keywords(query_str)
+        if not keywords:
+            return None, (None, []), []
 
         # Split into OR branches
         or_parts = re.split(r'\s+(?:OR|or|\|)\s+', query_str)
-
+        
         fts_or_clauses = []
         like_or_clauses = []
         like_params = []
 
         for or_branch in or_parts:
-            raw_tokens = [t for t in re.split(r'\s+', or_branch.strip()) if t]
-
-            positive_terms = []
-            negative_terms = []
-            negate_next = False
-            for tok in raw_tokens:
-                t_clean = tok.strip('"').strip("'")
-                upper = t_clean.upper()
-                if upper in ("AND", "&&", "&"):
-                    continue
-                if upper == "NOT":
-                    negate_next = True
-                    continue
-                if upper == "OR":
-                    negate_next = False
-                    continue
-                if not t_clean or t_clean.lower().startswith(("file:", "f:")):
-                    negate_next = False
-                    continue
-                if negate_next:
-                    negative_terms.append(t_clean)
-                else:
-                    positive_terms.append(t_clean)
-                negate_next = False
-
-            if not positive_terms and not negative_terms:
+            and_tokens = [t.strip().strip('"').strip("'") for t in re.split(r'\s+(?:AND|and|&&|&)\s+|\s+', or_branch) if t.strip()]
+            valid_and = [t for t in and_tokens if t.upper() not in ("AND", "OR", "NOT", "&&", "||", "|", "&") and not t.lower().startswith(("file:", "f:"))]
+            
+            if not valid_and:
                 continue
 
-            # FTS clause for this branch (FTS5 needs at least one positive
-            # term to anchor a NOT; a branch with only negative terms can't
-            # be expressed in FTS5 and is left to the LIKE stage instead)
-            if positive_terms:
-                fts_tokens_branch = [f'"{t.replace(chr(34), chr(34) * 2)}"' for t in positive_terms if len(t) >= 3]
-                fts_negative_branch = [f'"{t.replace(chr(34), chr(34) * 2)}"' for t in negative_terms if len(t) >= 3]
-                if fts_tokens_branch:
-                    branch_fts = " AND ".join(fts_tokens_branch)
-                    for neg in fts_negative_branch:
-                        branch_fts += f" NOT {neg}"
-                    fts_or_clauses.append("(" + branch_fts + ")")
+            # FTS clause for this branch
+            fts_tokens_branch = [f'"{t.replace(chr(34), chr(34)*2)}"' for t in valid_and if len(t) >= 3]
+            if fts_tokens_branch:
+                fts_or_clauses.append("(" + " AND ".join(fts_tokens_branch) + ")")
 
             # LIKE clause for this branch (matching line_text OR file_name)
-            branch_likes = ["(line_text LIKE ? OR file_name LIKE ?)" for _ in positive_terms]
-            branch_likes += ["NOT (line_text LIKE ? OR file_name LIKE ?)" for _ in negative_terms]
-            if branch_likes:
-                like_or_clauses.append("(" + " AND ".join(branch_likes) + ")")
-            for t in positive_terms:
-                like_params.extend([f"%{t}%", f"%{t}%"])
-            for t in negative_terms:
+            branch_likes = ["(line_text LIKE ? OR file_name LIKE ?)" for _ in valid_and]
+            like_or_clauses.append("(" + " AND ".join(branch_likes) + ")")
+            for t in valid_and:
                 like_params.extend([f"%{t}%", f"%{t}%"])
 
         fts_query = " OR ".join(fts_or_clauses) if fts_or_clauses else None
