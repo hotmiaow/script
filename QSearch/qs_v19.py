@@ -1583,26 +1583,14 @@ if HAS_TKINTER:
             )
             lbl_strip.pack(side="left")
 
-            # Status bar with Real-Time Dynamic Action Colors
-            self.status_frame = tk.Frame(self.root, bg="#F1F5F9", pady=4, padx=10, relief="solid", bd=1, highlightthickness=1, highlightbackground="#CBD5E1")
+            # Status bar
+            self.status_frame = ttk.Frame(self.root, padding=6, relief="groove")
             self.status_frame.pack(side="bottom", fill="x")
 
-            self.lbl_status = tk.Label(
-                self.status_frame,
-                text="🔍 Ready | Type keywords, MAC address (full/last 4), or Subnet (1.0.0.0/8) to search",
-                font=("Helvetica", 9, "bold"),
-                bg="#F1F5F9",
-                fg="#475569"
-            )
+            self.lbl_status = ttk.Label(self.status_frame, text="Ready | Supports 'AND', 'OR', Regex, Fuzzy, and Unique Files search...", font=("Helvetica", 9))
             self.lbl_status.pack(side="left", padx=5)
 
-            self.lbl_index_stats = tk.Label(
-                self.status_frame,
-                text="Index: 0 files (0 rows)",
-                font=("Helvetica", 9),
-                bg="#F1F5F9",
-                fg="#64748B"
-            )
+            self.lbl_index_stats = ttk.Label(self.status_frame, text="Index: 0 files (0 rows)", font=("Helvetica", 9), foreground="#666666")
             self.lbl_index_stats.pack(side="right", padx=5)
 
         def _toggle_regex_mode(self):
@@ -1850,7 +1838,7 @@ if HAS_TKINTER:
                 self.content_dir = Path(path).resolve()
                 self.lbl_folder_path.config(text=str(self.content_dir))
                 self.indexer.update_content_dir(self.content_dir)
-                self._set_action_status("indexing", f"🔄 Switched directory to: {self.content_dir}. Re-indexing...")
+                self.lbl_status.config(text=f"Switched directory to: {self.content_dir}. Re-indexing...")
                 threading.Thread(target=self.indexer.sync_content_directory, daemon=True).start()
 
         def _poll_queue(self):
@@ -1880,11 +1868,13 @@ if HAS_TKINTER:
 
             if is_indexing and files_left > 0:
                 self.lbl_index_stats.config(
-                    text=f"⚡ Indexing: {percent}% ({files_left} left) | {file_cnt} files ({row_cnt:,} rows)"
+                    text=f"⚡ Indexing: {percent}% ({files_left} left) | {file_cnt} files ({row_cnt:,} rows)",
+                    foreground="#D97706"
                 )
             else:
                 self.lbl_index_stats.config(
-                    text=f"Files: {file_cnt} ({row_cnt:,} rows) | DB Updated: {update_str} ({update_rel}) | Scanned: {scan_str} ({scan_rel})"
+                    text=f"Files: {file_cnt} ({row_cnt:,} rows) | DB Updated: {update_str} ({update_rel}) | Scanned: {scan_str} ({scan_rel})",
+                    foreground="#475569"
                 )
 
             # Update tooltip with full date/time details
@@ -1900,48 +1890,13 @@ if HAS_TKINTER:
                 f"• Watched Directory: {self.content_dir}"
             )
 
-            if is_indexing and files_left > 0 and not self.search_var.get().strip():
-                self._set_action_status("indexing", f"🔄 Background Indexing: {percent}% ({files_left} files left)...")
-
-        def _set_action_status(self, state: str, message: str):
-            """
-            Updates the bottom status bar with real-time dynamic action status and color patterns:
-            - 'typing': Amber / Warm Yellow (waiting for user to finish typing)
-            - 'searching': Blue / Cyan (executing search query in database)
-            - 'success': Emerald Green (matches found / active selection)
-            - 'no_results': Rose / Soft Red (no matches found)
-            - 'indexing': Golden Yellow (background indexing)
-            - 'ready': Slate / Neutral (idle ready)
-            """
-            styles = {
-                "typing": {"bg": "#FEF3C7", "fg": "#92400E", "border": "#FCD34D", "stats_fg": "#B45309"},
-                "searching": {"bg": "#DBEAFE", "fg": "#1E40AF", "border": "#93C5FD", "stats_fg": "#1D4ED8"},
-                "success": {"bg": "#D1FAE5", "fg": "#065F46", "border": "#6EE7B7", "stats_fg": "#047857"},
-                "no_results": {"bg": "#FEE2E2", "fg": "#991B1B", "border": "#FCA5A5", "stats_fg": "#B91C1C"},
-                "indexing": {"bg": "#FEF9C3", "fg": "#854D0E", "border": "#FDE047", "stats_fg": "#A16207"},
-                "ready": {"bg": "#F1F5F9", "fg": "#475569", "border": "#CBD5E1", "stats_fg": "#64748B"},
-            }
-            theme = styles.get(state, styles["ready"])
-            try:
-                self.status_frame.config(bg=theme["bg"], highlightbackground=theme["border"], highlightcolor=theme["border"])
-                self.lbl_status.config(text=message, bg=theme["bg"], fg=theme["fg"])
-                self.lbl_index_stats.config(bg=theme["bg"], fg=theme["stats_fg"])
-            except Exception:
-                pass
-
         def _on_key_release(self, event):
             if event.keysym in ("Up", "Down", "Left", "Right", "Return", "Escape", "Control_L", "Control_R", "F1"):
                 return
             if self._debounce_job:
                 self.root.after_cancel(self._debounce_job)
 
-            q = self.search_var.get().strip()
-            if q:
-                self._set_action_status("typing", f"⏳ Pending user to finish typing... ('{q}')")
-            else:
-                self._set_action_status("ready", "🔍 Ready | Type keywords, MAC address (full/last 4), or Subnet (1.0.0.0/8) to search")
-
-            q_len = len(q)
+            q_len = len(self.search_var.get().strip())
             delay_ms = 180 if q_len < 3 else 90
             self._debounce_job = self.root.after(delay_ms, self._perform_search)
 
@@ -1974,7 +1929,6 @@ if HAS_TKINTER:
                 self._render_welcome_guide()
                 self._current_results = []
                 self.lbl_status.config(text="Ready | Type keywords or click quick syntax chips above...")
-                self._set_action_status("ready", "🔍 Ready | Type keywords, MAC address (full/last 4), or Subnet (1.0.0.0/8) to search")
                 self.btn_load_full.pack_forget()
                 return
 
@@ -1994,7 +1948,6 @@ if HAS_TKINTER:
                 current_counter = self._search_counter
 
             self.lbl_status.config(text=f"Searching for '{query}'...")
-            self._set_action_status("searching", f"⚡ Searching database for '{query}'...")
 
             def search_worker(q, ftype, regex_flag, unique_flag, counter):
                 results, elapsed_ms, match_type = self.engine.search(q, limit=1000, file_type=ftype, is_regex=regex_flag, unique_files=unique_flag)
@@ -2013,7 +1966,6 @@ if HAS_TKINTER:
                 filter_mode = self.filter_var.get() if hasattr(self, 'filter_var') else "All Indexed Files"
                 self._render_no_results_hints(query, self.regex_var.get(), filter_mode)
                 self.lbl_status.config(text=f"No matches found for '{query}' in {elapsed_ms:.1f} ms. See troubleshooting hints below.")
-                self._set_action_status("no_results", f"⚠️ No matches found for '{query}' ({elapsed_ms:.1f} ms)")
                 return
 
             self.txt_detail.config(state="normal")
@@ -2038,7 +1990,6 @@ if HAS_TKINTER:
                 tag = ""
             uniq_tag = " (1 Match/File)" if self.unique_var.get() else ""
             self.lbl_status.config(text=f"Found {count} match(es){tag}{uniq_tag}{limit_notice} in {elapsed_ms:.1f} ms for '{query}'")
-            self._set_action_status("success", f"✅ Found {count} match(es){tag}{uniq_tag} in {elapsed_ms:.1f} ms")
 
             children = self.tree.get_children()
             if children:
@@ -2184,7 +2135,6 @@ if HAS_TKINTER:
 
                         if score < 100:
                             self.lbl_status.config(text=f"Match Score: {score}% | {fname}:L{rnum} | Modified: {mod_str} ({mod_rel})")
-                        self._set_action_status("success", f"📄 Selected: {fname} (Line #{rnum}) | Score: {score}%")
                 except Exception as e:
                     print(f"[Select Error] {e}", file=sys.stderr)
 
@@ -2272,14 +2222,14 @@ if HAS_TKINTER:
                 content = item["values"][2]
                 self.root.clipboard_clear()
                 self.root.clipboard_append(str(content))
-                self._set_action_status("success", "📋 Copied row content to clipboard!")
+                self.lbl_status.config(text="Copied row content to clipboard!")
 
         def _copy_detail_text(self):
             content = self.txt_detail.get("1.0", "end-1c").strip()
             if content:
                 self.root.clipboard_clear()
                 self.root.clipboard_append(content)
-                self._set_action_status("success", "📑 Copied column breakdown to clipboard!")
+                self.lbl_status.config(text="Copied column breakdown to clipboard!")
 
         def _open_selected_file(self):
             selected = self.tree.selection()
@@ -2295,7 +2245,6 @@ if HAS_TKINTER:
 
         def _clear_search(self):
             self.search_var.set("")
-            self._set_action_status("ready", "🔍 Ready | Type keywords, MAC address (full/last 4), or Subnet (1.0.0.0/8) to search")
             self._perform_search()
             self.search_entry.focus_set()
 
@@ -2332,7 +2281,7 @@ if HAS_TKINTER:
                         writer.writerow([f"{score}%", fname, rnum, ltext])
 
                 filename_only = os.path.basename(file_path)
-                self._set_action_status("success", f"💾 Successfully saved {len(self._current_results)} results to '{filename_only}'")
+                self.lbl_status.config(text=f"Successfully saved {len(self._current_results)} results to '{filename_only}'")
                 messagebox.showinfo("Save Complete", f"Successfully saved {len(self._current_results)} search results to:\n{file_path}")
             except Exception as e:
                 messagebox.showerror("Save Error", f"Failed to save results:\n{e}")
