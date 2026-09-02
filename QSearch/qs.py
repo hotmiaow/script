@@ -277,8 +277,13 @@ def parse_ip_or_subnet(query: str) -> Optional[Union[ipaddress.IPv4Network, ipad
 
 
 def is_ip_or_cidr_query(query: str) -> bool:
-    """Checks if query represents a valid IP or CIDR subnet."""
-    return parse_ip_or_subnet(query) is not None
+    """Checks if query represents a valid CIDR subnet containing a prefix slash (e.g. '1.0.0.0/8', '192.168.1.0/24')."""
+    if not query:
+        return False
+    q = query.strip()
+    if "/" in q and parse_ip_or_subnet(q) is not None:
+        return True
+    return False
 
 
 _IP_CANDIDATE_REGEX = re.compile(
@@ -774,9 +779,9 @@ class SearchEngine:
         base_filter_sql = (" AND " + " AND ".join(type_clauses)) if type_clauses else ""
         table_name = "fts_idx" if self.use_fts else "std_idx"
 
-        # Determine mode
-        is_mac_mode = is_mac or (not is_regex and not is_ip and is_mac_address(effective_query))
-        is_ip_mode = is_ip or (not is_regex and not is_mac and is_ip_or_cidr_query(effective_query))
+        # Determine mode: MAC mode only applies when is_mac is explicitly enabled
+        is_mac_mode = bool(is_mac)
+        is_ip_mode = bool(is_ip) or (not is_regex and not is_mac_mode and is_ip_or_cidr_query(effective_query))
 
         try:
             # Mode A: Regex Search
@@ -1399,9 +1404,15 @@ if HAS_TKINTER:
 
             # Regex toggle
             self.regex_var = tk.BooleanVar(value=False)
-            regex_cb = ttk.Checkbutton(search_row, text="Regex Mode", variable=self.regex_var, command=self._perform_search)
+            regex_cb = ttk.Checkbutton(search_row, text="Regex Mode", variable=self.regex_var, command=self._on_regex_toggle)
             regex_cb.pack(side="left", padx=(0, 6))
-            ToolTip(regex_cb, "Enable regular expression pattern matching (e.g. ^10\\.\\d+\\.\\d+ or (error|fail))")
+            ToolTip(regex_cb, "Enable regular expression pattern matching (e.g. ^10\\.\\d+\\.\\d+ or (error|fail)) [Ctrl+R]")
+
+            # MAC Mode toggle
+            self.mac_var = tk.BooleanVar(value=False)
+            mac_cb = ttk.Checkbutton(search_row, text="🏷️ MAC Mode", variable=self.mac_var, command=self._on_mac_toggle)
+            mac_cb.pack(side="left", padx=(0, 6))
+            ToolTip(mac_cb, "Enable dedicated MAC search mode: expands MAC address (full or last 4/6/8 characters) across all 9 notation formats (Cisco, colon, hyphen, dot, etc.) [Ctrl+M]")
 
             # Unique file toggle
             self.unique_var = tk.BooleanVar(value=False)
@@ -1457,9 +1468,9 @@ if HAS_TKINTER:
             btn_chip_ip.pack(side="left", padx=2)
             ToolTip(btn_chip_ip, "Click to insert IP Subnet/CIDR search: matches any IP or subnet inside the range (e.g. '1.0.0.0/8' or '192.168.1.0/24')")
 
-            btn_chip_mac = ttk.Button(hints_bar, text="🏷️ MAC", width=8, command=lambda: insert_syntax_sample("1111.1111.1111"))
+            btn_chip_mac = ttk.Button(hints_bar, text="🏷️ MAC Mode", width=11, command=self._toggle_mac_mode)
             btn_chip_mac.pack(side="left", padx=2)
-            ToolTip(btn_chip_mac, "Click to insert MAC search: automatically searches all 9 notation formats (1111.1111.1111, 11:11:11:11:11:11, etc.)")
+            ToolTip(btn_chip_mac, "Click to toggle dedicated MAC Address search mode on/off [Ctrl+M]")
 
             btn_chip_file = ttk.Button(hints_bar, text="file:filter", width=9, command=lambda: insert_syntax_sample("file:log"))
             btn_chip_file.pack(side="left", padx=2)
@@ -1467,7 +1478,7 @@ if HAS_TKINTER:
 
             btn_chip_regex = ttk.Button(hints_bar, text=".* Regex", width=8, command=self._toggle_regex_mode)
             btn_chip_regex.pack(side="left", padx=2)
-            ToolTip(btn_chip_regex, "Click to toggle Regex Mode on/off")
+            ToolTip(btn_chip_regex, "Click to toggle Regex Mode on/off [Ctrl+R]")
 
             btn_chip_unique = ttk.Button(hints_bar, text="📄 Unique Files", width=12, command=self._toggle_unique_mode)
             btn_chip_unique.pack(side="left", padx=2)
@@ -1562,6 +1573,8 @@ if HAS_TKINTER:
             # Global Shortcuts
             self.root.bind("<Control-f>", lambda e: self._focus_search())
             self.root.bind("<Command-f>", lambda e: self._focus_search())
+            self.root.bind("<Control-m>", lambda e: self._toggle_mac_mode())
+            self.root.bind("<Command-m>", lambda e: self._toggle_mac_mode())
             self.root.bind("<Control-u>", lambda e: self._toggle_unique_mode())
             self.root.bind("<Command-u>", lambda e: self._toggle_unique_mode())
             self.root.bind("<F1>", lambda e: self._show_help_dialog())
@@ -1577,7 +1590,7 @@ if HAS_TKINTER:
             shortcuts_strip.pack(side="bottom", fill="x")
             lbl_strip = ttk.Label(
                 shortcuts_strip,
-                text="⌨️  [Ctrl/Cmd+F] Search   [Ctrl/Cmd+U] 1 Match/File   [↑/↓] Navigate   [Enter] Open File   [Ctrl/Cmd+C] Copy Row   [Esc] Clear   [F1] Help Guide",
+                text="⌨️  [Ctrl/Cmd+F] Search   [Ctrl/Cmd+M] MAC Mode   [Ctrl/Cmd+U] 1 Match/File   [↑/↓] Navigate   [Enter] Open File   [Ctrl/Cmd+C] Copy Row   [Esc] Clear   [F1] Help Guide",
                 font=("Helvetica", 8),
                 foreground="#475569"
             )
@@ -1605,10 +1618,27 @@ if HAS_TKINTER:
             )
             self.lbl_index_stats.pack(side="right", padx=5)
 
+        def _on_regex_toggle(self):
+            """Ensures mutually clean toggling for regex mode."""
+            if self.regex_var.get():
+                self.mac_var.set(False)
+            self._perform_search()
+
+        def _on_mac_toggle(self):
+            """Ensures mutually clean toggling for MAC search mode."""
+            if self.mac_var.get():
+                self.regex_var.set(False)
+            self._perform_search()
+
+        def _toggle_mac_mode(self):
+            """Toggles MAC search mode on/off."""
+            self.mac_var.set(not self.mac_var.get())
+            self._on_mac_toggle()
+
         def _toggle_regex_mode(self):
             """Toggles regex mode checkbox and re-executes search."""
             self.regex_var.set(not self.regex_var.get())
-            self._perform_search()
+            self._on_regex_toggle()
 
         def _toggle_unique_mode(self):
             """Toggles unique file mode checkbox and re-executes search."""
@@ -1988,6 +2018,7 @@ if HAS_TKINTER:
 
             is_regex = self.regex_var.get()
             is_unique = self.unique_var.get()
+            is_mac = self.mac_var.get()
 
             with self._search_lock:
                 self._search_counter += 1
@@ -1996,11 +2027,18 @@ if HAS_TKINTER:
             self.lbl_status.config(text=f"Searching for '{query}'...")
             self._set_action_status("searching", f"⚡ Searching database for '{query}'...")
 
-            def search_worker(q, ftype, regex_flag, unique_flag, counter):
-                results, elapsed_ms, match_type = self.engine.search(q, limit=1000, file_type=ftype, is_regex=regex_flag, unique_files=unique_flag)
+            def search_worker(q, ftype, regex_flag, unique_flag, mac_flag, counter):
+                results, elapsed_ms, match_type = self.engine.search(
+                    q,
+                    limit=1000,
+                    file_type=ftype,
+                    is_regex=regex_flag,
+                    unique_files=unique_flag,
+                    is_mac=mac_flag
+                )
                 self._msg_queue.put(("search_results", (results, elapsed_ms, match_type, q, counter)))
 
-            threading.Thread(target=search_worker, args=(query, file_type, is_regex, is_unique, current_counter), daemon=True).start()
+            threading.Thread(target=search_worker, args=(query, file_type, is_regex, is_unique, is_mac, current_counter), daemon=True).start()
 
         def _apply_search_results(self, results, elapsed_ms, match_type, query):
             for item in self.tree.get_children():
@@ -2067,7 +2105,7 @@ if HAS_TKINTER:
                 return
 
             # Case B: MAC Address Highlighting (highlight all matched MAC formats)
-            if match_type == "mac" or is_mac_address(query):
+            if match_type == "mac":
                 variants = generate_mac_variants(query)
                 for v in variants:
                     start_pos = "1.0"
@@ -2081,7 +2119,7 @@ if HAS_TKINTER:
                 return
 
             # Case C: IP / Subnet Range Highlighting
-            if match_type == "ip_subnet" or is_ip_or_cidr_query(query):
+            if match_type == "ip_subnet":
                 target_net = parse_ip_or_subnet(query)
                 if target_net:
                     matched_ips = extract_matching_ips_in_text(target_net, full_text)
@@ -2351,7 +2389,7 @@ def colorize_cli_match(text: str, query: str, match_type: str, is_regex: bool) -
         except Exception:
             return text
 
-    if match_type == "mac" or is_mac_address(query):
+    if match_type == "mac":
         variants = generate_mac_variants(query)
         result = text
         for v in variants:
@@ -2359,7 +2397,7 @@ def colorize_cli_match(text: str, query: str, match_type: str, is_regex: bool) -
             result = re.sub(f"({pat})", r"\033[1;93;1m\1\033[0m", result, flags=re.IGNORECASE)
         return result
 
-    if match_type == "ip_subnet" or is_ip_or_cidr_query(query):
+    if match_type == "ip_subnet":
         target_net = parse_ip_or_subnet(query)
         if target_net:
             matched_ips = extract_matching_ips_in_text(target_net, text)
@@ -2405,6 +2443,7 @@ def run_interactive_cli(stdscr, content_dir=DEFAULT_CONTENT_DIR):
     match_type = "exact"
     is_regex = False
     is_unique = False
+    is_mac = False
 
     while True:
         stdscr.clear()
@@ -2428,6 +2467,7 @@ def run_interactive_cli(stdscr, content_dir=DEFAULT_CONTENT_DIR):
 
         mode_label = {"csv": "CSV Only", "text": "Text Only", "all": "All Files"}[filter_modes[filter_idx]]
         reg_label = " [Regex: ON]" if is_regex else ""
+        mac_label = " [MAC: ON]" if is_mac else ""
         uniq_label = " [Unique: ON]" if is_unique else ""
 
         if results and 0 <= selected_idx < len(results):
@@ -2445,7 +2485,7 @@ def run_interactive_cli(stdscr, content_dir=DEFAULT_CONTENT_DIR):
             else:
                 type_str = ""
 
-        info_str = f" Matches: {len(results)}{type_str}{reg_label}{uniq_label} | Time: {elapsed_ms:.1f}ms | Filter: {mode_label} [Tab/f] | {idx_str} "
+        info_str = f" Matches: {len(results)}{type_str}{reg_label}{mac_label}{uniq_label} | Time: {elapsed_ms:.1f}ms | Filter: {mode_label} [Tab/f] | {idx_str} "
         stdscr.addstr(3, 2, info_str[:max_x - 4], getattr(curses, 'A_DIM', curses.A_NORMAL))
 
         stdscr.addstr(4, 0, "─" * max_x)
@@ -2469,7 +2509,7 @@ def run_interactive_cli(stdscr, content_dir=DEFAULT_CONTENT_DIR):
                 else:
                     stdscr.addstr(row_y, 2, line_disp)
 
-        footer = " [Esc: Clear | Enter: Open | r: Regex | u: Unique | Tab/f: Filter | c: Copy | s: Save | Up/Down: Select] "
+        footer = " [Esc: Clear | Enter: Open | m: MAC Mode | r: Regex | u: Unique | Tab/f: Filter | c: Copy | s: Save | Up/Down: Select] "
         try:
             stdscr.addstr(max_y - 1, 0, footer.center(max_x), curses.A_REVERSE)
         except curses.error:
@@ -2494,20 +2534,29 @@ def run_interactive_cli(stdscr, content_dir=DEFAULT_CONTENT_DIR):
                 selected_idx = 0
             else:
                 break
+        elif ch in (ord('m'), ord('M')): # Toggle MAC search mode
+            is_mac = not is_mac
+            if is_mac:
+                is_regex = False
+            if query:
+                results, elapsed_ms, match_type = engine.search(query, file_type=filter_modes[filter_idx], is_regex=is_regex, unique_files=is_unique, is_mac=is_mac)
+                selected_idx = 0
         elif ch in (ord('r'), ord('R')): # Toggle Regex
             is_regex = not is_regex
+            if is_regex:
+                is_mac = False
             if query:
-                results, elapsed_ms, match_type = engine.search(query, file_type=filter_modes[filter_idx], is_regex=is_regex, unique_files=is_unique)
+                results, elapsed_ms, match_type = engine.search(query, file_type=filter_modes[filter_idx], is_regex=is_regex, unique_files=is_unique, is_mac=is_mac)
                 selected_idx = 0
         elif ch in (ord('u'), ord('U')): # Toggle Unique Files mode
             is_unique = not is_unique
             if query:
-                results, elapsed_ms, match_type = engine.search(query, file_type=filter_modes[filter_idx], is_regex=is_regex, unique_files=is_unique)
+                results, elapsed_ms, match_type = engine.search(query, file_type=filter_modes[filter_idx], is_regex=is_regex, unique_files=is_unique, is_mac=is_mac)
                 selected_idx = 0
         elif ch in (9, ord('\t'), ord('f'), ord('F')): # Tab or 'f' key toggles file filter
             filter_idx = (filter_idx + 1) % len(filter_modes)
             if query:
-                results, elapsed_ms, match_type = engine.search(query, file_type=filter_modes[filter_idx], is_regex=is_regex, unique_files=is_unique)
+                results, elapsed_ms, match_type = engine.search(query, file_type=filter_modes[filter_idx], is_regex=is_regex, unique_files=is_unique, is_mac=is_mac)
                 selected_idx = 0
         elif ch in (10, 13, getattr(curses, "KEY_ENTER", 10)): # Enter opens file
             if results and 0 <= selected_idx < len(results):
@@ -2545,7 +2594,7 @@ def run_interactive_cli(stdscr, content_dir=DEFAULT_CONTENT_DIR):
         elif ch in (curses.KEY_BACKSPACE, 127, 8):
             if query:
                 query = query[:-1]
-                results, elapsed_ms, match_type = engine.search(query, file_type=filter_modes[filter_idx], is_regex=is_regex, unique_files=is_unique)
+                results, elapsed_ms, match_type = engine.search(query, file_type=filter_modes[filter_idx], is_regex=is_regex, unique_files=is_unique, is_mac=is_mac)
                 selected_idx = 0
         elif ch == curses.KEY_UP:
             if selected_idx > 0:
@@ -2555,7 +2604,7 @@ def run_interactive_cli(stdscr, content_dir=DEFAULT_CONTENT_DIR):
                 selected_idx += 1
         elif 32 <= ch <= 126:
             query += chr(ch)
-            results, elapsed_ms, match_type = engine.search(query, file_type=filter_modes[filter_idx], is_regex=is_regex, unique_files=is_unique)
+            results, elapsed_ms, match_type = engine.search(query, file_type=filter_modes[filter_idx], is_regex=is_regex, unique_files=is_unique, is_mac=is_mac)
             selected_idx = 0
 
 
