@@ -134,6 +134,15 @@ class TestQueryParser(unittest.TestCase):
         self.assertEqual(ffilter2, "inventory")
         self.assertEqual(clean2, "server AND prod")
 
+    def test_strip_file_filter_quoted_and_spaces(self):
+        ffilter, clean = qs.strip_file_filter('file:"network inventory.csv" 10.0.0.0/8')
+        self.assertEqual(ffilter, "network inventory.csv")
+        self.assertEqual(clean, "10.0.0.0/8")
+
+        ffilter2, clean2 = qs.strip_file_filter('f:"switch log 2026.txt"')
+        self.assertEqual(ffilter2, "switch log 2026.txt")
+        self.assertEqual(clean2, "")
+
     def test_extract_search_keywords(self):
         keywords = qs.extract_search_keywords('server AND prod OR "GigabitEthernet 0/1" NOT test')
         self.assertIn("GigabitEthernet 0/1", keywords)
@@ -260,6 +269,21 @@ class TestSearchEngineIntegration(unittest.TestCase):
         info_ext = self.engine.get_file_info(str(other_file))
         self.assertIsNotNone(info_orig, "Original file was purged!")
         self.assertIsNotNone(info_ext, "External file was purged!")
+
+    def test_search_with_file_filter(self):
+        """Query with file:filename must only return matches from that specific file."""
+        res_csv, _, _ = self.engine.search("file:network_inventory.csv router")
+        self.assertTrue(len(res_csv) > 0)
+        for r in res_csv:
+            self.assertEqual(r[0], "network_inventory.csv")
+
+        # Filtering to syslog.log must return zero rows for 'router'
+        res_syslog, _, _ = self.engine.search("file:syslog.log router")
+        self.assertEqual(len(res_syslog), 0)
+
+        # Quoted file filter
+        res_quoted, _, _ = self.engine.search('file:"network_inventory.csv" router')
+        self.assertTrue(len(res_quoted) > 0)
 
 
 def run_all_tests():

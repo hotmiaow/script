@@ -370,7 +370,7 @@ def _sqlite_ip_in_network(target_net_str: str, text: str) -> int:
 
 def strip_file_filter(raw_query: str) -> Tuple[Optional[str], str]:
     """
-    Extracts an inline 'file:name' or 'f:name' filter token from a raw query
+    Extracts an inline 'file:name', 'file:"name with spaces"', or 'f:name' filter token from a raw query
     string and returns (file_filter, effective_query) where effective_query
     has the filter token(s) removed. Shared by SearchEngine.search() and any
     UI code that needs to reason about the same query the engine actually
@@ -378,13 +378,22 @@ def strip_file_filter(raw_query: str) -> Tuple[Optional[str], str]:
     """
     if not raw_query:
         return None, ""
+
     file_filter = None
+    # Check for quoted file filter first: file:"..." or f:"..."
+    m = re.search(r'\b(?:file|f):"([^"]+)"', raw_query, flags=re.IGNORECASE)
+    if m:
+        file_filter = m.group(1).strip()
+        effective_query = re.sub(r'\b(?:file|f):"[^"]+"', '', raw_query, flags=re.IGNORECASE).strip()
+        effective_query = re.sub(r'\s+', ' ', effective_query).strip()
+        return file_filter, effective_query
+
     cleaned_tokens = []
     for token in raw_query.split():
         if token.lower().startswith("file:") or token.lower().startswith("f:"):
             parts = token.split(":", 1)
             if len(parts) == 2 and parts[1]:
-                file_filter = parts[1].strip()
+                file_filter = parts[1].strip().strip('"\'')
         else:
             cleaned_tokens.append(token)
     return file_filter, " ".join(cleaned_tokens).strip()
@@ -937,7 +946,8 @@ class SearchEngine:
             type_clauses.append("NOT (CAST(file_name AS TEXT) LIKE '%.csv' OR CAST(file_name AS TEXT) LIKE '%.CSV')")
 
         if file_filter:
-            type_clauses.append(f"CAST(file_name AS TEXT) LIKE '%{file_filter}%'")
+            safe_ff = file_filter.replace("'", "''")
+            type_clauses.append(f"CAST(file_name AS TEXT) LIKE '%{safe_ff}%'")
 
         base_filter_sql = (" AND " + " AND ".join(type_clauses)) if type_clauses else ""
         table_name = "fts_idx" if self.use_fts else "std_idx"
@@ -1637,6 +1647,10 @@ if HAS_TKINTER:
             self.btn_load_full.pack_forget()
             ToolTip(self.btn_load_full, "Load the entire text file (default shows ±50 lines context slice)")
 
+            btn_filter_file = ttk.Button(detail_top, text="Search Only This File 🎯", command=self._filter_to_selected_file)
+            btn_filter_file.pack(side="right", padx=(4, 0))
+            ToolTip(btn_filter_file, "Add this file to search filter (file:filename) to search only inside this file")
+
             btn_copy_detail = ttk.Button(detail_top, text="Copy All Fields", command=self._copy_detail_text)
             btn_copy_detail.pack(side="right")
             ToolTip(btn_copy_detail, "Copy formatted breakdown text to clipboard")
@@ -1914,7 +1928,7 @@ if HAS_TKINTER:
                     ("OR Operator", "sw01 OR sw02 (or 'sw01 | sw02')", "Matches rows that contain AT LEAST ONE of the terms."),
                     ("Exact Phrases", '"GigabitEthernet 0/1"', "Surround in quotes to match exact words with spaces."),
                     ("Unique Files", "1 Match/File checkbox or '📄 Unique Files' chip", "Show each matching file only once even if multiple lines match in that file."),
-                    ("File Filters", "file:switch vlan10 (or 'f:sw')", "Filters matched lines to files containing 'switch'."),
+                    ("File Filters", "file:switch vlan10 (or right-click 'Search Only This File')", "Filters matched lines to files matching 'switch'."),
                     ("Regex Mode", "^10\\.1\\.\\d+\\.\\d+", "Enable 'Regex Mode' checkbox for full regex patterns."),
                     ("Fuzzy Fallback", "misspelled_word", "Single words without operators match typos with % similarity score.")
                 ]),
@@ -1926,7 +1940,7 @@ if HAS_TKINTER:
                     ("Enter", "Open selected file in default app", "Opens file in Notepad, VSCode, TextEdit, etc."),
                     ("Ctrl+C / Cmd+C", "Copy selected matched row", "Copies full content line to clipboard."),
                     ("Double-Click", "Copy row / inspect", "Copies row and highlights breakdown in bottom pane."),
-                    ("Right-Click", "Context menu", "Opens clipboard and folder explorer actions."),
+                    ("Right-Click", "Context menu", "Right-click any result row to 'Search Only This File', copy, or open."),
                     ("Esc", "Clear search", "Clears search box and restores initial guide view."),
                     ("F1 / Ctrl+H", "Open this Help Guide", "Opens this reference cheat sheet.")
                 ]),
@@ -1960,6 +1974,9 @@ if HAS_TKINTER:
             self.context_menu.add_command(label="📋 Copy Matched Row (Ctrl+C)", command=self._copy_selected_row)
             self.context_menu.add_command(label="📑 Copy Column Breakdown", command=self._copy_detail_text)
             self.context_menu.add_separator()
+            self._filter_menu_idx = self.context_menu.index("end") + 1
+            self.context_menu.add_command(label="🎯 Search Only This File", command=self._filter_to_selected_file)
+            self.context_menu.add_separator()
             self.context_menu.add_command(label="🖥️ Open File in Default App (Enter)", command=self._open_selected_file)
             self.context_menu.add_command(label="📂 Open Containing Folder", command=self._open_selected_folder)
             self.context_menu.add_separator()
@@ -1972,6 +1989,13 @@ if HAS_TKINTER:
             row_id = self.tree.identify_row(event.y)
             if row_id:
                 self.tree.selection_set(row_id)
+                try:
+                    fname = self.tree.item(row_id)["values"][0]
+                    short_name = os.path.basename(fname)
+                    short_disp = short_name if len(short_name) <= 25 else short_name[:22] + "..."
+                    self.context_menu.entryconfig(self._filter_menu_idx, label=f"🎯 Search Only This File ({short_disp})")
+                except Exception:
+                    pass
                 self.context_menu.post(event.x_root, event.y_root)
 
         def _setup_indexer(self):
@@ -2453,6 +2477,31 @@ if HAS_TKINTER:
             if selected:
                 fname = self.tree.item(selected[0])["values"][0]
                 open_containing_folder(fname, content_dir=self.content_dir)
+
+        def _filter_to_selected_file(self):
+            """Adds or updates the inline file filter to search only the selected file."""
+            selected = self.tree.selection()
+            if not selected:
+                return
+            fname = self.tree.item(selected[0])["values"][0]
+            if not fname:
+                return
+
+            filter_token = f'file:"{fname}"' if " " in str(fname) else f"file:{fname}"
+
+            cur_query = self.search_var.get().strip()
+            _, effective_q = strip_file_filter(cur_query)
+
+            if effective_q:
+                new_query = f"{filter_token} {effective_q}"
+            else:
+                new_query = filter_token
+
+            self.search_var.set(new_query)
+            self.search_entry.focus_set()
+            self.search_entry.icursor(tk.END)
+            self._perform_search()
+            self._set_action_status("success", f"🎯 Filtered search to file: '{fname}'")
 
         def _clear_search(self):
             self.search_var.set("")
