@@ -1,7 +1,7 @@
 # Requirements & Test Specifications: Cisco & FortiGate Interface Information Extractor
 
 ## 1. Overview
-The **Cisco & FortiGate Interface Information Extractor** (`Cisco Interface Information Extractor.py`) parses network device configurations (Cisco IOS, IOS-XE, NX-OS, and Fortinet FortiOS) to extract:
+The **Cisco & FortiGate Interface Information Extractor** (`InterfaceExtractor.py`) parses network device configurations (Cisco IOS, IOS-XE, NX-OS, and Fortinet FortiOS) to extract:
 - Hostname / Device Name (with VDOM context when applicable)
 - Interface Name
 - IP Address & Subnet (in CIDR notation)
@@ -84,9 +84,29 @@ end
 When associating an interface to its security zone, `get_zone_for_interface()` must evaluate candidates in the following strict priority:
 1. **Exact VDOM Match**: `f"{vdom_name}::{interface_name}"`
 2. **Root VDOM Fallback**: `f"root::{interface_name}"`
-3. **Unknown VDOM Fallback**: `f"unknown::{interface_name}"`
-4. **Case-Insensitive Match**: Matches case variations (e.g. `lag1.1111` vs `LAG1.1111`).
-5. **Default**: Returns `"No Zone"` if no mapping exists.
+3. **Cross-VDOM Match**: Checks across all VDOMs for that device if the interface is mapped to a zone in another VDOM (e.g. `AWS::LAG1.1111 -> AAA-Zone`).
+4. **Unknown VDOM Fallback**: `f"unknown::{interface_name}"`
+5. **Case-Insensitive Match**: Matches case variations (e.g. `lag1.1111` vs `LAG1.1111`).
+6. **Default**: Returns `"No Zone"` if no mapping exists.
+
+---
+
+### Requirement 4: Cross-File FortiGate Interface & Zone Correlation
+When configuration for a firewall device is split across multiple files (for example, `hk1-aaa_root.set` containing interface IP configurations and `hk1-aaa_AWS.set` containing zone configurations for the `AWS` VDOM):
+
+1. **Filename Convention Parsing**:
+   - Files matching `<hostname>_<vdom>.<ext>` (e.g. `hk1-aaa_AWS.set`, `hk1-aaa_root.set`) are automatically parsed into:
+     - Device Hostname: `hk1-aaa`
+     - Default VDOM Context: `AWS` or `root`
+   - Generic terms like `firewall`, `router`, `switch` are preserved as part of the hostname rather than treated as VDOMs.
+2. **Batch Pre-Scanning (`process_directory`)**:
+   - Pass 1: Scans all FortiGate files to construct device-wide zone tables (`device_zones[hostname]`).
+   - Pass 2: Parses all files with full cross-file zone knowledge available immediately.
+3. **Order-Independent Retroactive Resolution (`parse_file`)**:
+   - If `hk1-aaa_root.set` is parsed before `hk1-aaa_AWS.set`, previously collected interface entries are automatically updated when the zone file is processed.
+   - If `hk1-aaa_AWS.set` is parsed before `hk1-aaa_root.set`, the zone information is already in `device_zones[hostname]` and mapped on the fly.
+4. **Interface Deduplication**:
+   - Merges identical interfaces across files while retaining the richest zone and description data.
 
 ---
 
@@ -95,7 +115,7 @@ When associating an interface to its security zone, `get_zone_for_interface()` m
 A dedicated regression test suite is located at:
 `cisco interface ip extract and use it traceroute/test_cisco_extractor.py`
 
-### Test Cases Included:
+### Test Cases Included (12 Tests):
 | Test Method | Category | Verified Behavior |
 | :--- | :--- | :--- |
 | `test_inline_vdom_zone_unquoted_interface` | FortiGate Inline | Extracts `App::VL1.1234 -> AAA-Zone` from single-line command |
@@ -104,7 +124,11 @@ A dedicated regression test suite is located at:
 | `test_inline_global_zone` | FortiGate Inline | Extracts global zone mappings to `root::<iface>` |
 | `test_multiline_nested_vdom_and_zones` | FortiGate Nested | Multi-VDOM, multi-zone block state machine integrity |
 | `test_zone_lookup_exact_and_fallback` | FortiGate Lookup | Exact VDOM match, root fallback, case-insensitivity |
-| `test_end_to_end_inline_zone_and_interfaces`| End-to-End | Full CSV record output with IP, VDOM, and zone |
+| `test_end_to_end_inline_zone_and_interfaces` | End-to-End | Full CSV record output with IP, VDOM, and zone |
+| `test_filename_parsing` | Cross-File | Extracts device and VDOM from filenames like `hk1-aaa_AWS.set` |
+| `test_cross_file_directory_processing` | Cross-File | Directory pre-scan correlates `hk1-aaa_root.set` IP and `hk1-aaa_AWS.set` Zone |
+| `test_cross_file_root_before_aws` | Cross-File | Retroactive zone resolution when root file parsed before AWS zone file |
+| `test_cross_file_aws_before_root` | Cross-File | Direct zone resolution when AWS zone file parsed before root file |
 | `test_cisco_hostname_and_interfaces` | Cisco IOS/NXOS | Hostname, IP address conversion, and description extraction |
 
 ### How to Run the Tests:

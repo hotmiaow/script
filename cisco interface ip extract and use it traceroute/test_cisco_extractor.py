@@ -16,11 +16,20 @@ Tests:
 3. End-to-end interface and IP extraction:
    - FortiGate IP mask vs CIDR format
    - Description, VDOM, and zone mapping in final output dictionary
-4. Cisco interface extraction:
+4. Cross-File FortiGate Interface and Zone correlation:
+   - Separate files for same device: e.g. hk1-aaa_AWS.set and hk1-aaa_root.set
+   - root file has interface IP, AWS file has zone configuration
+   - Batch directory pre-scan resolution
+   - Order-independent retroactive resolution (root first vs AWS first)
+   - Filename parsing for device name and VDOM context
+5. Cisco interface extraction:
    - Hostname, primary IP, CIDR conversion, and VRF detection
 """
 
 import sys
+import os
+import tempfile
+import shutil
 import unittest
 from pathlib import Path
 
@@ -28,10 +37,13 @@ from pathlib import Path
 CURRENT_DIR = Path(__file__).parent.resolve()
 sys.path.insert(0, str(CURRENT_DIR))
 
-# Import the extractor module dynamically due to filename with spaces
+# Import the extractor module dynamically
 import importlib.util
-script_path = CURRENT_DIR / "Cisco Interface Information Extractor.py"
-spec = importlib.util.spec_from_file_location("cisco_extractor", str(script_path))
+script_path = CURRENT_DIR / "InterfaceExtractor.py"
+if not script_path.exists():
+    script_path = CURRENT_DIR / "Cisco Interface Information Extractor.py"
+
+spec = importlib.util.spec_from_file_location("interface_extractor", str(script_path))
 extractor_mod = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(extractor_mod)
 NetworkConfigParser = extractor_mod.NetworkConfigParser
@@ -156,6 +168,102 @@ class TestFortigateInterfaceParsing(unittest.TestCase):
         self.assertEqual(lag_entry["ip_address"], "10.2.3.4/24")
         self.assertEqual(lag_entry["zone"], "AAA-Zone")
         self.assertEqual(lag_entry["description"], "Uplink LAG")
+
+
+class TestCrossFileFortigateCorrelation(unittest.TestCase):
+    """Tests for cross-file FortiGate correlation (e.g. hk1-aaa_AWS.set and hk1-aaa_root.set)."""
+
+    def setUp(self):
+        self.parser = NetworkConfigParser()
+        self.temp_dir = tempfile.mkdtemp(prefix="test_fg_cross_")
+
+        self.aws_file = os.path.join(self.temp_dir, "hk1-aaa_AWS.set")
+        self.root_file = os.path.join(self.temp_dir, "hk1-aaa_root.set")
+
+        # AWS file contains the zone configuration for AAA-Zone
+        with open(self.aws_file, "w") as f:
+            f.write("""
+config system zone
+    edit "AAA-Zone"
+        set interface "LAG1.1111" VL1.1234
+    next
+end
+""")
+
+        # root file contains the interfaces with IP configurations
+        with open(self.root_file, "w") as f:
+            f.write("""
+config system interface
+    edit "VL1.1234"
+        set ip 10.1.2.3 255.255.255.0
+        set description "App Web Gateway"
+    next
+    edit "LAG1.1111"
+        set ip 10.2.3.4 255.255.255.0
+        set description "App DB Uplink"
+    next
+end
+""")
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir)
+
+    def test_filename_parsing(self):
+        """Test device name and VDOM extraction from filename."""
+        dev, vdom = self.parser.parse_device_and_vdom_from_filename("hk1-aaa_AWS.set")
+        self.assertEqual(dev, "hk1-aaa")
+        self.assertEqual(vdom, "AWS")
+
+        dev, vdom = self.parser.parse_device_and_vdom_from_filename("/path/to/hk1-aaa_root.set")
+        self.assertEqual(dev, "hk1-aaa")
+        self.assertEqual(vdom, "root")
+
+        dev, vdom = self.parser.parse_device_and_vdom_from_filename("standalone_firewall.txt")
+        self.assertEqual(dev, "standalone_firewall")
+        self.assertEqual(vdom, "root")
+
+    def test_cross_file_directory_processing(self):
+        """Test process_directory pre-scan and cross-file zone resolution."""
+        self.parser.process_directory(self.temp_dir, auto_yes=True)
+        self.assertEqual(len(self.parser.interface_data), 2)
+
+        vl = next((i for i in self.parser.interface_data if i["interface_name"] == "VL1.1234"), None)
+        self.assertIsNotNone(vl)
+        self.assertEqual(vl["device_name"], "hk1-aaa (VDOM: AWS)")
+        self.assertEqual(vl["ip_address"], "10.1.2.3/24")
+        self.assertEqual(vl["zone"], "AAA-Zone")
+        self.assertEqual(vl["description"], "App Web Gateway")
+
+        lag = next((i for i in self.parser.interface_data if i["interface_name"] == "LAG1.1111"), None)
+        self.assertIsNotNone(lag)
+        self.assertEqual(lag["device_name"], "hk1-aaa (VDOM: AWS)")
+        self.assertEqual(lag["ip_address"], "10.2.3.4/24")
+        self.assertEqual(lag["zone"], "AAA-Zone")
+        self.assertEqual(lag["description"], "App DB Uplink")
+
+    def test_cross_file_root_before_aws(self):
+        """Test parsing root file first, then AWS file (retroactive resolution)."""
+        root_res = self.parser.parse_file(self.root_file)
+        self.parser.interface_data.extend(root_res)
+
+        aws_res = self.parser.parse_file(self.aws_file)
+        self.parser.interface_data.extend(aws_res)
+
+        for item in self.parser.interface_data:
+            self.assertEqual(item["zone"], "AAA-Zone")
+            self.assertIn("AWS", item["device_name"])
+
+    def test_cross_file_aws_before_root(self):
+        """Test parsing AWS file first, then root file."""
+        aws_res = self.parser.parse_file(self.aws_file)
+        self.parser.interface_data.extend(aws_res)
+
+        root_res = self.parser.parse_file(self.root_file)
+        self.parser.interface_data.extend(root_res)
+
+        for item in self.parser.interface_data:
+            self.assertEqual(item["zone"], "AAA-Zone")
+            self.assertIn("AWS", item["device_name"])
 
 
 class TestCiscoInterfaceParsing(unittest.TestCase):

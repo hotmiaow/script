@@ -16,22 +16,6 @@ from typing import List, Dict, Optional
 class NetworkConfigParser:
     def __init__(self):
         self.interface_data = []
-        self.device_zones = {}  # device_name -> { "vdom::interface": zone_name }
-
-    def parse_device_and_vdom_from_filename(self, filepath: str) -> tuple:
-        """
-        Extract device name and VDOM name from filename convention:
-        e.g. 'hk1-aaa_AWS.set' -> ('hk1-aaa', 'AWS')
-             'hk1-aaa_root.set' -> ('hk1-aaa', 'root')
-             'standalone_firewall.txt' -> ('standalone_firewall', 'root')
-        """
-        base = os.path.splitext(os.path.basename(filepath))[0]
-        non_vdom_words = {'firewall', 'switch', 'router', 'backup', 'config', 'cfg', 'extractor', 'network'}
-        if "_" in base:
-            parts = base.rsplit("_", 1)
-            if parts[0] and parts[1] and parts[1].lower() not in non_vdom_words:
-                return parts[0].strip(), parts[1].strip()
-        return base.strip(), "root"
 
     def extract_hostname_cisco(self, content: str) -> str:
         """Extract hostname from Cisco configuration"""
@@ -59,18 +43,12 @@ class NetworkConfigParser:
 
         return "Unknown"
 
-    def extract_hostname_fortigate(self, content: str, filepath: Optional[str] = None) -> str:
-        """Extract hostname from Fortigate configuration with filename fallback"""
+    def extract_hostname_fortigate(self, content: str) -> str:
+        """Extract hostname from Fortigate configuration"""
         # Look for set hostname command
         hostname_match = re.search(r'set hostname\s+"?([^"\n]+)"?', content, re.IGNORECASE)
         if hostname_match:
             return hostname_match.group(1).strip('"')
-
-        # Fallback to filename prefix before _ (e.g. hk1-aaa_AWS.set -> hk1-aaa)
-        if filepath:
-            dev_name, _ = self.parse_device_and_vdom_from_filename(filepath)
-            if dev_name and dev_name != "Unknown":
-                return dev_name
 
         return "Unknown"
 
@@ -346,17 +324,16 @@ class NetworkConfigParser:
 
         return interfaces
 
-    def get_zone_for_interface(self, interface_name: str, vdom_name: str, zones: Dict[str, str], return_vdom: bool = False):
+    def get_zone_for_interface(self, interface_name: str, vdom_name: str, zones: Dict[str, str]) -> str:
         """
-        Get zone for interface with fallback to root VDOM and cross-VDOM resolution
-        (supports configurations where IP is in root and zones are in another VDOM).
-        Supports case-insensitive lookup.
+        Get zone for interface with fallback to root VDOM if not found in specific VDOM.
+        This implements the enhanced logic: if no zone info found in corresponding VDOM,
+        use the info found in root VDOM. Supports case-insensitive lookup.
         """
         # Priority order for zone lookup:
         # 1. Exact VDOM match
         # 2. Root VDOM (fallback)
-        # 3. Cross-VDOM match (find any VDOM that maps this interface to a zone)
-        # 4. Unknown VDOM (last resort)
+        # 3. Unknown VDOM (last resort)
 
         possible_keys = [
             f"{vdom_name}::{interface_name}",  # Exact VDOM match
@@ -367,78 +344,37 @@ class NetworkConfigParser:
         print(f"        Debug: Looking for zone mapping for interface '{interface_name}' in VDOM '{vdom_name}'")
         print(f"        Debug: Available zone mappings: {list(zones.keys())}")
 
-        # 1. Exact match check
+        # Exact match check
         for i, key in enumerate(possible_keys):
             if key in zones:
                 zone_name = zones[key]
                 fallback_info = ""
-                resolved_v = vdom_name
                 if i == 1:  # Root VDOM fallback was used
                     fallback_info = " (fallback from root)"
-                    resolved_v = "root"
                 elif i == 2:  # Unknown fallback was used
                     fallback_info = " (unknown fallback)"
 
                 print(f"        Debug: Found zone mapping {key} -> {zone_name}{fallback_info}")
-                return (zone_name, resolved_v) if return_vdom else zone_name
+                return zone_name
 
-        # 2. Cross-VDOM match: check if interface is mapped to a zone in any other VDOM for this firewall
-        for k, z_val in zones.items():
-            if "::" in k:
-                kvdom, kiface = k.split("::", 1)
-                if kiface.lower() == interface_name.lower():
-                    print(f"        Debug: Found cross-file/cross-VDOM zone mapping {k} -> {z_val}")
-                    return (z_val, kvdom) if return_vdom else z_val
-
-        # 3. Case-insensitive match fallback
+        # Case-insensitive match fallback
         for i, key in enumerate(possible_keys):
             key_lower = key.lower()
             for z_key, z_val in zones.items():
                 if z_key.lower() == key_lower:
                     fallback_info = f" (case-insensitive from {z_key})"
                     print(f"        Debug: Found zone mapping {key} -> {z_val}{fallback_info}")
-                    resolved_v = "root" if i == 1 else vdom_name
-                    return (z_val, resolved_v) if return_vdom else z_val
+                    return z_val
 
         print(f"        Debug: Interface '{interface_name}' not found in zones for VDOM '{vdom_name}'")
-        return ("No Zone", vdom_name) if return_vdom else "No Zone"
+        return "No Zone"
 
-    def _retroactive_zone_resolution(self, hostname: str) -> None:
-        """Updates previously extracted interface records if their zone is now known from another file."""
-        if hostname not in self.device_zones:
-            return
-        device_zones = self.device_zones[hostname]
-
-        for item in self.interface_data:
-            dev_name = item.get("device_name", "")
-            if dev_name == hostname or dev_name.startswith(f"{hostname} (VDOM:"):
-                if item.get("zone") in ("No Zone", "N/A", ""):
-                    iface_name = item.get("interface_name", "")
-                    vdom = "root"
-                    vdom_m = re.search(r'\(VDOM:\s*([^)]+)\)', dev_name)
-                    if vdom_m:
-                        vdom = vdom_m.group(1).strip()
-
-                    new_zone, resolved_vdom = self.get_zone_for_interface(iface_name, vdom, device_zones, return_vdom=True)
-                    if new_zone != "No Zone":
-                        item["zone"] = new_zone
-                        if resolved_vdom != "root":
-                            item["device_name"] = f"{hostname} (VDOM: {resolved_vdom})"
-                        print(f"        Debug: Retroactive cross-file resolution: {iface_name} -> {new_zone} (VDOM: {resolved_vdom})")
-
-    def parse_fortigate_interfaces(self, content: str, hostname: str, default_vdom: str = "root", filepath: Optional[str] = None) -> List[Dict]:
-        """Parse Fortigate interface configurations with cross-file VDOM and zone support"""
+    def parse_fortigate_interfaces(self, content: str, hostname: str) -> List[Dict]:
+        """Parse Fortigate interface configurations with VDOM and zone support"""
         interfaces = []
 
-        # Extract zones from this config with default_vdom context
-        file_zones = self.extract_fortigate_zones(content, default_vdom=default_vdom)
-
-        # Record in device_zones for cross-file correlation
-        if hostname not in self.device_zones:
-            self.device_zones[hostname] = {}
-        self.device_zones[hostname].update(file_zones)
-
-        zones = self.device_zones[hostname]
+        # Extract zones from the entire config
+        zones = self.extract_fortigate_zones(content)
 
         # Find interface configurations - improved pattern to handle the entire config structure
         interface_pattern = r'config\s+system\s+interface\s*\n(.*?)(?=^config\s+(?!system\s+interface)|\Z)'
@@ -472,9 +408,9 @@ class NetworkConfigParser:
         for interface_name, interface_config in interface_blocks:
             print(f"      Debug: Processing interface '{interface_name}'")
 
-            # Extract VDOM from interface config, falling back to default_vdom
+            # Extract VDOM from interface config
             vdom_match = re.search(r'^\s*set\s+vdom\s+"?([^"\n\s]+)"?', interface_config, re.MULTILINE | re.IGNORECASE)
-            vdom_name = vdom_match.group(1).strip('"') if vdom_match else default_vdom
+            vdom_name = vdom_match.group(1).strip('"') if vdom_match else "root"
 
             # Look for IP configuration - improved patterns
             ip_patterns = [
@@ -509,13 +445,12 @@ class NetworkConfigParser:
                     if desc_match:
                         description = desc_match.group(1).strip()
 
-                    # Get zone for this interface using enhanced lookup with cross-VDOM support
-                    zone_name, resolved_vdom = self.get_zone_for_interface(interface_name, vdom_name, zones, return_vdom=True)
-                    active_vdom = resolved_vdom if (resolved_vdom and resolved_vdom != "root") else vdom_name
+                    # Get zone for this interface using enhanced lookup with fallback
+                    zone_name = self.get_zone_for_interface(interface_name, vdom_name, zones)
 
                     # Create device name with VDOM
-                    if active_vdom != "root":
-                        device_name = f"{hostname} (VDOM: {active_vdom})"
+                    if vdom_name != "root":
+                        device_name = f"{hostname} (VDOM: {vdom_name})"
                     else:
                         device_name = hostname
 
@@ -591,7 +526,7 @@ class NetworkConfigParser:
 
         return interfaces
 
-    def extract_fortigate_zones(self, content: str, default_vdom: str = "root") -> Dict[str, str]:
+    def extract_fortigate_zones(self, content: str) -> Dict[str, str]:
         """
         Extract interface-to-zone mappings from FortiGate config,
         including zones defined inside each VDOM and inline / single-line commands.
@@ -599,7 +534,7 @@ class NetworkConfigParser:
         Handles commands such as:
           - config vdom edit App config system zone edit "AAA-Zone" set interface VL1.1234
           - config vdom edit App config system zone edit "AAA-Zone" set interface "LAG1.1111"
-        as well as standard multi-line nested FortiGate configurations and file-level VDOM defaults.
+        as well as standard multi-line nested FortiGate configurations.
         """
         zones = {}
 
@@ -629,7 +564,7 @@ class NetworkConfigParser:
                         print(f"      Debug: Inline VDOM zone found: {zone_key} -> {zone_name}")
                 continue
 
-            # Inline command for global zone (uses default_vdom from file context if provided)
+            # Inline command for global zone (no config vdom)
             global_match = re.search(
                 r'config\s+system\s+zone\s+edit\s+"?([^"\r\n]+?)"?\s+'
                 r'set\s+interface\s+(.+)',
@@ -642,7 +577,7 @@ class NetworkConfigParser:
                 interfaces = self.parse_interface_list(iface_part)
                 for iface in interfaces:
                     if iface:
-                        zone_key = f"{default_vdom}::{iface}"
+                        zone_key = f"root::{iface}"
                         if zone_key not in zones:
                             zones[zone_key] = zone_name
                             print(f"      Debug: Inline Global zone found: {zone_key} -> {zone_name}")
@@ -650,7 +585,7 @@ class NetworkConfigParser:
 
         # 2. Tokenized state machine for structured / multi-line nested blocks
         tokens = re.findall(r'"[^"]*"|\'[^\']*\'|\S+', content)
-        current_vdom = default_vdom
+        current_vdom = "root"
         config_stack = []
         current_zone = None
 
@@ -711,7 +646,7 @@ class NetworkConfigParser:
                 if "zone" in current_section:
                     current_zone = None
                 elif current_section == "vdom":
-                    current_vdom = default_vdom
+                    current_vdom = "root"
                 continue
 
             elif tok == "end":
@@ -721,7 +656,7 @@ class NetworkConfigParser:
                     if "zone" in popped:
                         current_zone = None
                     elif popped == "vdom":
-                        current_vdom = default_vdom
+                        current_vdom = "root"
                 continue
 
             else:
@@ -1040,32 +975,11 @@ class NetworkConfigParser:
         except:
             return "24"
 
-    def detect_device_type(self, content: str, filepath: Optional[str] = None) -> str:
-        """Detect device type based on configuration content and filename"""
+    def detect_device_type(self, content: str) -> str:
+        """Detect device type based on configuration content"""
         content_lower = content.lower()
 
-        # Check file extension
-        if filepath:
-            ext = os.path.splitext(filepath)[1].lower()
-            if ext == '.set':
-                return 'fortigate'
-
-        fortigate_indicators = [
-            'fortigate',
-            'fortios',
-            'config system',
-            'config vdom',
-            'config firewall',
-            'config router',
-            'config switch-controller',
-            'config wireless-controller',
-            'config user',
-            'config vpn',
-            'config log',
-            'config system zone',
-            'config system interface'
-        ]
-        if any(ind in content_lower for ind in fortigate_indicators):
+        if 'fortigate' in content_lower or 'config system interface' in content_lower or 'config vdom' in content_lower:
             return 'fortigate'
         elif any(keyword in content_lower for keyword in ['cisco', 'ios', 'nxos', 'interface', 'hostname']):
             return 'cisco'
@@ -1129,32 +1043,22 @@ class NetworkConfigParser:
             print(f"Error reading file {filepath}: {e}")
             return []
 
-        device_type = self.detect_device_type(content, filepath=filepath)
+        device_type = self.detect_device_type(content)
         interfaces = []
-        parsed_device, parsed_vdom = self.parse_device_and_vdom_from_filename(filepath)
-        default_vdom = parsed_vdom if parsed_vdom else "root"
 
         if device_type == 'fortigate':
-            hostname = self.extract_hostname_fortigate(content, filepath=filepath)
-            if hostname == "Unknown" and parsed_device:
-                hostname = parsed_device
-            interfaces.extend(self.parse_fortigate_interfaces(content, hostname, default_vdom=default_vdom, filepath=filepath))
+            hostname = self.extract_hostname_fortigate(content)
+            interfaces.extend(self.parse_fortigate_interfaces(content, hostname))
         else:  # Cisco
             hostname = self.extract_hostname_cisco(content)
-            if hostname == "Unknown" and parsed_device:
-                hostname = parsed_device
             interfaces.extend(self.parse_cisco_interfaces(content, hostname))
             interfaces.extend(self.parse_cisco_evpn(content, hostname))
 
         # Add filename as fallback if hostname is unknown
         if hostname == "Unknown":
-            hostname = parsed_device if parsed_device else os.path.splitext(os.path.basename(filepath))[0]
+            hostname = os.path.splitext(os.path.basename(filepath))[0]
             for interface in interfaces:
                 interface['device_name'] = hostname
-
-        # Retroactively resolve any previously parsed interfaces that now have known zones
-        if device_type == 'fortigate':
-            self._retroactive_zone_resolution(hostname)
 
         if interfaces:
             print(f"    → Found {len(interfaces)} interfaces on {hostname}")
@@ -1208,49 +1112,13 @@ class NetworkConfigParser:
             else:
                 print("Please enter 'y' for yes or 'n' for no.")
 
-        # Pass 1: Pre-scan FortiGate files to discover device zones across all files
-        print("\nPre-scanning FortiGate files for cross-file zone mappings...")
-        for filepath in text_files:
-            try:
-                with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
-                    content = f.read()
-                if self.detect_device_type(content, filepath=filepath) == 'fortigate':
-                    p_dev, p_vdom = self.parse_device_and_vdom_from_filename(filepath)
-                    hname = self.extract_hostname_fortigate(content, filepath=filepath)
-                    if hname == "Unknown" and p_dev:
-                        hname = p_dev
-                    def_vdom = p_vdom if p_vdom else "root"
-                    f_zones = self.extract_fortigate_zones(content, default_vdom=def_vdom)
-                    if hname not in self.device_zones:
-                        self.device_zones[hname] = {}
-                    self.device_zones[hname].update(f_zones)
-            except Exception:
-                pass
-
         print("\nProcessing files...")
         print("=" * 30)
 
         for i, filepath in enumerate(text_files, 1):
             print(f"[{i}/{len(text_files)}] Processing: {os.path.basename(filepath)}")
             interfaces = self.parse_file(filepath)
-            for iface in interfaces:
-                # Deduplicate by interface_name, ip_address, and base device name
-                dev_base = iface['device_name'].split()[0]
-                existing = next(
-                    (item for item in self.interface_data
-                     if item['interface_name'] == iface['interface_name']
-                     and item['ip_address'] == iface['ip_address']
-                     and item['device_name'].split()[0] == dev_base),
-                    None
-                )
-                if existing:
-                    if (existing['zone'] in ("No Zone", "N/A") or not existing['zone']) and iface['zone'] not in ("No Zone", "N/A"):
-                        existing['zone'] = iface['zone']
-                        existing['device_name'] = iface['device_name']
-                    if existing['description'] in ("N/A", "") and iface['description'] not in ("N/A", ""):
-                        existing['description'] = iface['description']
-                else:
-                    self.interface_data.append(iface)
+            self.interface_data.extend(interfaces)
 
         print(f"\nCompleted processing {len(text_files)} files.")
 
