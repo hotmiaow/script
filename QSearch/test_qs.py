@@ -121,6 +121,22 @@ class TestIPSubnetHelpers(unittest.TestCase):
         matched = qs.extract_matching_ips_in_text(target_net, text)
         self.assertEqual(matched, ["2001:db8::1"])
 
+    def test_extract_subnets_gated_by_mode(self):
+        """extract_subnets_from_query should only return networks when subnet mode or ip mode is enabled."""
+        q = "10.0.0.0/8 OR 192.168.1.0/24"
+        self.assertEqual(qs.extract_subnets_from_query(q, is_subnet_mode=False), [])
+        subnets = qs.extract_subnets_from_query(q, is_subnet_mode=True)
+        self.assertEqual(len(subnets), 2)
+        self.assertEqual(str(subnets[0]), "10.0.0.0/8")
+        self.assertEqual(str(subnets[1]), "192.168.1.0/24")
+
+    def test_query_contains_subnet_syntax(self):
+        """query_contains_subnet_syntax identifies if user typed CIDR notation."""
+        self.assertTrue(qs.query_contains_subnet_syntax("10.0.0.0/8"))
+        self.assertTrue(qs.query_contains_subnet_syntax("server AND 192.168.1.0/24"))
+        self.assertFalse(qs.query_contains_subnet_syntax("server AND database"))
+        self.assertFalse(qs.query_contains_subnet_syntax("10.0.0.1"))
+
 
 class TestQueryParser(unittest.TestCase):
     """Tests stripping inline file filters, extracting keywords, and boolean parsing."""
@@ -151,6 +167,26 @@ class TestQueryParser(unittest.TestCase):
         self.assertNotIn("test", keywords)  # Excluded by NOT
         self.assertNotIn("AND", keywords)
         self.assertNotIn("OR", keywords)
+
+    def test_character_deletion_edge_cases(self):
+        """Deleting characters down to lone operators, unclosed quotes, or incomplete file: should not crash."""
+        # Unclosed quote
+        kw_quote = qs.extract_search_keywords('"server prod')
+        self.assertTrue(len(kw_quote) > 0)
+
+        # Lone operator fallback
+        kw_not = qs.extract_search_keywords('not')
+        self.assertIn("not", kw_not)
+        kw_and = qs.extract_search_keywords('and')
+        self.assertIn("and", kw_and)
+        kw_or = qs.extract_search_keywords('or')
+        self.assertIn("or", kw_or)
+
+        # Incomplete file: prefix
+        ffilter, clean = qs.strip_file_filter("file:")
+        self.assertIsNone(ffilter)
+        self.assertEqual(clean, "file:")
+
 
 
 class TestSearchEngineIntegration(unittest.TestCase):
@@ -193,24 +229,40 @@ class TestSearchEngineIntegration(unittest.TestCase):
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     def test_no_dropped_or_branches(self):
-        """Query '1.0.0.0/8 OR 10.0.0.0/8' must find both 1.x and 10.x even with 1000+ results."""
-        results, elapsed_ms, match_type = self.engine.search("1.0.0.0/8 OR 10.0.0.0/8", limit=1000)
+        """Query '1.0.0.0/8 OR 10.0.0.0/8' with is_subnet=True must find both 1.x and 10.x even with 1000+ results."""
+        results, elapsed_ms, match_type = self.engine.search("1.0.0.0/8 OR 10.0.0.0/8", limit=1000, is_subnet=True)
         has_1 = any("1.10.20." in r[2] for r in results)
         has_10 = any("10.0.0." in r[2] for r in results)
         self.assertTrue(has_1, "1.0.0.0/8 branch was improperly dropped!")
         self.assertTrue(has_10, "10.0.0.0/8 branch was improperly dropped!")
 
+    def test_subnet_mode_disabled_by_default(self):
+        """Without is_subnet=True, CIDR notation must NOT trigger subnet containment search."""
+        # 1. Subnet mode disabled (default) -> should not match 1.10.20.x
+        res_default, _, match_type_default = self.engine.search("1.0.0.0/8")
+        self.assertNotEqual(match_type_default, "ip_subnet")
+        has_1_default = any("1.10.20." in r[2] for r in res_default)
+        self.assertFalse(has_1_default, "Subnet search should NOT be active when Subnet Mode is disabled!")
+
+        # 2. Subnet mode enabled -> must match 1.10.20.x
+        res_subnet, _, match_type_subnet = self.engine.search("1.0.0.0/8", is_subnet=True)
+        self.assertEqual(match_type_subnet, "ip_subnet")
+        has_1_subnet = any("1.10.20." in r[2] for r in res_subnet)
+        self.assertTrue(has_1_subnet, "Subnet search failed when Subnet Mode was enabled!")
+        self.assertEqual(len(res_subnet), 5)
+
     def test_subnet_and_short_keyword_precision(self):
-        """'10.0.0.0/8 AND sw' must return 0 rows since all 10.x hosts have role 'router'."""
-        res_none, _, _ = self.engine.search("10.0.0.0/8 AND sw")
+        """'10.0.0.0/8 AND sw' with is_subnet=True must return 0 rows since all 10.x hosts have role 'router'."""
+        res_none, _, _ = self.engine.search("10.0.0.0/8 AND sw", is_subnet=True)
         self.assertEqual(len(res_none), 0, "Expected 0 results for '10.0.0.0/8 AND sw'")
 
-        res_match, _, _ = self.engine.search("1.0.0.0/8 AND sw")
+        res_match, _, _ = self.engine.search("1.0.0.0/8 AND sw", is_subnet=True)
         self.assertEqual(len(res_match), 5, "Expected 5 results for '1.0.0.0/8 AND sw'")
 
     def test_subnet_not_exclusion(self):
-        """'192.168.1.0/24 NOT 192.168.1.50' should only return 192.168.1.51."""
-        results, _, _ = self.engine.search("192.168.1.0/24 NOT 192.168.1.50")
+        """'192.168.1.0/24 NOT 192.168.1.50' with is_subnet=True should only return 192.168.1.51."""
+        results, _, match_type = self.engine.search("192.168.1.0/24 NOT 192.168.1.50", is_subnet=True)
+        self.assertEqual(match_type, "ip_subnet")
         matched_content = [r[2] for r in results]
         self.assertTrue(any("192.168.1.51" in c for c in matched_content))
         self.assertFalse(any("192.168.1.50" in c for c in matched_content))
@@ -284,6 +336,37 @@ class TestSearchEngineIntegration(unittest.TestCase):
         # Quoted file filter
         res_quoted, _, _ = self.engine.search('file:"network_inventory.csv" router')
         self.assertTrue(len(res_quoted) > 0)
+
+    def test_empty_query_clearing(self):
+        """Deleting all characters should return an empty result list without crashing."""
+        for empty_val in ["", "   ", None]:
+            res, elapsed, match_type = self.engine.search(empty_val)
+            self.assertEqual(res, [])
+            self.assertEqual(elapsed, 0.0)
+            self.assertEqual(match_type, "")
+
+    def test_backspaced_and_partial_queries(self):
+        """Typing and backspacing characters (operators, CIDR slash, MAC colons) must remain stable."""
+        # 1. Partial CIDR with trailing slash
+        res_slash, _, _ = self.engine.search("192.168.1.0/")
+        self.assertTrue(len(res_slash) > 0, "Query with trailing slash '192.168.1.0/' should not fail")
+
+        # 2. Deleting characters down to boolean operators
+        res_not, _, _ = self.engine.search("not")
+        # Should not raise exception and should execute search
+        self.assertIsInstance(res_not, list)
+
+        res_and, _, _ = self.engine.search("and")
+        self.assertIsInstance(res_and, list)
+
+        # 3. Partial MAC address with trailing separator
+        res_mac_colon, _, _ = self.engine.search("11:22:33:", is_mac=True)
+        self.assertIsInstance(res_mac_colon, list)
+
+        # 4. Incomplete file filter
+        res_file_only, _, _ = self.engine.search("file: router")
+        self.assertTrue(len(res_file_only) > 0)
+
 
 
 def run_all_tests():

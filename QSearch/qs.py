@@ -302,8 +302,10 @@ def parse_ip_or_subnet(query: str) -> Optional[Union[ipaddress.IPv4Network, ipad
         return None
 
 
-def extract_subnets_from_query(query: str, is_ip_mode: bool = False) -> List[Union[ipaddress.IPv4Network, ipaddress.IPv6Network]]:
-    """Extracts all valid CIDR subnets (or IPs if is_ip_mode) from a query string."""
+def extract_subnets_from_query(query: str, is_subnet_mode: bool = False, is_ip_mode: bool = False) -> List[Union[ipaddress.IPv4Network, ipaddress.IPv6Network]]:
+    """Extracts all valid CIDR subnets (or IPs) from a query string when subnet mode is enabled."""
+    if not (is_subnet_mode or is_ip_mode):
+        return []
     subnets = []
     if not query:
         return subnets
@@ -313,16 +315,30 @@ def extract_subnets_from_query(query: str, is_ip_mode: bool = False) -> List[Uni
         t_clean = tok.strip('"\'(),')
         if not t_clean or t_clean.upper() in ("AND", "OR", "NOT", "&&", "||", "|", "&"):
             continue
-        if "/" in t_clean or is_ip_mode:
-            net = parse_ip_or_subnet(t_clean)
-            if net is not None and net not in subnets:
-                subnets.append(net)
+        net = parse_ip_or_subnet(t_clean)
+        if net is not None and net not in subnets:
+            subnets.append(net)
     return subnets
 
 
-def is_ip_or_cidr_query(query: str, is_ip_mode: bool = False) -> bool:
-    """Checks if query represents or contains at least one valid CIDR subnet (e.g. '1.0.0.0/8', '192.168.1.0/24') or IP."""
-    return len(extract_subnets_from_query(query, is_ip_mode=is_ip_mode)) > 0
+def is_ip_or_cidr_query(query: str, is_subnet_mode: bool = False, is_ip_mode: bool = False) -> bool:
+    """Checks if query represents or contains at least one valid CIDR subnet or IP when subnet mode is enabled."""
+    return len(extract_subnets_from_query(query, is_subnet_mode=is_subnet_mode, is_ip_mode=is_ip_mode)) > 0
+
+
+def query_contains_subnet_syntax(query: str) -> bool:
+    """Checks if query contains tokens that look like a CIDR subnet (e.g. '1.0.0.0/8' or '192.168.1.0/24')."""
+    if not query:
+        return False
+    clean = re.sub(r'\b(file|f):[^\s]+', '', query, flags=re.IGNORECASE)
+    tokens = re.findall(r'"[^"]+"|\S+', clean)
+    for tok in tokens:
+        t_clean = tok.strip('"\'(),')
+        if not t_clean or t_clean.upper() in ("AND", "OR", "NOT", "&&", "||", "|", "&"):
+            continue
+        if "/" in t_clean and parse_ip_or_subnet(t_clean) is not None:
+            return True
+    return False
 
 
 _IP_CANDIDATE_REGEX = re.compile(
@@ -394,6 +410,8 @@ def strip_file_filter(raw_query: str) -> Tuple[Optional[str], str]:
             parts = token.split(":", 1)
             if len(parts) == 2 and parts[1]:
                 file_filter = parts[1].strip().strip('"\'')
+            else:
+                cleaned_tokens.append(token)
         else:
             cleaned_tokens.append(token)
     return file_filter, " ".join(cleaned_tokens).strip()
@@ -418,7 +436,7 @@ def extract_search_keywords(raw_query: str) -> List[str]:
     tokens = []
     negate_next = False
     for token in re.split(r'[\s|,;]+', unquoted):
-        token_clean = token.strip().strip("()").strip()
+        token_clean = token.strip().strip("()").strip('"\':').strip()
         if not token_clean:
             continue
         upper = token_clean.upper()
@@ -434,6 +452,13 @@ def extract_search_keywords(raw_query: str) -> List[str]:
         tokens.append(token_clean)
 
     all_keywords = phrases + tokens
+    # Fallback: if all tokens were dropped because of lone operators, include them as search terms
+    if not all_keywords:
+        for token in re.split(r'[\s|,;]+', unquoted):
+            token_clean = token.strip().strip("()").strip('"\':').strip()
+            if token_clean:
+                all_keywords.append(token_clean)
+
     return [k for k in all_keywords if len(k) >= 1]
 
 
@@ -780,7 +805,7 @@ class SearchEngine:
             pass
         return None
 
-    def _parse_boolean_query_sql(self, query_str: str, is_mac: bool = False, is_ip: bool = False) -> Tuple[Optional[str], Tuple[Optional[str], List[Any]], List[str], List[Any], bool]:
+    def _parse_boolean_query_sql(self, query_str: str, is_mac: bool = False, is_ip: bool = False, is_subnet: bool = False) -> Tuple[Optional[str], Tuple[Optional[str], List[Any]], List[str], List[Any], bool]:
         """
         Parses query containing 'AND', 'OR', 'NOT', '|', '&', subnets, and MAC tokens into:
         - FTS5 MATCH expression
@@ -792,6 +817,7 @@ class SearchEngine:
         keywords = extract_search_keywords(query_str)
         extracted_subnets = []
         has_mac_term = False
+        is_subnet_mode = bool(is_subnet or is_ip)
 
         # Split into non-empty OR branches
         or_parts = [p.strip() for p in re.split(r'\s+(?:OR|or|\|)\s+', query_str) if p.strip()]
@@ -827,6 +853,14 @@ class SearchEngine:
                     positive_terms.append(t_clean)
                 negate_next = False
 
+            # If all tokens were operators or ignored (e.g. user typed or deleted down to "not", "and", "or", etc.),
+            # treat the non-empty tokens as positive search terms so the query does not collapse to zero results.
+            if not positive_terms and not negative_terms:
+                for tok in raw_tokens:
+                    t_clean = tok.strip('"').strip("'")
+                    if t_clean and not t_clean.lower().startswith(("file:", "f:")):
+                        positive_terms.append(t_clean)
+
             if not positive_terms and not negative_terms:
                 continue
 
@@ -835,9 +869,10 @@ class SearchEngine:
             branch_like_parts = []
 
             for t in positive_terms:
-                is_subnet_token = ("/" in t or is_ip) and parse_ip_or_subnet(t) is not None
+                t_sub = t[:-1] if (t.endswith('/') and len(t) > 1) else t
+                is_subnet_token = is_subnet_mode and (parse_ip_or_subnet(t_sub) is not None)
                 if is_subnet_token:
-                    net = parse_ip_or_subnet(t)
+                    net = parse_ip_or_subnet(t_sub)
                     if net not in extracted_subnets:
                         extracted_subnets.append(net)
                     # Prefilter for IPv4 to accelerate sqlite evaluation
@@ -861,25 +896,27 @@ class SearchEngine:
                         branch_like_parts.append("ip_in_network(?, line_text)")
                         like_params.append(str(net))
 
-                elif is_mac and is_mac_address(t):
-                    has_mac_term = True
-                    variants = generate_mac_variants(t)
-                    mac_subclauses = ["(line_text LIKE ? OR file_name LIKE ?)" for _ in variants]
-                    branch_like_parts.append("(" + " OR ".join(mac_subclauses) + ")")
-                    for v in variants:
-                        like_params.extend([f"%{v}%", f"%{v}%"])
-                    fts_v = [f'"{v}"' for v in variants if len(v) >= 3]
-                    if fts_v:
-                        branch_fts_pos.append("(" + " OR ".join(fts_v) + ")")
-
                 else:
-                    branch_like_parts.append("(line_text LIKE ? OR file_name LIKE ?)")
-                    like_params.extend([f"%{t}%", f"%{t}%"])
-                    if len(t) >= 3:
-                        branch_fts_pos.append(f'"{t.replace(chr(34), chr(34) * 2)}"')
+                    t_mac_candidate = t.rstrip(':.-') if (len(t) > 3 and any(c in t for c in ':.-')) else t
+                    if is_mac and is_mac_address(t_mac_candidate):
+                        has_mac_term = True
+                        variants = generate_mac_variants(t_mac_candidate)
+                        mac_subclauses = ["(line_text LIKE ? OR file_name LIKE ?)" for _ in variants]
+                        branch_like_parts.append("(" + " OR ".join(mac_subclauses) + ")")
+                        for v in variants:
+                            like_params.extend([f"%{v}%", f"%{v}%"])
+                        fts_v = [f'"{v}"' for v in variants if len(v) >= 3]
+                        if fts_v:
+                            branch_fts_pos.append("(" + " OR ".join(fts_v) + ")")
+
+                    else:
+                        branch_like_parts.append("(line_text LIKE ? OR file_name LIKE ?)")
+                        like_params.extend([f"%{t}%", f"%{t}%"])
+                        if len(t) >= 3:
+                            branch_fts_pos.append(f'"{t.replace(chr(34), chr(34) * 2)}"')
 
             for t in negative_terms:
-                is_subnet_token = ("/" in t or is_ip) and parse_ip_or_subnet(t) is not None
+                is_subnet_token = is_subnet_mode and (parse_ip_or_subnet(t) is not None)
                 if is_subnet_token:
                     net = parse_ip_or_subnet(t)
                     branch_like_parts.append("NOT ip_in_network(?, line_text)")
@@ -912,21 +949,23 @@ class SearchEngine:
 
         return fts_query, (like_sql, like_params), keywords, extracted_subnets, has_mac_term
 
-    def search(self, query_str, limit=1000, file_type="all", is_regex=False, unique_files=False, is_mac=False, is_ip=False):
+    def search(self, query_str, limit=1000, file_type="all", is_regex=False, unique_files=False, is_mac=False, is_ip=False, is_subnet=False):
         """
         Performs multi-stage search across all files:
-        - MAC address multi-format search (e.g. '1111.1111.1111', '11:11:11:11:11:11', etc.)
-        - IP / CIDR Subnet range containment search (e.g. '1.0.0.0/8', '192.168.1.0/24')
+        - Subnet / CIDR range containment search when is_subnet=True (e.g. '1.0.0.0/8', '192.168.1.0/24')
+        - MAC address multi-format search when is_mac=True (e.g. '1111.1111.1111', '11:11:11:11:11:11', etc.)
         - Boolean AND / OR / NOT search (e.g. 'server OR user', '1.0.0.0/8 AND server', '10.0.0.0/8 OR 192.168.0.0/16')
-        - Regular expression pattern matching
+        - Regular expression pattern matching when is_regex=True
         - File-specific filtering (e.g. 'file:switch')
         - Multi-token LIKE fallback (checking both content and file path)
         - Bounded Fuzzy search fallback
         - Unique files deduplication when unique_files=True
         """
-        raw_query = query_str.strip()
+        if not query_str:
+            return [], 0.0, ""
+        raw_query = str(query_str).strip()
         if not raw_query:
-            return [], 0.0, "exact"
+            return [], 0.0, ""
 
         start_time = time.perf_counter()
         conn = self.get_connection()
@@ -952,9 +991,9 @@ class SearchEngine:
         base_filter_sql = (" AND " + " AND ".join(type_clauses)) if type_clauses else ""
         table_name = "fts_idx" if self.use_fts else "std_idx"
 
-        # Determine mode: MAC mode only applies when is_mac is explicitly enabled
+        # Determine mode: MAC and Subnet mode only apply when explicitly enabled
         is_mac_mode = bool(is_mac)
-        is_ip_mode = bool(is_ip)
+        is_subnet_mode = bool(is_subnet or is_ip)
 
         try:
             # Mode A: Regex Search
@@ -982,7 +1021,7 @@ class SearchEngine:
             # Mode B: Unified Boolean, Multi-Token, Subnet / CIDR & MAC Search
             elif effective_query:
                 fts_expr, (like_sql, like_params), keywords, extracted_subnets, has_mac_term = self._parse_boolean_query_sql(
-                    effective_query, is_mac=is_mac_mode, is_ip=is_ip_mode
+                    effective_query, is_mac=is_mac_mode, is_ip=is_subnet_mode, is_subnet=is_subnet_mode
                 )
 
                 if extracted_subnets:
@@ -1032,9 +1071,10 @@ class SearchEngine:
                     except sqlite3.Error:
                         pass
 
-                # Stage 3: Bounded Fuzzy Search Fallback (only for single word queries >= 4 chars without boolean operators/subnets)
+                # Stage 3: Bounded Fuzzy Search Fallback (only for single word queries >= 4 chars without boolean operators/subnets/IPs)
                 has_boolean_ops = any(op in effective_query.upper() for op in ("OR", "AND", "NOT", "|", "&"))
-                if not results and len(keywords) == 1 and len(keywords[0]) >= 4 and not is_phrase and not has_boolean_ops and not extracted_subnets and not is_mac_mode:
+                is_ip_or_subnet_token = (parse_ip_or_subnet(keywords[0]) is not None) if (len(keywords) == 1) else False
+                if not results and len(keywords) == 1 and len(keywords[0]) >= 4 and not is_phrase and not has_boolean_ops and not extracted_subnets and not is_mac_mode and not is_ip_or_subnet_token:
                     match_type = "fuzzy"
                     cur.execute(f"""
                         SELECT file_name, row_num, line_text, score FROM (
@@ -1510,6 +1550,10 @@ if HAS_TKINTER:
             lbl_search.pack(side="left", padx=(0, 6))
 
             self.search_var = tk.StringVar()
+            if hasattr(self.search_var, "trace_add"):
+                self.search_var.trace_add("write", self._on_search_var_changed)
+            else:
+                self.search_var.trace("w", self._on_search_var_changed)
             self.search_entry = ttk.Entry(search_row, textvariable=self.search_var, font=("Helvetica", 12))
             self.search_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
             self.search_entry.focus_set()
@@ -1522,6 +1566,12 @@ if HAS_TKINTER:
             regex_cb = ttk.Checkbutton(search_row, text="Regex Mode", variable=self.regex_var, command=self._on_regex_toggle)
             regex_cb.pack(side="left", padx=(0, 6))
             ToolTip(regex_cb, "Enable regular expression pattern matching (e.g. ^10\\.\\d+\\.\\d+ or (error|fail)) [Ctrl+R]")
+
+            # Subnet Mode toggle
+            self.subnet_var = tk.BooleanVar(value=False)
+            subnet_cb = ttk.Checkbutton(search_row, text="🌐 Subnet Mode", variable=self.subnet_var, command=self._on_subnet_toggle)
+            subnet_cb.pack(side="left", padx=(0, 6))
+            ToolTip(subnet_cb, "Enable subnet / CIDR search mode: matches IP addresses within subnet ranges (e.g. 192.168.1.0/24 or 10.0.0.0/8) [Ctrl+S]")
 
             # MAC Mode toggle
             self.mac_var = tk.BooleanVar(value=False)
@@ -1558,9 +1608,11 @@ if HAS_TKINTER:
 
             ttk.Label(hints_bar, text="💡 Quick Syntax:", font=("Helvetica", 8, "bold"), foreground="#475569").pack(side="left", padx=(0, 4))
 
-            def insert_syntax_sample(template):
+            def insert_syntax_sample(template, enable_subnet=False):
                 cur = self.search_var.get().strip()
                 new_val = f"{cur} {template}".strip() if cur else template
+                if enable_subnet:
+                    self.subnet_var.set(True)
                 self.search_var.set(new_val)
                 self.search_entry.focus_set()
                 self.search_entry.icursor(tk.END)
@@ -1579,9 +1631,9 @@ if HAS_TKINTER:
             btn_chip_quote.pack(side="left", padx=2)
             ToolTip(btn_chip_quote, 'Click to insert exact phrase quotes: matches word sequence verbatim (e.g. "Vlan 100")')
 
-            btn_chip_ip = ttk.Button(hints_bar, text="🌐 Subnet", width=9, command=lambda: insert_syntax_sample("1.0.0.0/8"))
+            btn_chip_ip = ttk.Button(hints_bar, text="🌐 Subnet", width=9, command=lambda: insert_syntax_sample("1.0.0.0/8", enable_subnet=True))
             btn_chip_ip.pack(side="left", padx=2)
-            ToolTip(btn_chip_ip, "Click to insert IP Subnet/CIDR search: matches any IP or subnet inside the range (e.g. '1.0.0.0/8' or '192.168.1.0/24')")
+            ToolTip(btn_chip_ip, "Click to insert IP Subnet/CIDR search and enable Subnet Mode: matches any IP or subnet inside the range (e.g. '1.0.0.0/8' or '192.168.1.0/24')")
 
             btn_chip_mac = ttk.Button(hints_bar, text="🏷️ MAC Mode", width=11, command=self._toggle_mac_mode)
             btn_chip_mac.pack(side="left", padx=2)
@@ -1688,10 +1740,16 @@ if HAS_TKINTER:
             self.tree.bind("<Control-c>", lambda e: self._copy_selected_row())
             self.tree.bind("<Command-c>", lambda e: self._copy_selected_row())
             self.tree.bind("<Up>", self._on_tree_up_arrow)
+            self.tree.bind("<BackSpace>", self._on_tree_backspace)
+            self.tree.bind("<Delete>", self._on_tree_delete)
 
             # Global Shortcuts
             self.root.bind("<Control-f>", lambda e: self._focus_search())
             self.root.bind("<Command-f>", lambda e: self._focus_search())
+            self.root.bind("<Control-s>", lambda e: self._toggle_subnet_mode())
+            self.root.bind("<Command-s>", lambda e: self._toggle_subnet_mode())
+            self.root.bind("<Control-b>", lambda e: self._toggle_subnet_mode())
+            self.root.bind("<Command-b>", lambda e: self._toggle_subnet_mode())
             self.root.bind("<Control-m>", lambda e: self._toggle_mac_mode())
             self.root.bind("<Command-m>", lambda e: self._toggle_mac_mode())
             self.root.bind("<Control-u>", lambda e: self._toggle_unique_mode())
@@ -1709,7 +1767,7 @@ if HAS_TKINTER:
             shortcuts_strip.pack(side="bottom", fill="x")
             lbl_strip = ttk.Label(
                 shortcuts_strip,
-                text="⌨️  [Ctrl/Cmd+F] Search   [Ctrl/Cmd+M] MAC Mode   [Ctrl/Cmd+U] 1 Match/File   [↑/↓] Navigate   [Enter] Open File   [Ctrl/Cmd+C] Copy Row   [Esc] Clear   [F1] Help Guide",
+                text="⌨️  [Ctrl/Cmd+F] Search   [Ctrl/Cmd+S] Subnet Mode   [Ctrl/Cmd+M] MAC Mode   [Ctrl/Cmd+U] 1 Match/File   [↑/↓] Navigate   [Enter] Open File   [Ctrl/Cmd+C] Copy Row   [Esc] Clear   [F1] Help Guide",
                 font=("Helvetica", 8),
                 foreground="#475569"
             )
@@ -1741,7 +1799,19 @@ if HAS_TKINTER:
             """Ensures mutually clean toggling for regex mode."""
             if self.regex_var.get():
                 self.mac_var.set(False)
+                self.subnet_var.set(False)
             self._perform_search()
+
+        def _on_subnet_toggle(self):
+            """Ensures clean toggling for subnet search mode."""
+            if self.subnet_var.get():
+                self.regex_var.set(False)
+            self._perform_search()
+
+        def _toggle_subnet_mode(self):
+            """Toggles Subnet search mode on/off."""
+            self.subnet_var.set(not self.subnet_var.get())
+            self._on_subnet_toggle()
 
         def _on_mac_toggle(self):
             """Ensures mutually clean toggling for MAC search mode."""
@@ -1853,10 +1923,18 @@ if HAS_TKINTER:
                 self.txt_detail.insert(tk.END, f" Searched all 9 notation variants for MAC '{effective_q}'. Ensure the target files contain this MAC address.\n")
 
             # Check if query looks like IP/CIDR
-            if is_ip_or_cidr_query(effective_q):
-                self.txt_detail.insert(tk.END, "  • ")
-                self.txt_detail.insert(tk.END, "Subnet Search:  ", "guide_tag")
-                self.txt_detail.insert(tk.END, f" Searched for any IP address or subnet inside '{effective_q}'. Check if the IP range covers your target.\n")
+            if hasattr(self, 'subnet_var') and self.subnet_var.get():
+                if query_contains_subnet_syntax(effective_q):
+                    self.txt_detail.insert(tk.END, "  • ")
+                    self.txt_detail.insert(tk.END, "Subnet Search:  ", "guide_tag")
+                    self.txt_detail.insert(tk.END, f" Searched for any IP address or subnet inside '{effective_q}'. Check if the IP range covers your target.\n")
+            else:
+                if query_contains_subnet_syntax(effective_q):
+                    self.txt_detail.insert(tk.END, "  • ")
+                    self.txt_detail.insert(tk.END, "Subnet Detected: ", "guide_tag")
+                    self.txt_detail.insert(tk.END, f" Your query '{effective_q}' looks like an IP/CIDR subnet. To search for IP range containment, enable ")
+                    self.txt_detail.insert(tk.END, "'Subnet Mode'", "guide_code")
+                    self.txt_detail.insert(tk.END, " above [Ctrl+S].\n")
 
             # Check if query uses quotes
             if '"' in query:
@@ -1922,7 +2000,7 @@ if HAS_TKINTER:
 
             content_sections = [
                 ("1. ADVANCED QUERY SYNTAX", [
-                    ("IP Subnet Search", "1.0.0.0/8 (or '192.168.1.0/24')", "Searches and matches any IP or subnet contained inside the CIDR range."),
+                    ("Subnet Mode", "🌐 Subnet Mode (Ctrl+S)", "When enabled, searches and matches any IP or subnet contained inside the CIDR range (e.g. '1.0.0.0/8' or '192.168.1.0/24'). When disabled, searches text verbatim."),
                     ("MAC Address Search", "1111.1111.1111 (or 11:11:11:11:11:11)", "Searches all 9 formats (Cisco, IEEE colon, dot, hyphen, space, flat raw hex)."),
                     ("AND Operator", "server AND prod (or 'server && prod')", "Matches rows that contain ALL specified terms."),
                     ("OR Operator", "sw01 OR sw02 (or 'sw01 | sw02')", "Matches rows that contain AT LEAST ONE of the terms."),
@@ -1934,6 +2012,8 @@ if HAS_TKINTER:
                 ]),
                 ("2. KEYBOARD SHORTCUTS", [
                     ("Ctrl+F / Cmd+F", "Focus search input bar", "Quickly jump to the search box from anywhere."),
+                    ("Ctrl+S / Cmd+S", "Toggle Subnet Mode", "Toggles Subnet / CIDR range search mode on/off."),
+                    ("Ctrl+M / Cmd+M", "Toggle MAC Mode", "Toggles multi-format MAC address search mode on/off."),
                     ("Ctrl+U / Cmd+U", "Toggle Unique Files (1 Match/File)", "Toggles showing each unique file only once in results."),
                     ("Down Arrow (↓)", "Move from search box to results table", "Navigate directly to search results."),
                     ("Up Arrow (↑)", "Move from top row back to search box", "Jump back to editing your search query."),
@@ -2027,7 +2107,8 @@ if HAS_TKINTER:
                         results, elapsed_ms, match_type, query, counter = data
                         with self._search_lock:
                             is_latest = (counter == self._search_counter)
-                        if is_latest and self.search_var.get().strip() == query:
+                        current_q = self.search_var.get().strip()
+                        if is_latest and current_q and current_q == query:
                             self._apply_search_results(results, elapsed_ms, match_type, query)
             except queue.Empty:
                 pass
@@ -2093,21 +2174,54 @@ if HAS_TKINTER:
             except Exception:
                 pass
 
+        def _on_search_var_changed(self, *args):
+            """Triggered immediately whenever search text changes via typing, deletion, paste, cut, or clear."""
+            if self._debounce_job:
+                try:
+                    self.root.after_cancel(self._debounce_job)
+                except Exception:
+                    pass
+                self._debounce_job = None
+
+            q = self.search_var.get().strip()
+            if not q:
+                # All characters deleted: immediately invalidate in-flight searches and reset view without lag
+                with self._search_lock:
+                    self._search_counter += 1
+                self._perform_search()
+            else:
+                self._set_action_status("typing", f"⏳ Pending user to finish typing... ('{q}')")
+                q_len = len(q)
+                delay_ms = 100 if q_len < 3 else 60
+                self._debounce_job = self.root.after(delay_ms, self._perform_search)
+
+        def _on_tree_backspace(self, event):
+            self.search_entry.focus_set()
+            cur = self.search_var.get()
+            if cur:
+                self.search_var.set(cur[:-1])
+                self.search_entry.icursor(tk.END)
+            return "break"
+
+        def _on_tree_delete(self, event):
+            self.search_entry.focus_set()
+            self.search_entry.icursor(tk.END)
+            return "break"
+
         def _on_key_release(self, event):
             if event.keysym in ("Up", "Down", "Left", "Right", "Return", "Escape", "Control_L", "Control_R", "F1"):
                 return
-            if self._debounce_job:
-                self.root.after_cancel(self._debounce_job)
-
             q = self.search_var.get().strip()
-            if q:
-                self._set_action_status("typing", f"⏳ Pending user to finish typing... ('{q}')")
-            else:
-                self._set_action_status("ready", "🔍 Ready | Type keywords, MAC address (full/last 4), or Subnet (1.0.0.0/8) to search")
-
-            q_len = len(q)
-            delay_ms = 180 if q_len < 3 else 90
-            self._debounce_job = self.root.after(delay_ms, self._perform_search)
+            if not q:
+                if self._debounce_job:
+                    try:
+                        self.root.after_cancel(self._debounce_job)
+                    except Exception:
+                        pass
+                    self._debounce_job = None
+                with self._search_lock:
+                    self._search_counter += 1
+                self._perform_search()
 
         def _on_search_down_arrow(self, event):
             children = self.tree.get_children()
@@ -2130,13 +2244,25 @@ if HAS_TKINTER:
             self.search_entry.select_range(0, tk.END)
 
         def _perform_search(self):
+            if self._debounce_job:
+                try:
+                    self.root.after_cancel(self._debounce_job)
+                except Exception:
+                    pass
+                self._debounce_job = None
+
             query = self.search_var.get().strip()
 
             if not query:
+                with self._search_lock:
+                    self._search_counter += 1
                 for item in self.tree.get_children():
                     self.tree.delete(item)
                 self._render_welcome_guide()
                 self._current_results = []
+                self._active_match_type = "exact"
+                self._active_file_path = None
+                self._active_match_rnum = None
                 self.lbl_status.config(text="Ready | Type keywords or click quick syntax chips above...")
                 self._set_action_status("ready", "🔍 Ready | Type keywords, MAC address (full/last 4), or Subnet (1.0.0.0/8) to search")
                 self.btn_load_full.pack_forget()
@@ -2153,6 +2279,7 @@ if HAS_TKINTER:
             is_regex = self.regex_var.get()
             is_unique = self.unique_var.get()
             is_mac = self.mac_var.get()
+            is_subnet = self.subnet_var.get() if hasattr(self, 'subnet_var') else False
 
             with self._search_lock:
                 self._search_counter += 1
@@ -2161,18 +2288,19 @@ if HAS_TKINTER:
             self.lbl_status.config(text=f"Searching for '{query}'...")
             self._set_action_status("searching", f"⚡ Searching database for '{query}'...")
 
-            def search_worker(q, ftype, regex_flag, unique_flag, mac_flag, counter):
+            def search_worker(q, ftype, regex_flag, unique_flag, mac_flag, subnet_flag, counter):
                 results, elapsed_ms, match_type = self.engine.search(
                     q,
                     limit=1000,
                     file_type=ftype,
                     is_regex=regex_flag,
                     unique_files=unique_flag,
-                    is_mac=mac_flag
+                    is_mac=mac_flag,
+                    is_subnet=subnet_flag
                 )
                 self._msg_queue.put(("search_results", (results, elapsed_ms, match_type, q, counter)))
 
-            threading.Thread(target=search_worker, args=(query, file_type, is_regex, is_unique, is_mac, current_counter), daemon=True).start()
+            threading.Thread(target=search_worker, args=(query, file_type, is_regex, is_unique, is_mac, is_subnet, current_counter), daemon=True).start()
 
         def _apply_search_results(self, results, elapsed_ms, match_type, query):
             for item in self.tree.get_children():
@@ -2260,22 +2388,24 @@ if HAS_TKINTER:
                 return
 
             # Case C: Subnets Highlighting (supports multi-subnet OR / AND queries)
-            subnets = extract_subnets_from_query(query)
-            if subnets:
-                for target_net in subnets:
-                    matched_ips = extract_matching_ips_in_text(target_net, full_text)
-                    for mip in matched_ips:
-                        start_pos = "1.0"
-                        while True:
-                            start_pos = self.txt_detail.search(mip, start_pos, stopindex=tk.END, nocase=False)
-                            if not start_pos:
-                                break
-                            end_pos = f"{start_pos}+{len(mip)}c"
-                            self.txt_detail.tag_add("match_query", start_pos, end_pos)
-                            start_pos = end_pos
+            is_subnet_active = (match_type == "ip_subnet") or (hasattr(self, "subnet_var") and self.subnet_var.get())
+            if is_subnet_active:
+                subnets = extract_subnets_from_query(query, is_subnet_mode=True)
+                if subnets:
+                    for target_net in subnets:
+                        matched_ips = extract_matching_ips_in_text(target_net, full_text)
+                        for mip in matched_ips:
+                            start_pos = "1.0"
+                            while True:
+                                start_pos = self.txt_detail.search(mip, start_pos, stopindex=tk.END, nocase=False)
+                                if not start_pos:
+                                    break
+                                end_pos = f"{start_pos}+{len(mip)}c"
+                                self.txt_detail.tag_add("match_query", start_pos, end_pos)
+                                start_pos = end_pos
 
             # Case D: MAC Address Highlighting (if in MAC mode)
-            if match_type == "mac" or self.mac_var.get():
+            if match_type == "mac" or (hasattr(self, "mac_var") and self.mac_var.get()):
                 tokens = re.findall(r'"[^"]+"|\S+', query)
                 for tok in tokens:
                     t_clean = tok.strip('"\',()')
@@ -2294,9 +2424,9 @@ if HAS_TKINTER:
             # Case E: Exact / Multi-token / Boolean Search Highlighting
             keywords = extract_search_keywords(query)
             for kw in keywords:
-                if "/" in kw and parse_ip_or_subnet(kw) is not None:
+                if is_subnet_active and "/" in kw and parse_ip_or_subnet(kw) is not None:
                     continue
-                if (match_type == "mac" or self.mac_var.get()) and is_mac_address(kw):
+                if (match_type == "mac" or (hasattr(self, "mac_var") and self.mac_var.get())) and is_mac_address(kw):
                     continue
                 if not kw:
                     continue
@@ -2577,13 +2707,14 @@ def colorize_cli_match(text: str, query: str, match_type: str, is_regex: bool) -
     result = text
 
     # 1. Highlight all matching IP addresses across all subnets in the query
-    subnets = extract_subnets_from_query(query)
-    if subnets:
-        for target_net in subnets:
-            matched_ips = extract_matching_ips_in_text(target_net, result)
-            for mip in matched_ips:
-                pat = re.escape(mip)
-                result = re.sub(f"({pat})", r"\033[1;93;1m\1\033[0m", result)
+    if match_type == "ip_subnet":
+        subnets = extract_subnets_from_query(query, is_subnet_mode=True)
+        if subnets:
+            for target_net in subnets:
+                matched_ips = extract_matching_ips_in_text(target_net, result)
+                for mip in matched_ips:
+                    pat = re.escape(mip)
+                    result = re.sub(f"({pat})", r"\033[1;93;1m\1\033[0m", result)
 
     # 2. Highlight MAC variants if in MAC mode
     if match_type == "mac":
@@ -2596,10 +2727,10 @@ def colorize_cli_match(text: str, query: str, match_type: str, is_regex: bool) -
                     pat = re.escape(v)
                     result = re.sub(f"({pat})", r"\033[1;93;1m\1\033[0m", result, flags=re.IGNORECASE)
 
-    # 3. Standard text keywords (omitting CIDR subnets and MAC tokens)
+    # 3. Standard text keywords (omitting CIDR subnets in subnet mode and MAC tokens in MAC mode)
     keywords = extract_search_keywords(query)
     for kw in keywords:
-        if "/" in kw and parse_ip_or_subnet(kw) is not None:
+        if match_type == "ip_subnet" and "/" in kw and parse_ip_or_subnet(kw) is not None:
             continue
         if match_type == "mac" and is_mac_address(kw):
             continue
@@ -2630,6 +2761,7 @@ def run_interactive_cli(stdscr, content_dir=DEFAULT_CONTENT_DIR):
     is_regex = False
     is_unique = False
     is_mac = False
+    is_subnet = False
 
     while True:
         stdscr.clear()
@@ -2654,6 +2786,7 @@ def run_interactive_cli(stdscr, content_dir=DEFAULT_CONTENT_DIR):
         mode_label = {"csv": "CSV Only", "text": "Text Only", "all": "All Files"}[filter_modes[filter_idx]]
         reg_label = " [Regex: ON]" if is_regex else ""
         mac_label = " [MAC: ON]" if is_mac else ""
+        subnet_label = " [Subnet: ON]" if is_subnet else ""
         uniq_label = " [Unique: ON]" if is_unique else ""
 
         if results and 0 <= selected_idx < len(results):
@@ -2671,7 +2804,7 @@ def run_interactive_cli(stdscr, content_dir=DEFAULT_CONTENT_DIR):
             else:
                 type_str = ""
 
-        info_str = f" Matches: {len(results)}{type_str}{reg_label}{mac_label}{uniq_label} | Time: {elapsed_ms:.1f}ms | Filter: {mode_label} [Tab] | {idx_str} "
+        info_str = f" Matches: {len(results)}{type_str}{reg_label}{mac_label}{subnet_label}{uniq_label} | Time: {elapsed_ms:.1f}ms | Filter: {mode_label} [Tab] | {idx_str} "
         stdscr.addstr(3, 2, info_str[:max_x - 4], getattr(curses, 'A_DIM', curses.A_NORMAL))
 
         stdscr.addstr(4, 0, "─" * max_x)
@@ -2694,7 +2827,7 @@ def run_interactive_cli(stdscr, content_dir=DEFAULT_CONTENT_DIR):
                 else:
                     stdscr.addstr(row_y, 2, line_disp)
 
-        footer = " [Esc: Clear | Enter: Open | Tab: Filter | F2/Ctrl+O: MAC | F3/Ctrl+R: Regex | F4: Unique | F5: Save | ↑/↓: Select] "
+        footer = " [Esc: Clear | Enter: Open | Tab: Filter | F2: MAC | F3: Regex | F7/Ctrl+B: Subnet | F4: Unique | F5: Save | ↑/↓: Select] "
         try:
             stdscr.addstr(max_y - 1, 0, footer.center(max_x), curses.A_REVERSE)
         except curses.error:
@@ -2724,24 +2857,32 @@ def run_interactive_cli(stdscr, content_dir=DEFAULT_CONTENT_DIR):
             if is_mac:
                 is_regex = False
             if query:
-                results, elapsed_ms, match_type = engine.search(query, file_type=filter_modes[filter_idx], is_regex=is_regex, unique_files=is_unique, is_mac=is_mac)
+                results, elapsed_ms, match_type = engine.search(query, file_type=filter_modes[filter_idx], is_regex=is_regex, unique_files=is_unique, is_mac=is_mac, is_subnet=is_subnet)
                 selected_idx = 0
         elif ch in (getattr(curses, 'KEY_F3', 267), 18): # F3 or Ctrl+R -> Toggle Regex
             is_regex = not is_regex
             if is_regex:
                 is_mac = False
+                is_subnet = False
             if query:
-                results, elapsed_ms, match_type = engine.search(query, file_type=filter_modes[filter_idx], is_regex=is_regex, unique_files=is_unique, is_mac=is_mac)
+                results, elapsed_ms, match_type = engine.search(query, file_type=filter_modes[filter_idx], is_regex=is_regex, unique_files=is_unique, is_mac=is_mac, is_subnet=is_subnet)
+                selected_idx = 0
+        elif ch in (getattr(curses, 'KEY_F7', 271), 2): # F7 or Ctrl+B -> Toggle Subnet mode
+            is_subnet = not is_subnet
+            if is_subnet:
+                is_regex = False
+            if query:
+                results, elapsed_ms, match_type = engine.search(query, file_type=filter_modes[filter_idx], is_regex=is_regex, unique_files=is_unique, is_mac=is_mac, is_subnet=is_subnet)
                 selected_idx = 0
         elif ch in (getattr(curses, 'KEY_F4', 268), 21): # F4 or Ctrl+U -> Toggle Unique Files mode
             is_unique = not is_unique
             if query:
-                results, elapsed_ms, match_type = engine.search(query, file_type=filter_modes[filter_idx], is_regex=is_regex, unique_files=is_unique, is_mac=is_mac)
+                results, elapsed_ms, match_type = engine.search(query, file_type=filter_modes[filter_idx], is_regex=is_regex, unique_files=is_unique, is_mac=is_mac, is_subnet=is_subnet)
                 selected_idx = 0
         elif ch in (9, ord('\t')): # Tab key toggles file filter
             filter_idx = (filter_idx + 1) % len(filter_modes)
             if query:
-                results, elapsed_ms, match_type = engine.search(query, file_type=filter_modes[filter_idx], is_regex=is_regex, unique_files=is_unique, is_mac=is_mac)
+                results, elapsed_ms, match_type = engine.search(query, file_type=filter_modes[filter_idx], is_regex=is_regex, unique_files=is_unique, is_mac=is_mac, is_subnet=is_subnet)
                 selected_idx = 0
         elif ch in (10, 13, getattr(curses, "KEY_ENTER", 10)): # Enter opens file
             if results and 0 <= selected_idx < len(results):
@@ -2779,10 +2920,15 @@ def run_interactive_cli(stdscr, content_dir=DEFAULT_CONTENT_DIR):
                             writer.writerow([f"{score}%", fname, rnum, ltext])
                 except Exception:
                     pass
-        elif ch in (curses.KEY_BACKSPACE, 127, 8):
+        elif ch in (curses.KEY_BACKSPACE, 127, 8, getattr(curses, 'KEY_DC', 330)):
             if query:
                 query = query[:-1]
-                results, elapsed_ms, match_type = engine.search(query, file_type=filter_modes[filter_idx], is_regex=is_regex, unique_files=is_unique, is_mac=is_mac)
+                if query:
+                    results, elapsed_ms, match_type = engine.search(query, file_type=filter_modes[filter_idx], is_regex=is_regex, unique_files=is_unique, is_mac=is_mac, is_subnet=is_subnet)
+                else:
+                    results = []
+                    elapsed_ms = 0.0
+                    match_type = ""
                 selected_idx = 0
         elif ch == curses.KEY_UP:
             if selected_idx > 0:
@@ -2792,11 +2938,11 @@ def run_interactive_cli(stdscr, content_dir=DEFAULT_CONTENT_DIR):
                 selected_idx += 1
         elif 32 <= ch <= 126:
             query += chr(ch)
-            results, elapsed_ms, match_type = engine.search(query, file_type=filter_modes[filter_idx], is_regex=is_regex, unique_files=is_unique, is_mac=is_mac)
+            results, elapsed_ms, match_type = engine.search(query, file_type=filter_modes[filter_idx], is_regex=is_regex, unique_files=is_unique, is_mac=is_mac, is_subnet=is_subnet)
             selected_idx = 0
 
 
-def run_interactive_repl(content_dir=DEFAULT_CONTENT_DIR, file_type="all", unique_files=False, is_mac=False, is_ip=False):
+def run_interactive_repl(content_dir=DEFAULT_CONTENT_DIR, file_type="all", unique_files=False, is_mac=False, is_ip=False, is_subnet=False):
     """Continuous REPL prompt for terminal users without curses."""
     engine = SearchEngine(content_dir=content_dir)
     indexer = BackgroundIndexer(engine, content_dir=content_dir)
@@ -2810,7 +2956,7 @@ def run_interactive_repl(content_dir=DEFAULT_CONTENT_DIR, file_type="all", uniqu
     print(f"  🔍 QSearch Interactive CLI REPL (Directory: {content_dir})")
     print(f"  📊 Index: {fc} files ({rc:,} rows) | Last DB Sync: {update_t}")
     print(f"  📁 Last Scan: {scan_t} ({format_relative_time(l_scan)})")
-    print("  Commands: :help | :info | :filter [csv|text|all] | :mac | :ip | :regex | :unique | :open <row> | :quit")
+    print("  Commands: :help | :info | :filter [csv|text|all] | :subnet | :mac | :regex | :unique | :open <row> | :quit")
     print("  Syntax:   1.0.0.0/8 | 1111.1111.1111 | server AND prod | word1 OR word2 | file:name")
     print("=" * 75)
 
@@ -2819,7 +2965,7 @@ def run_interactive_repl(content_dir=DEFAULT_CONTENT_DIR, file_type="all", uniqu
     regex_mode = False
     unique_mode = unique_files
     mac_mode = is_mac
-    ip_mode = is_ip
+    subnet_mode = bool(is_subnet or is_ip)
 
     while True:
         try:
@@ -2828,8 +2974,8 @@ def run_interactive_repl(content_dir=DEFAULT_CONTENT_DIR, file_type="all", uniqu
                 flags.append("Regex")
             if mac_mode:
                 flags.append("MAC")
-            if ip_mode:
-                flags.append("IP")
+            if subnet_mode:
+                flags.append("Subnet")
             if unique_mode:
                 flags.append("Unique")
             flag_str = f" [{', '.join(flags)}]" if flags else ""
@@ -2853,14 +2999,14 @@ def run_interactive_repl(content_dir=DEFAULT_CONTENT_DIR, file_type="all", uniqu
             print("\n📖 QSearch CLI REPL Commands & Query Syntax:")
             print("  :info / :stats          Show database sync & filesystem scan timestamps")
             print("  :filter [csv|text|all]  Change active file filter")
+            print("  :subnet / :s            Toggle Subnet search mode (IP/CIDR containment)")
             print("  :mac                    Toggle forced MAC address search mode")
-            print("  :ip                     Toggle forced IP / Subnet search mode")
             print("  :regex                  Toggle regular expression search mode")
             print("  :unique / :u            Toggle unique files mode (1 match per file)")
             print("  :open <num>             Open matched file in default application")
             print("  :quit / :q / exit       Exit QSearch")
             print("\n💡 Search Syntax Examples:")
-            print("  • IP Subnet:     1.0.0.0/8             (matches any IP/subnet inside 1.0.0.0/8)")
+            print("  • IP Subnet:     1.0.0.0/8             (matches any IP/subnet inside 1.0.0.0/8 when Subnet mode is ON)")
             print("  • MAC Address:   1111.1111.1111        (searches all 9 formats: ., :, -, space, flat)")
             print("  • AND Search:    server AND prod       (requires both terms)")
             print("  • OR Search:     vlan10 OR vlan20      (matches either term)")
@@ -2871,25 +3017,25 @@ def run_interactive_repl(content_dir=DEFAULT_CONTENT_DIR, file_type="all", uniqu
             continue
         if cmd in (":quit", ":q", "exit", "quit"):
             break
+        if cmd in (":subnet", ":s", ":ip"):
+            subnet_mode = not subnet_mode
+            if subnet_mode:
+                mac_mode = False
+                regex_mode = False
+            print(f"[Subnet mode: {'ON' if subnet_mode else 'OFF'}]")
+            continue
         if cmd == ":mac":
             mac_mode = not mac_mode
             if mac_mode:
-                ip_mode = False
+                subnet_mode = False
                 regex_mode = False
             print(f"[MAC address mode: {'ON' if mac_mode else 'OFF'}]")
-            continue
-        if cmd == ":ip":
-            ip_mode = not ip_mode
-            if ip_mode:
-                mac_mode = False
-                regex_mode = False
-            print(f"[IP / Subnet mode: {'ON' if ip_mode else 'OFF'}]")
             continue
         if cmd == ":regex":
             regex_mode = not regex_mode
             if regex_mode:
                 mac_mode = False
-                ip_mode = False
+                subnet_mode = False
             print(f"[Regex mode: {'ON' if regex_mode else 'OFF'}]")
             continue
         if cmd in (":unique", ":u"):
@@ -2922,7 +3068,7 @@ def run_interactive_repl(content_dir=DEFAULT_CONTENT_DIR, file_type="all", uniqu
             is_regex=regex_mode,
             unique_files=unique_mode,
             is_mac=mac_mode,
-            is_ip=ip_mode
+            is_subnet=subnet_mode
         )
         last_results = results
 
@@ -2951,12 +3097,14 @@ def run_interactive_repl(content_dir=DEFAULT_CONTENT_DIR, file_type="all", uniqu
         print("─" * 70)
 
 
-def run_direct_cli_search(query, content_dir=DEFAULT_CONTENT_DIR, file_type="all", is_regex=False, unique_files=False, is_mac=False, is_ip=False, output_format="text", csv_out_path=None):
+def run_direct_cli_search(query, content_dir=DEFAULT_CONTENT_DIR, file_type="all", is_regex=False, unique_files=False, is_mac=False, is_ip=False, is_subnet=False, output_format="text", csv_out_path=None):
     """Executes single search query directly from terminal arguments with front percentage & keyword highlighting."""
     engine = SearchEngine(content_dir=content_dir)
 
     indexer = BackgroundIndexer(engine, content_dir=content_dir)
     indexer.sync_content_directory()
+
+    is_subnet_mode = bool(is_subnet or is_ip)
 
     results, elapsed_ms, match_type = engine.search(
         query,
@@ -2965,7 +3113,7 @@ def run_direct_cli_search(query, content_dir=DEFAULT_CONTENT_DIR, file_type="all
         is_regex=is_regex,
         unique_files=unique_files,
         is_mac=is_mac,
-        is_ip=is_ip
+        is_subnet=is_subnet_mode
     )
 
     # Format 1: JSON Output
@@ -3044,8 +3192,9 @@ def main():
     parser.add_argument("-c", "--csv", action="store_true", help="Search only CSV files")
     parser.add_argument("-t", "--text", action="store_true", help="Search only non-CSV text files (.txt, .log, etc.)")
     parser.add_argument("-a", "--all", action="store_true", help="Search all indexed text and CSV files (default)")
+    parser.add_argument("-s", "--subnet", dest="subnet", action="store_true", help="Enable Subnet Mode to search IP/CIDR containment (e.g. 1.0.0.0/8)")
+    parser.add_argument("-i", "--ip", "--net", dest="ip", action="store_true", help="Alias for --subnet: Force IP / Subnet search matching all IPs/subnets inside CIDR range (e.g. 1.0.0.0/8)")
     parser.add_argument("-m", "--mac", action="store_true", help="Force MAC address search across all formats (1111.1111.1111, 11:11:11:11:11:11, etc.)")
-    parser.add_argument("-i", "--ip", "--net", dest="ip", action="store_true", help="Force IP / Subnet search matching all IPs/subnets inside CIDR range (e.g. 1.0.0.0/8)")
     parser.add_argument("-r", "--regex", action="store_true", help="Enable regular expression matching")
     parser.add_argument("-u", "--unique", action="store_true", help="Show each matching file only once (1 match per file)")
     parser.add_argument("--json", action="store_true", help="Output results in JSON format")
@@ -3080,6 +3229,8 @@ def main():
         # actually does something instead of being a documented no-op.
         file_type = "all"
 
+    is_subnet_arg = bool(args.subnet or args.ip)
+
     # Case 1: Direct one-shot search
     if args.query:
         search_query = " ".join(args.query)
@@ -3091,7 +3242,7 @@ def main():
             is_regex=args.regex,
             unique_files=args.unique,
             is_mac=args.mac,
-            is_ip=args.ip,
+            is_subnet=is_subnet_arg,
             output_format=out_fmt,
             csv_out_path=args.csv_out
         )
@@ -3099,7 +3250,7 @@ def main():
 
     # Case 2: REPL prompt
     if args.repl:
-        run_interactive_repl(content_dir=content_dir, file_type=file_type, unique_files=args.unique, is_mac=args.mac, is_ip=args.ip)
+        run_interactive_repl(content_dir=content_dir, file_type=file_type, unique_files=args.unique, is_mac=args.mac, is_subnet=is_subnet_arg)
         return
 
     # Case 3: GUI Mode
@@ -3114,6 +3265,8 @@ def main():
                 app.regex_var.set(True)
             if args.mac:
                 app.mac_var.set(True)
+            if is_subnet_arg:
+                app.subnet_var.set(True)
             if file_type == "csv":
                 app.filter_var.set("CSV Files Only")
             elif file_type == "text":
@@ -3133,7 +3286,7 @@ def main():
             except KeyboardInterrupt:
                 sys.exit(0)
         else:
-            run_interactive_repl(content_dir=content_dir, file_type=file_type, unique_files=args.unique, is_mac=args.mac, is_ip=args.ip)
+            run_interactive_repl(content_dir=content_dir, file_type=file_type, unique_files=args.unique, is_mac=args.mac, is_subnet=is_subnet_arg)
 
 
 if __name__ == "__main__":

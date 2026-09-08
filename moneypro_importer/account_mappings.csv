@@ -1,0 +1,11 @@
+BankPattern,MoneyProAccount
+4500********1234,CIBC Visa (...1234)
+00012345678,CIBC Chequing (...5678)
+40-00-00 12345678,HSBC Premier (...5678)
+cibc_visa,CIBC Visa
+cibc_chequing,CIBC Chequing
+cibc_dividend,CIBC Visa Dividend
+hsbc_premier,HSBC Premier
+hsbc_chequing,HSBC Chequing
+hsbc_uk,HSBC UK Premier
+hsbc_hk,HSBC HK
