@@ -367,6 +367,17 @@ class TestSearchEngineIntegration(unittest.TestCase):
         res_file_only, _, _ = self.engine.search("file: router")
         self.assertTrue(len(res_file_only) > 0)
 
+    def test_long_search_pattern_speed(self):
+        """Long search patterns must execute under 50ms without full-table LIKE scanning."""
+        import time
+        long_query = "srv-web-01 AND active AND 192.168.1.51"
+        t0 = time.perf_counter()
+        res, elapsed, match_type = self.engine.search(long_query)
+        t1 = time.perf_counter()
+        self.assertLess((t1 - t0) * 1000.0, 50.0, "Long pattern search took too long (> 50ms)")
+        self.assertEqual(match_type, "exact")
+        self.assertTrue(len(res) > 0)
+
 
 
 def run_all_tests():

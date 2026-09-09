@@ -132,30 +132,18 @@ def _fuzzy_score(query, text):
     if not query or not text:
         return 0
     q = query.lower().strip()
-    # Fuzzy matching is designed for single-word typos (<= 30 chars)
-    if len(q) > 30:
-        return 0
     t = text.lower().strip()
 
     if q in t:
         return 100
 
-    len_q = len(q)
-    min_len = max(2, int(len_q * 0.5))
-    max_len = int(len_q * 1.8)
-
-    words = [w for w in re.split(r'[\s|,;:]+', t) if min_len <= len(w) <= max_len]
+    words = [w for w in re.split(r'[\s|,;:]+', t) if len(w) >= 2]
     best_score = 0
     for w in words:
-        matcher = difflib.SequenceMatcher(None, q, w)
-        if matcher.real_quick_ratio() < 0.6:
-            continue
-        ratio = matcher.ratio()
+        ratio = difflib.SequenceMatcher(None, q, w).ratio()
         score = int(ratio * 100)
         if score > best_score:
             best_score = score
-            if best_score >= 95:
-                break
     return best_score
 
 
@@ -479,20 +467,12 @@ def get_fuzzy_matched_words(query: str, text: str) -> List[str]:
     if not query or not text:
         return []
     q_clean = query.lower().strip()
-    if len(q_clean) > 30:
-        return []
-    len_q = len(q_clean)
-    min_len = max(2, int(len_q * 0.5))
-    max_len = int(len_q * 1.8)
-    words = [w for w in re.split(r'[\s|,;:]+', text) if min_len <= len(w) <= max_len]
+    words = [w for w in re.split(r'[\s|,;:]+', text) if len(w) >= 2]
     matched = []
     best_score = 0
     best_word = None
     for w in words:
-        matcher = difflib.SequenceMatcher(None, q_clean, w.lower())
-        if matcher.real_quick_ratio() < 0.5:
-            continue
-        ratio = matcher.ratio() * 100
+        ratio = difflib.SequenceMatcher(None, q_clean, w.lower()).ratio() * 100
         if ratio > best_score:
             best_score = ratio
             best_word = w
@@ -640,7 +620,6 @@ class SearchEngine:
         self.content_dir = Path(content_dir).resolve()
         self.use_fts = True
         self._headers_cache = {}
-        self._file_info_cache: Dict[str, Dict[str, Any]] = {}
         self._init_db()
         self.refresh_headers_cache()
 
@@ -667,7 +646,6 @@ class SearchEngine:
                     except Exception:
                         pass
             self._headers_cache = cache
-            self._file_info_cache.clear()
             conn.close()
         except Exception:
             pass
@@ -677,9 +655,6 @@ class SearchEngine:
         conn = sqlite3.connect(self.db_path, timeout=10.0)
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
-        conn.execute("PRAGMA cache_size = -64000;")
-        conn.execute("PRAGMA mmap_size = 268435456;")
-        conn.execute("PRAGMA temp_store = MEMORY;")
         conn.create_function("fuzzy_score", 2, _fuzzy_score)
         conn.create_function("regexp", 2, _sqlite_regexp)
         conn.create_function("ip_in_network", 2, _sqlite_ip_in_network)
@@ -801,8 +776,6 @@ class SearchEngine:
 
     def get_file_info(self, file_name: str) -> Optional[Dict[str, Any]]:
         """Retrieves detailed file metadata (mtime, size, row_count, headers, indexed_at) from file_meta."""
-        if hasattr(self, "_file_info_cache") and file_name in self._file_info_cache:
-            return self._file_info_cache[file_name]
         try:
             conn = self.get_connection()
             cur = conn.cursor()
@@ -820,7 +793,7 @@ class SearchEngine:
                         headers = json.loads(row[3])
                     except Exception:
                         headers = []
-                info = {
+                return {
                     "mtime": row[0],
                     "size": row[1],
                     "row_count": row[2],
@@ -828,19 +801,15 @@ class SearchEngine:
                     "indexed_at": row[4],
                     "file_path": row[5]
                 }
-                if hasattr(self, "_file_info_cache"):
-                    self._file_info_cache[file_name] = info
-                return info
         except Exception:
             pass
         return None
 
-    def _parse_boolean_query_sql(self, query_str: str, is_mac: bool = False, is_ip: bool = False, is_subnet: bool = False) -> Tuple[Optional[str], Tuple[Optional[str], List[Any]], Tuple[Optional[str], List[Any]], List[str], List[Any], bool]:
+    def _parse_boolean_query_sql(self, query_str: str, is_mac: bool = False, is_ip: bool = False, is_subnet: bool = False) -> Tuple[Optional[str], Tuple[Optional[str], List[Any]], List[str], List[Any], bool]:
         """
         Parses query containing 'AND', 'OR', 'NOT', '|', '&', subnets, and MAC tokens into:
         - FTS5 MATCH expression
-        - Residual SQL filter (only for tokens FTS cannot handle: <3 char tokens, subnet containment, NOT exclusions)
-        - Fallback SQL LIKE filter (for use when FTS is unavailable)
+        - Standard SQL LIKE/ip_in_network WHERE expression
         - List of extracted keywords (for text highlighting)
         - List of extracted CIDR networks (for IP highlighting)
         - has_mac_term boolean
@@ -854,11 +823,8 @@ class SearchEngine:
         or_parts = [p.strip() for p in re.split(r'\s+(?:OR|or|\|)\s+', query_str) if p.strip()]
 
         fts_or_clauses = []
-        fallback_or_clauses = []
-        fallback_params = []
-        residual_or_clauses = []
-        residual_params = []
-        any_residual_present = False
+        like_or_clauses = []
+        like_params = []
 
         for or_branch in or_parts:
             # Tokenize while keeping "quoted phrases" intact as a single atomic term
@@ -900,8 +866,7 @@ class SearchEngine:
 
             branch_fts_pos = []
             branch_fts_neg = []
-            branch_fallback_parts = []
-            branch_residual_parts = []
+            branch_like_parts = []
 
             for t in positive_terms:
                 t_sub = t[:-1] if (t.endswith('/') and len(t) > 1) else t
@@ -923,17 +888,13 @@ class SearchEngine:
                             pfx = f"{octs[0]}."
 
                     if pfx:
-                        branch_fallback_parts.append("(ip_in_network(?, line_text) AND line_text LIKE ?)")
-                        fallback_params.extend([str(net), f"%{pfx}%"])
+                        branch_like_parts.append("(ip_in_network(?, line_text) AND line_text LIKE ?)")
+                        like_params.extend([str(net), f"%{pfx}%"])
                         if len(pfx) >= 3:
                             branch_fts_pos.append(f'"{pfx}"')
                     else:
-                        branch_fallback_parts.append("ip_in_network(?, line_text)")
-                        fallback_params.append(str(net))
-
-                    # Subnet containment always requires exact IP evaluation
-                    branch_residual_parts.append("ip_in_network(?, line_text)")
-                    residual_params.append(str(net))
+                        branch_like_parts.append("ip_in_network(?, line_text)")
+                        like_params.append(str(net))
 
                 else:
                     t_mac_candidate = t.rstrip(':.-') if (len(t) > 3 and any(c in t for c in ':.-')) else t
@@ -941,47 +902,34 @@ class SearchEngine:
                         has_mac_term = True
                         variants = generate_mac_variants(t_mac_candidate)
                         mac_subclauses = ["(line_text LIKE ? OR file_name LIKE ?)" for _ in variants]
-                        branch_fallback_parts.append("(" + " OR ".join(mac_subclauses) + ")")
+                        branch_like_parts.append("(" + " OR ".join(mac_subclauses) + ")")
                         for v in variants:
-                            fallback_params.extend([f"%{v}%", f"%{v}%"])
+                            like_params.extend([f"%{v}%", f"%{v}%"])
                         fts_v = [f'"{v}"' for v in variants if len(v) >= 3]
                         if fts_v:
                             branch_fts_pos.append("(" + " OR ".join(fts_v) + ")")
-                        if any(len(v) < 3 for v in variants):
-                            branch_residual_parts.append("(" + " OR ".join(mac_subclauses) + ")")
-                            for v in variants:
-                                residual_params.extend([f"%{v}%", f"%{v}%"])
 
                     else:
-                        branch_fallback_parts.append("(line_text LIKE ? OR file_name LIKE ?)")
-                        fallback_params.extend([f"%{t}%", f"%{t}%"])
+                        branch_like_parts.append("(line_text LIKE ? OR file_name LIKE ?)")
+                        like_params.extend([f"%{t}%", f"%{t}%"])
                         if len(t) >= 3:
                             branch_fts_pos.append(f'"{t.replace(chr(34), chr(34) * 2)}"')
-                        else:
-                            branch_residual_parts.append("(line_text LIKE ? OR file_name LIKE ?)")
-                            residual_params.extend([f"%{t}%", f"%{t}%"])
 
             for t in negative_terms:
                 is_subnet_token = is_subnet_mode and (parse_ip_or_subnet(t) is not None)
                 if is_subnet_token:
                     net = parse_ip_or_subnet(t)
-                    branch_fallback_parts.append("NOT ip_in_network(?, line_text)")
-                    fallback_params.append(str(net))
-                    branch_residual_parts.append("NOT ip_in_network(?, line_text)")
-                    residual_params.append(str(net))
+                    branch_like_parts.append("NOT ip_in_network(?, line_text)")
+                    like_params.append(str(net))
                 elif is_mac and is_mac_address(t):
                     variants = generate_mac_variants(t)
                     mac_subclauses = ["(line_text LIKE ? OR file_name LIKE ?)" for _ in variants]
-                    branch_fallback_parts.append("NOT (" + " OR ".join(mac_subclauses) + ")")
-                    branch_residual_parts.append("NOT (" + " OR ".join(mac_subclauses) + ")")
+                    branch_like_parts.append("NOT (" + " OR ".join(mac_subclauses) + ")")
                     for v in variants:
-                        fallback_params.extend([f"%{v}%", f"%{v}%"])
-                        residual_params.extend([f"%{v}%", f"%{v}%"])
+                        like_params.extend([f"%{v}%", f"%{v}%"])
                 else:
-                    branch_fallback_parts.append("NOT (line_text LIKE ? OR file_name LIKE ?)")
-                    fallback_params.extend([f"%{t}%", f"%{t}%"])
-                    branch_residual_parts.append("NOT (line_text LIKE ? OR file_name LIKE ?)")
-                    residual_params.extend([f"%{t}%", f"%{t}%"])
+                    branch_like_parts.append("NOT (line_text LIKE ? OR file_name LIKE ?)")
+                    like_params.extend([f"%{t}%", f"%{t}%"])
                     if len(t) >= 3:
                         branch_fts_neg.append(f'"{t.replace(chr(34), chr(34) * 2)}"')
 
@@ -991,25 +939,15 @@ class SearchEngine:
                     branch_fts += f" NOT {neg}"
                 fts_or_clauses.append("(" + branch_fts + ")")
 
-            if branch_fallback_parts:
-                fallback_or_clauses.append("(" + " AND ".join(branch_fallback_parts) + ")")
+            if branch_like_parts:
+                like_or_clauses.append("(" + " AND ".join(branch_like_parts) + ")")
 
-            if branch_residual_parts:
-                any_residual_present = True
-                residual_or_clauses.append("(" + " AND ".join(branch_residual_parts) + ")")
-            else:
-                residual_or_clauses.append("1=1")
-
+        # Only use FTS if EVERY branch has a valid positive FTS representation;
+        # otherwise a partial FTS query would permanently drop the unindexed branch(es).
         fts_query = " OR ".join(fts_or_clauses) if (len(fts_or_clauses) == len(or_parts)) else None
-        fallback_like_sql = "(" + " OR ".join(fallback_or_clauses) + ")" if fallback_or_clauses else None
+        like_sql = "(" + " OR ".join(like_or_clauses) + ")" if like_or_clauses else None
 
-        if any_residual_present and residual_or_clauses:
-            residual_sql = "(" + " OR ".join(residual_or_clauses) + ")"
-        else:
-            residual_sql = None
-            residual_params = []
-
-        return fts_query, (residual_sql, residual_params), (fallback_like_sql, fallback_params), keywords, extracted_subnets, has_mac_term
+        return fts_query, (like_sql, like_params), keywords, extracted_subnets, has_mac_term
 
     def search(self, query_str, limit=1000, file_type="all", is_regex=False, unique_files=False, is_mac=False, is_ip=False, is_subnet=False):
         """
@@ -1082,7 +1020,7 @@ class SearchEngine:
 
             # Mode B: Unified Boolean, Multi-Token, Subnet / CIDR & MAC Search
             elif effective_query:
-                fts_expr, (residual_sql, residual_params), (fallback_like_sql, fallback_like_params), keywords, extracted_subnets, has_mac_term = self._parse_boolean_query_sql(
+                fts_expr, (like_sql, like_params), keywords, extracted_subnets, has_mac_term = self._parse_boolean_query_sql(
                     effective_query, is_mac=is_mac_mode, is_ip=is_subnet_mode, is_subnet=is_subnet_mode
                 )
 
@@ -1094,20 +1032,19 @@ class SearchEngine:
                     match_type = "exact"
 
                 is_phrase = effective_query.startswith('"') and effective_query.endswith('"') and len(effective_query) >= 2
-                fts_succeeded = False
 
-                # Stage 1: FTS5 Trigram Indexed Search
+                # Stage 1: FTS5 Trigram Indexed Search with Subquery Constraint Verification
                 if self.use_fts and fts_expr:
                     try:
-                        if residual_sql:
+                        if like_sql:
                             sql_stmt = f"""
                                 SELECT file_name, row_num, line_text
                                 FROM fts_idx
                                 WHERE rowid IN (SELECT rowid FROM fts_idx WHERE fts_idx MATCH ?)
-                                  AND {residual_sql}{base_filter_sql}
+                                  AND {like_sql}{base_filter_sql}
                                 LIMIT ?;
                             """
-                            cur.execute(sql_stmt, (fts_expr, *residual_params, limit * 2))
+                            cur.execute(sql_stmt, (fts_expr, *like_params, limit * 2))
                         else:
                             cur.execute(f"""
                                 SELECT file_name, row_num, line_text
@@ -1117,40 +1054,33 @@ class SearchEngine:
                             """, (fts_expr, limit * 2))
                         raw = cur.fetchall()
                         results = [(r[0], r[1], r[2], 100) for r in raw]
-                        fts_succeeded = True
                     except sqlite3.Error:
-                        fts_succeeded = False
                         results = []
 
-                # Stage 2: Fast LIKE & ip_in_network Fallback (ONLY if FTS was unavailable or failed)
-                if not fts_succeeded and fallback_like_sql:
+                # Stage 2: Fast LIKE & ip_in_network Fallback / Supplemental Search
+                if (not results or len(results) < limit) and like_sql:
                     try:
-                        sql_stmt = f"SELECT file_name, row_num, line_text FROM {table_name} WHERE {fallback_like_sql}{base_filter_sql} LIMIT ?;"
-                        cur.execute(sql_stmt, (*fallback_like_params, limit * 2))
+                        sql_stmt = f"SELECT file_name, row_num, line_text FROM {table_name} WHERE {like_sql}{base_filter_sql} LIMIT ?;"
+                        cur.execute(sql_stmt, (*like_params, limit * 2))
                         raw_like = cur.fetchall()
-                        results = [(r[0], r[1], r[2], 100) for r in raw_like]
+                        existing_keys = {(r[0], r[1]) for r in results}
+                        for r in raw_like:
+                            if (r[0], r[1]) not in existing_keys:
+                                results.append((r[0], r[1], r[2], 100))
+                                existing_keys.add((r[0], r[1]))
                     except sqlite3.Error:
                         pass
 
-                # Stage 3: Bounded Fuzzy Search Fallback (only for single word queries 4-30 chars without boolean operators/subnets/IPs)
+                # Stage 3: Bounded Fuzzy Search Fallback (only for single word queries >= 4 chars without boolean operators/subnets/IPs)
                 has_boolean_ops = any(op in effective_query.upper() for op in ("OR", "AND", "NOT", "|", "&"))
                 is_ip_or_subnet_token = (parse_ip_or_subnet(keywords[0]) is not None) if (len(keywords) == 1) else False
-                if (
-                    not results
-                    and len(keywords) == 1
-                    and 4 <= len(keywords[0]) <= 30
-                    and not is_phrase
-                    and not has_boolean_ops
-                    and not extracted_subnets
-                    and not is_mac_mode
-                    and not is_ip_or_subnet_token
-                ):
+                if not results and len(keywords) == 1 and len(keywords[0]) >= 4 and not is_phrase and not has_boolean_ops and not extracted_subnets and not is_mac_mode and not is_ip_or_subnet_token:
                     match_type = "fuzzy"
                     cur.execute(f"""
                         SELECT file_name, row_num, line_text, score FROM (
                             SELECT file_name, row_num, line_text, max(fuzzy_score(?, line_text), fuzzy_score(?, file_name)) as score
                             FROM {table_name}
-                            LIMIT 1000
+                            LIMIT 5000
                         )
                         WHERE score >= 60{base_filter_sql}
                         ORDER BY score DESC
@@ -1570,7 +1500,6 @@ if HAS_TKINTER:
             self._active_file_path = None
             self._active_match_rnum = None
             self._active_match_type = "exact"
-            self._file_path_cache: Dict[str, Path] = {}
 
             self._setup_ui()
             self._poll_queue()
@@ -1629,7 +1558,6 @@ if HAS_TKINTER:
             self.search_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
             self.search_entry.focus_set()
             self.search_entry.bind("<KeyRelease>", self._on_key_release)
-            self.search_entry.bind("<Return>", lambda e: self._perform_search())
             self.search_entry.bind("<Down>", self._on_search_down_arrow)
             ToolTip(self.search_entry, "Type keywords to search. Supports 'AND', 'OR', exact \"quotes\", 'file:name' filters, or Regex. Press Ctrl+F / Cmd+F to focus.")
 
@@ -2164,8 +2092,6 @@ if HAS_TKINTER:
             path = filedialog.askdirectory(initialdir=str(self.content_dir), title="Select Folder to Index & Search")
             if path:
                 self.content_dir = Path(path).resolve()
-                if hasattr(self, "_file_path_cache"):
-                    self._file_path_cache.clear()
                 self.lbl_folder_path.config(text=str(self.content_dir))
                 self.indexer.update_content_dir(self.content_dir)
                 self._set_action_status("indexing", f"🔄 Switched directory to: {self.content_dir}. Re-indexing...")
@@ -2266,7 +2192,7 @@ if HAS_TKINTER:
             else:
                 self._set_action_status("typing", f"⏳ Pending user to finish typing... ('{q}')")
                 q_len = len(q)
-                delay_ms = 80 if q_len < 3 else (130 if q_len < 10 else 180)
+                delay_ms = 100 if q_len < 3 else 60
                 self._debounce_job = self.root.after(delay_ms, self._perform_search)
 
         def _on_tree_backspace(self, event):
@@ -2363,9 +2289,6 @@ if HAS_TKINTER:
             self._set_action_status("searching", f"⚡ Searching database for '{query}'...")
 
             def search_worker(q, ftype, regex_flag, unique_flag, mac_flag, subnet_flag, counter):
-                with self._search_lock:
-                    if counter != self._search_counter:
-                        return
                 results, elapsed_ms, match_type = self.engine.search(
                     q,
                     limit=1000,
@@ -2375,9 +2298,6 @@ if HAS_TKINTER:
                     is_mac=mac_flag,
                     is_subnet=subnet_flag
                 )
-                with self._search_lock:
-                    if counter != self._search_counter:
-                        return
                 self._msg_queue.put(("search_results", (results, elapsed_ms, match_type, q, counter)))
 
             threading.Thread(target=search_worker, args=(query, file_type, is_regex, is_unique, is_mac, is_subnet, current_counter), daemon=True).start()
@@ -2530,18 +2450,13 @@ if HAS_TKINTER:
                         headers = self.engine.get_file_headers(fname)
                         is_regex = self.regex_var.get()
 
-                        if hasattr(self, "_file_path_cache") and fname in self._file_path_cache:
-                            target_path = self._file_path_cache[fname]
-                        else:
-                            target_path = Path(fname)
-                            if not target_path.is_absolute() or not target_path.exists():
-                                target_path = self.content_dir / fname
-                                if not target_path.exists():
-                                    matches = list(self.content_dir.rglob(os.path.basename(fname)))
-                                    if matches:
-                                        target_path = matches[0]
-                            if hasattr(self, "_file_path_cache"):
-                                self._file_path_cache[fname] = target_path
+                        target_path = Path(fname)
+                        if not target_path.is_absolute() or not target_path.exists():
+                            target_path = self.content_dir / fname
+                            if not target_path.exists():
+                                matches = list(self.content_dir.rglob(os.path.basename(fname)))
+                                if matches:
+                                    target_path = matches[0]
 
                         self._active_file_path = target_path
                         self._active_match_rnum = rnum
