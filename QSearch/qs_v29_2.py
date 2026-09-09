@@ -30,7 +30,6 @@ import sqlite3
 import threading
 import subprocess
 import difflib
-from concurrent.futures import ThreadPoolExecutor
 import re
 import argparse
 from pathlib import Path
@@ -91,8 +90,6 @@ except ImportError:
 SCRIPT_DIR = Path(__file__).parent.resolve()
 DEFAULT_CONTENT_DIR = SCRIPT_DIR / "content"
 DEFAULT_DB_PATH = SCRIPT_DIR / "qs_index.db"
-INDEX_SCHEMA_VERSION = "4"
-GUI_RESULT_DISPLAY_LIMIT = 500
 
 # Ensure default content directory exists
 DEFAULT_CONTENT_DIR.mkdir(parents=True, exist_ok=True)
@@ -130,20 +127,6 @@ def format_relative_time(ts: Optional[float]) -> str:
         return "Unknown"
 
 
-# Optional accelerated fuzzy matching backend (roadmap item A.1). rapidfuzz's
-# C implementation is typically an order of magnitude faster than stdlib
-# difflib for short-string ratios, which matters here since fuzzy_score() is
-# invoked as a per-row SQLite callback. Falls back to difflib transparently
-# when rapidfuzz isn't installed, so this stays a zero-mandatory-dependency
-# tool per DEVELOPMENT.md.
-HAS_RAPIDFUZZ = False
-try:
-    from rapidfuzz import fuzz as _rf_fuzz
-    HAS_RAPIDFUZZ = True
-except ImportError:
-    _rf_fuzz = None
-
-
 def _fuzzy_score(query, text):
     """Calculates fuzzy similarity ratio (0-100) between query and text line."""
     if not query or not text:
@@ -163,16 +146,6 @@ def _fuzzy_score(query, text):
 
     words = [w for w in re.split(r'[\s|,;:]+', t) if min_len <= len(w) <= max_len]
     best_score = 0
-
-    if HAS_RAPIDFUZZ:
-        for w in words:
-            score = int(_rf_fuzz.ratio(q, w))
-            if score > best_score:
-                best_score = score
-                if best_score >= 95:
-                    break
-        return best_score
-
     for w in words:
         matcher = difflib.SequenceMatcher(None, q, w)
         if matcher.real_quick_ratio() < 0.6:
@@ -516,13 +489,10 @@ def get_fuzzy_matched_words(query: str, text: str) -> List[str]:
     best_score = 0
     best_word = None
     for w in words:
-        if HAS_RAPIDFUZZ:
-            ratio = int(_rf_fuzz.ratio(q_clean, w.lower()))
-        else:
-            matcher = difflib.SequenceMatcher(None, q_clean, w.lower())
-            if matcher.real_quick_ratio() < 0.5:
-                continue
-            ratio = matcher.ratio() * 100
+        matcher = difflib.SequenceMatcher(None, q_clean, w.lower())
+        if matcher.real_quick_ratio() < 0.5:
+            continue
+        ratio = matcher.ratio() * 100
         if ratio > best_score:
             best_score = ratio
             best_word = w
@@ -671,8 +641,6 @@ class SearchEngine:
         self.use_fts = True
         self._headers_cache = {}
         self._file_info_cache: Dict[str, Dict[str, Any]] = {}
-        self._conn_cache: Dict[int, sqlite3.Connection] = {}
-        self._conn_cache_lock = threading.Lock()
         self._init_db()
         self.refresh_headers_cache()
 
@@ -691,44 +659,22 @@ class SearchEngine:
             for fpath, hdrs in cur.fetchall():
                 if hdrs:
                     try:
-                        abs_path = str(Path(fpath).resolve())
-                        rel_name = os.path.relpath(abs_path, self.content_dir) if abs_path.startswith(str(self.content_dir) + os.sep) else os.path.basename(abs_path)
+                        rel_name = os.path.relpath(fpath, self.content_dir) if str(fpath).startswith(str(self.content_dir)) else os.path.basename(fpath)
                         parsed = json.loads(hdrs)
                         cache[rel_name] = parsed
-                        cache[os.path.basename(abs_path)] = parsed
-                        cache[abs_path] = parsed
+                        cache[os.path.basename(fpath)] = parsed
+                        cache[fpath] = parsed
                     except Exception:
                         pass
             self._headers_cache = cache
             self._file_info_cache.clear()
+            conn.close()
         except Exception:
             pass
 
     def get_connection(self):
-        """Returns a cached per-thread SQLite connection with registered custom functions.
-
-        Opening a connection, applying 5 PRAGMAs and registering 3 custom SQL
-        functions is measurably expensive (sub-millisecond individually, but the
-        GUI issues one search per keystroke and the background indexer polls
-        every 2-6s). Re-doing that setup on every call was the single biggest
-        avoidable cost in interactive search latency, so connections are now
-        opened once per thread and reused for the life of the SearchEngine.
-        """
-        tid = threading.get_ident()
-        conn = self._conn_cache.get(tid)
-        if conn is not None:
-            try:
-                conn.execute("SELECT 1;")
-                return conn
-            except sqlite3.Error:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-                with self._conn_cache_lock:
-                    self._conn_cache.pop(tid, None)
-
-        conn = sqlite3.connect(self.db_path, timeout=10.0, check_same_thread=False)
+        """Returns a thread-safe connection to SQLite with registered custom functions."""
+        conn = sqlite3.connect(self.db_path, timeout=10.0)
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
         conn.execute("PRAGMA cache_size = -64000;")
@@ -737,19 +683,7 @@ class SearchEngine:
         conn.create_function("fuzzy_score", 2, _fuzzy_score)
         conn.create_function("regexp", 2, _sqlite_regexp)
         conn.create_function("ip_in_network", 2, _sqlite_ip_in_network)
-        with self._conn_cache_lock:
-            self._conn_cache[tid] = conn
         return conn
-
-    def close_all_connections(self):
-        """Closes every cached per-thread connection. Call on clean shutdown."""
-        with self._conn_cache_lock:
-            for conn in self._conn_cache.values():
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-            self._conn_cache.clear()
 
     def _init_db(self):
         """Initializes database schema with FTS5 trigram support or standard fallback."""
@@ -781,22 +715,6 @@ class SearchEngine:
                 value TEXT
             );
         """)
-
-        # Index v4 stores canonical absolute paths in file_name. Rebuild once
-        # when upgrading so files with the same basename cannot collide.
-        schema_row = cur.execute(
-            "SELECT value FROM db_meta WHERE key = 'index_schema_version' LIMIT 1;"
-        ).fetchone()
-        current_schema = schema_row[0] if schema_row else None
-        if current_schema != INDEX_SCHEMA_VERSION:
-            cur.execute("DROP TABLE IF EXISTS fts_idx;")
-            cur.execute("DROP TABLE IF EXISTS std_idx;")
-            cur.execute("DELETE FROM file_meta;")
-            cur.execute(
-                "INSERT OR REPLACE INTO db_meta (key, value) VALUES ('index_schema_version', ?);",
-                (INDEX_SCHEMA_VERSION,)
-            )
-            conn.commit()
 
         # Check existing fts_idx definition
         try:
@@ -833,6 +751,7 @@ class SearchEngine:
             cur.execute("CREATE INDEX IF NOT EXISTS idx_std_text ON std_idx(line_text);")
 
         conn.commit()
+        conn.close()
 
     def get_file_headers(self, file_name):
         """Retrieves column header names for a CSV file from memory cache or DB."""
@@ -845,12 +764,9 @@ class SearchEngine:
 
         conn = self.get_connection()
         cur = conn.cursor()
-        canonical = str(Path(file_name).resolve()) if file_name else ""
-        cur.execute("SELECT headers FROM file_meta WHERE file_path = ? LIMIT 1;", (canonical,))
+        cur.execute("SELECT headers FROM file_meta WHERE file_path LIKE ?;", (f"%{file_name}",))
         row = cur.fetchone()
-        if row is None and file_name != canonical:
-            cur.execute("SELECT headers FROM file_meta WHERE file_path = ? LIMIT 1;", (file_name,))
-            row = cur.fetchone()
+        conn.close()
         if row and row[0]:
             try:
                 headers = json.loads(row[0])
@@ -867,6 +783,7 @@ class SearchEngine:
             cur = conn.cursor()
             cur.execute("INSERT OR REPLACE INTO db_meta (key, value) VALUES (?, ?);", (key, str(value)))
             conn.commit()
+            conn.close()
         except Exception:
             pass
 
@@ -877,6 +794,7 @@ class SearchEngine:
             cur = conn.cursor()
             cur.execute("SELECT value FROM db_meta WHERE key = ? LIMIT 1;", (key,))
             row = cur.fetchone()
+            conn.close()
             return row[0] if row else default
         except Exception:
             return default
@@ -888,20 +806,13 @@ class SearchEngine:
         try:
             conn = self.get_connection()
             cur = conn.cursor()
-            canonical = str(Path(file_name).resolve()) if file_name else ""
+            base = os.path.basename(file_name)
             cur.execute(
-                "SELECT mtime, size, row_count, headers, indexed_at, file_path "
-                "FROM file_meta WHERE file_path = ? LIMIT 1;",
-                (canonical,)
+                "SELECT mtime, size, row_count, headers, indexed_at, file_path FROM file_meta WHERE file_path = ? OR file_path LIKE ? OR file_path LIKE ? LIMIT 1;",
+                (file_name, f"%{file_name}", f"%{base}")
             )
             row = cur.fetchone()
-            if row is None and file_name != canonical:
-                cur.execute(
-                    "SELECT mtime, size, row_count, headers, indexed_at, file_path "
-                    "FROM file_meta WHERE file_path = ? LIMIT 1;",
-                    (file_name,)
-                )
-                row = cur.fetchone()
+            conn.close()
             if row:
                 headers = []
                 if row[3]:
@@ -1100,23 +1011,6 @@ class SearchEngine:
 
         return fts_query, (residual_sql, residual_params), (fallback_like_sql, fallback_params), keywords, extracted_subnets, has_mac_term
 
-    def _fuzzy_candidate_sql(self, term: str) -> str:
-        """Returns a trigram MATCH expression to prefilter fuzzy candidates."""
-        q = term.lower().strip()
-        if not self.use_fts or len(q) < 6:
-            return ""
-        trigrams = []
-        seen = set()
-        for i in range(len(q) - 2):
-            tri = q[i:i + 3]
-            if tri not in seen:
-                seen.add(tri)
-                trigrams.append(tri)
-        trigrams = trigrams[:4]
-        if not trigrams:
-            return ""
-        return " OR ".join(f'"{t.replace(chr(34), chr(34) * 2)}"' for t in trigrams)
-
     def search(self, query_str, limit=1000, file_type="all", is_regex=False, unique_files=False, is_mac=False, is_ip=False, is_subnet=False):
         """
         Performs multi-stage search across all files:
@@ -1209,7 +1103,7 @@ class SearchEngine:
                             sql_stmt = f"""
                                 SELECT file_name, row_num, line_text
                                 FROM fts_idx
-                                WHERE fts_idx MATCH ?
+                                WHERE rowid IN (SELECT rowid FROM fts_idx WHERE fts_idx MATCH ?)
                                   AND {residual_sql}{base_filter_sql}
                                 LIMIT ?;
                             """
@@ -1252,49 +1146,18 @@ class SearchEngine:
                     and not is_ip_or_subnet_token
                 ):
                     match_type = "fuzzy"
-                    # NOTE: previously this pre-truncated with an inner `LIMIT 1000`
-                    # *before* scoring, so on any DB with more than 1000 rows the
-                    # fuzzy fallback silently only ever considered the first 1000
-                    # (in arbitrary storage order) and could miss the actual best
-                    # match. The file-type/file: filter is now applied before
-                    # scoring too, so it narrows the scored set instead of just
-                    # the final output. rapidfuzz (when available) makes scoring
-                    # the full filtered set fast enough that the old cap is no
-                    # longer needed for correctness.
-                    fuzzy_expr = self._fuzzy_candidate_sql(keywords[0])
-                    if self.use_fts and fuzzy_expr:
-                        cur.execute(
-                            f"SELECT file_name, row_num, line_text FROM fts_idx "
-                            f"WHERE fts_idx MATCH ?{base_filter_sql} LIMIT 20000;",
-                            (fuzzy_expr,)
+                    cur.execute(f"""
+                        SELECT file_name, row_num, line_text, score FROM (
+                            SELECT file_name, row_num, line_text, max(fuzzy_score(?, line_text), fuzzy_score(?, file_name)) as score
+                            FROM {table_name}
+                            LIMIT 1000
                         )
-                    else:
-                        cur.execute(
-                            f"SELECT file_name, row_num, line_text FROM {table_name} "
-                            f"WHERE 1=1{base_filter_sql};"
-                        )
-                    candidate_rows = cur.fetchall()
-
-                    # Candidate filtering is optional. Fall back to the full
-                    # scan when it yields nothing so fuzzy search stays correct.
-                    if not candidate_rows and fuzzy_expr:
-                        cur.execute(
-                            f"SELECT file_name, row_num, line_text FROM {table_name} "
-                            f"WHERE 1=1{base_filter_sql};"
-                        )
-                        candidate_rows = cur.fetchall()
-
-                    scored = []
-                    for fname, rnum, ltext in candidate_rows:
-                        score = max(
-                            _fuzzy_score(keywords[0], ltext),
-                            _fuzzy_score(keywords[0], os.path.basename(fname)),
-                            _fuzzy_score(keywords[0], fname),
-                        )
-                        if score >= 60:
-                            scored.append((fname, rnum, ltext, score))
-                    scored.sort(key=lambda r: r[3], reverse=True)
-                    results = scored[:limit * 2]
+                        WHERE score >= 60{base_filter_sql}
+                        ORDER BY score DESC
+                        LIMIT ?;
+                    """, (keywords[0], keywords[0], limit * 2))
+                    fuzzy_raw = cur.fetchall()
+                    results = [(r[0], r[1], r[2], int(r[3])) for r in fuzzy_raw]
 
             # If only file filter was provided with no keywords
             elif file_filter:
@@ -1310,6 +1173,8 @@ class SearchEngine:
         except sqlite3.Error as e:
             print(f"[Search Engine Error] {e}", file=sys.stderr)
             results = []
+        finally:
+            conn.close()
 
         balanced_results = balance_results_by_file(results, limit=limit, unique_files=unique_files)
 
@@ -1331,6 +1196,7 @@ class SearchEngine:
             s_row = cur.fetchone()
             last_scan_ts = float(s_row[0]) if s_row and s_row[0] else None
 
+            conn.close()
             return file_cnt, row_cnt, last_db_update, last_scan_ts
         except Exception:
             return 0, 0, None, None
@@ -1421,10 +1287,6 @@ class BackgroundIndexer(threading.Thread):
         self.content_dir = Path(new_dir).resolve()
         self.engine.set_content_dir(self.content_dir)
 
-    def stop(self):
-        """Stops the background indexing loop cleanly."""
-        self._running = False
-
     def run(self):
         while self._running:
             try:
@@ -1453,22 +1315,12 @@ class BackgroundIndexer(threading.Thread):
                         if fname.startswith(".") or fname in EXCLUDED_FILENAMES:
                             continue
                         full_path = Path(root) / fname
-                        try:
-                            if str(full_path.resolve()) in {
-                                str(Path(self.engine.db_path).resolve()),
-                                str(Path(self.engine.db_path).resolve()) + "-wal",
-                                str(Path(self.engine.db_path).resolve()) + "-shm",
-                            }:
+                        if is_text_file(full_path):
+                            try:
+                                stat = full_path.stat()
+                                disk_files[str(full_path)] = (round(stat.st_mtime, 3), stat.st_size)
+                            except OSError:
                                 continue
-                            stat = full_path.stat()
-                            key = str(full_path)
-                            current_meta = (round(stat.st_mtime, 3), stat.st_size)
-                            if key in db_files and db_files[key] == current_meta:
-                                disk_files[key] = current_meta
-                            elif is_text_file(full_path):
-                                disk_files[key] = current_meta
-                        except OSError:
-                            continue
 
             # Only remove files that belong to the watched directory scope
             content_dir_str = str(self.content_dir)
@@ -1555,12 +1407,12 @@ class BackgroundIndexer(threading.Thread):
                     except Exception:
                         pass
 
+            conn.close()
             return has_changes
 
     def index_single_file(self, conn, filepath):
         """Reads and indexes a single text file cleanly into SQLite."""
-        canonical_path = str(Path(filepath).resolve())
-        rel_name = canonical_path
+        rel_name = os.path.relpath(filepath, self.content_dir) if str(filepath).startswith(str(self.content_dir)) else os.path.basename(filepath)
         stat = os.stat(filepath)
         ext = os.path.splitext(filepath)[1].lower()
 
@@ -1665,15 +1517,6 @@ if HAS_TKINTER:
                 self.widget.after_cancel(self.id)
                 self.id = None
 
-        def update_text(self, text):
-            self.text = text
-            if self.tip_window:
-                try:
-                    self.tip_window.destroy()
-                except Exception:
-                    pass
-                self.tip_window = None
-
         def show_tip(self, event=None):
             if self.tip_window or not self.text:
                 return
@@ -1724,23 +1567,14 @@ if HAS_TKINTER:
             self._current_results = []
             self._search_counter = 0
             self._search_lock = threading.Lock()
-            self._search_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="QSearchSearch")
-            self._search_future = None
             self._active_file_path = None
             self._active_match_rnum = None
             self._active_match_type = "exact"
             self._file_path_cache: Dict[str, Path] = {}
-            self._sort_state: Dict[str, bool] = {}
-            self._column_headings = {
-                "file": "File Path (Double-click to open)",
-                "row": "Row #",
-                "content": "Matched Content (Score In Front)",
-            }
 
             self._setup_ui()
             self._poll_queue()
             self.root.after(50, self._setup_indexer)
-            self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         def _setup_ui(self):
             style = ttk.Style()
@@ -1908,10 +1742,9 @@ if HAS_TKINTER:
             columns = ("file", "row", "content")
             self.tree = ttk.Treeview(table_frame, columns=columns, show="headings", selectmode="browse")
 
-            self.tree.heading("file", text=self._column_headings["file"], command=lambda: self._sort_by_column("file"))
-            self.tree.heading("row", text=self._column_headings["row"], command=lambda: self._sort_by_column("row"))
-            self.tree.heading("content", text=self._column_headings["content"], command=lambda: self._sort_by_column("content"))
-            ToolTip(self.tree, "Click a column header to sort results by that column; click again to reverse")
+            self.tree.heading("file", text="File Path (Double-click to open)")
+            self.tree.heading("row", text="Row #")
+            self.tree.heading("content", text="Matched Content (Score In Front)")
 
             self.tree.column("file", width=190, minwidth=110, anchor="w")
             self.tree.column("row", width=65, minwidth=50, anchor="center")
@@ -2033,31 +1866,6 @@ if HAS_TKINTER:
                 fg="#64748B"
             )
             self.lbl_index_stats.pack(side="right", padx=5)
-            self._stats_tooltip = ToolTip(self.lbl_index_stats, "Index status is loading...")
-
-        def _on_close(self):
-            """Stops background workers and releases resources cleanly."""
-            try:
-                if self._search_future is not None:
-                    self._search_future.cancel()
-                try:
-                    self._search_executor.shutdown(wait=False, cancel_futures=True)
-                except TypeError:
-                    self._search_executor.shutdown(wait=False)
-            except Exception:
-                pass
-            try:
-                self.indexer.stop()
-            except Exception:
-                pass
-            try:
-                self.engine.close_all_connections()
-            except Exception:
-                pass
-            try:
-                self.root.destroy()
-            except Exception:
-                pass
 
         def _on_regex_toggle(self):
             """Ensures mutually clean toggling for regex mode."""
@@ -2401,13 +2209,14 @@ if HAS_TKINTER:
             # Update tooltip with full date/time details
             scan_full = format_timestamp(last_scan, "%Y-%m-%d %H:%M:%S")
             update_full = format_timestamp(last_update, "%Y-%m-%d %H:%M:%S")
-            self._stats_tooltip.update_text(
-                f"Index status:\n"
-                f"• Total files indexed: {file_cnt} ({row_cnt:,} rows)\n"
-                f"• Last filesystem scan: {scan_full} ({scan_rel})\n"
-                f"• Last database sync:  {update_full} ({update_rel})\n"
-                f"• Active filter: {filter_mode}\n"
-                f"• Watched directory: {self.content_dir}"
+            ToolTip(
+                self.lbl_index_stats,
+                f"📊 Index & Sync Timestamps:\n"
+                f"• Total Files Indexed: {file_cnt} ({row_cnt:,} rows)\n"
+                f"• Last Filesystem Scan: {scan_full} ({scan_rel})\n"
+                f"• Last Database Sync:  {update_full} ({update_rel})\n"
+                f"• Active Filter: {filter_mode}\n"
+                f"• Watched Directory: {self.content_dir}"
             )
 
             if is_indexing and files_left > 0 and not self.search_var.get().strip():
@@ -2571,72 +2380,7 @@ if HAS_TKINTER:
                         return
                 self._msg_queue.put(("search_results", (results, elapsed_ms, match_type, q, counter)))
 
-            with self._search_lock:
-                if self._search_future is not None:
-                    try:
-                        self._search_future.cancel()
-                    except Exception:
-                        pass
-                self._search_future = self._search_executor.submit(
-                    search_worker,
-                    query, file_type, is_regex, is_unique, is_mac, is_subnet, current_counter
-                )
-
-        def _sort_by_column(self, col):
-            """Sorts the currently displayed results by the clicked column header.
-
-            Row order and self._current_results are reordered in lockstep so
-            _on_tree_select's positional index lookup stays correct. Clicking
-            the same header again reverses the sort.
-            """
-            if not self._current_results:
-                return
-            reverse = self._sort_state.get(col, False)
-            col_idx = {"file": 0, "row": 1, "content": 2}[col]
-
-            def sort_key(row):
-                val = row[col_idx]
-                if col == "row":
-                    try:
-                        return float(val)
-                    except (TypeError, ValueError):
-                        return 0.0
-                return str(val).lower()
-
-            children = self.tree.get_children("")
-            visible_count = len(children)
-            visible_rows = self._current_results[:visible_count]
-            tail_rows = self._current_results[visible_count:]
-            paired = list(zip(children, visible_rows))
-            paired.sort(key=lambda pair: sort_key(pair[1]), reverse=reverse)
-            for new_index, (iid, _row) in enumerate(paired):
-                self.tree.move(iid, "", new_index)
-            self._current_results = [row for _, row in paired] + tail_rows
-            self._sort_state[col] = not reverse
-
-            arrow = " ▼" if reverse else " ▲"
-            for c, label in self._column_headings.items():
-                self.tree.heading(c, text=(label + arrow) if c == col else label)
-
-        def _reset_sort_indicators(self):
-            self._sort_state = {}
-            for c, label in self._column_headings.items():
-                self.tree.heading(c, text=label)
-
-        def _display_filename(self, filename: str) -> str:
-            """Returns a compact UI path while retaining canonical paths internally."""
-            try:
-                path = Path(filename).resolve()
-                root = self.content_dir.resolve()
-                try:
-                    return str(path.relative_to(root))
-                except ValueError:
-                    try:
-                        return str(path.relative_to(root.parent))
-                    except ValueError:
-                        return str(path)
-            except Exception:
-                return str(filename)
+            threading.Thread(target=search_worker, args=(query, file_type, is_regex, is_unique, is_mac, is_subnet, current_counter), daemon=True).start()
 
         def _apply_search_results(self, results, elapsed_ms, match_type, query):
             for item in self.tree.get_children():
@@ -2644,7 +2388,6 @@ if HAS_TKINTER:
 
             self._current_results = results
             self._active_match_type = match_type
-            self._reset_sort_indicators()
 
             if not results:
                 filter_mode = self.filter_var.get() if hasattr(self, 'filter_var') else "All Indexed Files"
@@ -2656,16 +2399,13 @@ if HAS_TKINTER:
             self.txt_detail.config(state="normal")
             self.txt_detail.delete("1.0", tk.END)
 
-            visible_results = results[:GUI_RESULT_DISPLAY_LIMIT]
-            for fname, rnum, ltext, score in visible_results:
+            # Insert results putting matching percentage in front of the line
+            for fname, rnum, ltext, score in results:
                 disp_text = f"[{score}%] {ltext}"
-                self.tree.insert("", "end", values=(self._display_filename(fname), rnum, disp_text))
+                self.tree.insert("", "end", values=(fname, rnum, disp_text))
 
             count = len(results)
-            limit_notice = (
-                f" (showing first {len(visible_results):,})"
-                if count > len(visible_results) else ""
-            )
+            limit_notice = " (showing top 1000)" if count >= 1000 else ""
             if match_type == "regex":
                 tag = " (Regex Matches)"
             elif match_type == "mac":
@@ -2818,8 +2558,7 @@ if HAS_TKINTER:
 
                         time_hint = f"  •  Modified: {mod_str} ({mod_rel})" if mod_rel else ""
                         idx_hint = f"  •  DB Indexed: {idx_str}" if idx_str else ""
-                        display_fname = self._display_filename(fname)
-                        self.lbl_detail_header.config(text=f"[{score}%] 📄 {display_fname} (Line #{rnum}){time_hint}{idx_hint}")
+                        self.lbl_detail_header.config(text=f"[{score}%] 📄 {fname} (Line #{rnum}){time_hint}{idx_hint}")
 
                         ToolTip(
                             self.lbl_detail_header,
@@ -2850,30 +2589,30 @@ if HAS_TKINTER:
                     print(f"[Select Error] {e}", file=sys.stderr)
 
         def _render_text_context_window(self, target_path, rnum, query, is_regex):
-            """Loads only ±50 lines around a match; does not scan the rest of a huge file."""
+            """Renders a sliced context window (±50 lines) to prevent UI freezing on large files."""
             try:
                 window_size = 50
                 start_l = max(1, rnum - window_size)
                 end_l = rnum + window_size
-                context_lines = []
-                has_more = False
 
                 with open(target_path, "r", encoding="utf-8", errors="replace") as f:
+                    lines = []
+                    total_lines = 0
                     for cur_idx, line in enumerate(f, start=1):
-                        if cur_idx > end_l:
-                            has_more = True
-                            break
+                        total_lines = cur_idx
                         if start_l <= cur_idx <= end_l:
-                            context_lines.append((cur_idx, line))
+                            lines.append((cur_idx, line))
 
-                self.btn_load_full.pack_forget()
-                if has_more:
+                if total_lines > 120:
                     self.btn_load_full.pack(side="right", padx=(4, 0))
+                else:
+                    self.btn_load_full.pack_forget()
 
                 target_pos = None
                 if start_l > 1:
-                    self.txt_detail.insert(tk.END, f"--- [Earlier lines 1-{start_l - 1} hidden] ---\n")
-                for cur_idx, line in context_lines:
+                    self.txt_detail.insert(tk.END, f"--- [Skipped lines 1 to {start_l-1}] ---\n")
+
+                for cur_idx, line in lines:
                     l_start = self.txt_detail.index("end-1c")
                     self.txt_detail.insert(tk.END, f"L{cur_idx:<5d} │ {line}")
                     l_end = self.txt_detail.index("end-1c")
@@ -2881,13 +2620,11 @@ if HAS_TKINTER:
                         target_pos = l_start
                         self.txt_detail.tag_add("match_line", l_start, l_end)
 
-                if has_more:
-                    self.txt_detail.insert(
-                        tk.END,
-                        f"--- [Later lines after {end_l} hidden. Click 'Load Full File' to view] ---\n"
-                    )
+                if end_l < total_lines:
+                    self.txt_detail.insert(tk.END, f"--- [Remaining lines {end_l+1} to {total_lines} hidden. Click 'Load Full File' above] ---\n")
 
                 self._highlight_matches_in_text(query, self._active_match_type, is_regex)
+
                 if target_pos:
                     self.txt_detail.see(target_pos)
 
@@ -2895,7 +2632,7 @@ if HAS_TKINTER:
                 self.txt_detail.insert(tk.END, f"Error loading file: {e}")
 
         def _load_full_text_file(self):
-            """Loads the full text file on explicit user request."""
+            """Loads full file upon user request."""
             if not self._active_file_path or not self._active_file_path.exists():
                 return
             try:
@@ -2907,24 +2644,21 @@ if HAS_TKINTER:
                 rnum = self._active_match_rnum
                 is_regex = self.regex_var.get()
 
-                chunks = []
-                target_pos = None
-                char_pos = 0
                 with open(self._active_file_path, "r", encoding="utf-8", errors="replace") as f:
+                    target_pos = None
                     for cur_idx, line in enumerate(f, start=1):
-                        rendered = f"L{cur_idx:<5d} │ {line}"
+                        l_start = self.txt_detail.index("end-1c")
+                        self.txt_detail.insert(tk.END, f"L{cur_idx:<5d} │ {line}")
+                        l_end = self.txt_detail.index("end-1c")
                         if cur_idx == rnum:
-                            target_pos = char_pos
-                        chunks.append(rendered)
-                        char_pos += len(rendered)
-                self.txt_detail.insert(tk.END, "".join(chunks))
-
-                if target_pos is not None:
-                    l_start = f"1.0 + {target_pos} chars"
-                    self.txt_detail.tag_add("match_line", l_start, f"{l_start} lineend")
-                    self.txt_detail.see(l_start)
+                            target_pos = l_start
+                            self.txt_detail.tag_add("match_line", l_start, l_end)
 
                 self._highlight_matches_in_text(query, self._active_match_type, is_regex)
+
+                if target_pos:
+                    self.txt_detail.see(target_pos)
+
             except Exception as e:
                 self.txt_detail.insert(tk.END, f"Error: {e}")
 
@@ -2964,15 +2698,11 @@ if HAS_TKINTER:
             selected = self.tree.selection()
             if not selected:
                 return
-            tree_idx = self.tree.index(selected[0])
-            if not (0 <= tree_idx < len(self._current_results)):
-                return
-            full_fname = self._current_results[tree_idx][0]
-            display_fname = self._display_filename(full_fname)
-            if not full_fname:
+            fname = self.tree.item(selected[0])["values"][0]
+            if not fname:
                 return
 
-            filter_token = f'file:"{display_fname}"' if " " in str(display_fname) else f"file:{display_fname}"
+            filter_token = f'file:"{fname}"' if " " in str(fname) else f"file:{fname}"
 
             cur_query = self.search_var.get().strip()
             _, effective_q = strip_file_filter(cur_query)
@@ -3024,7 +2754,7 @@ if HAS_TKINTER:
                     writer = csv.writer(f)
                     writer.writerow(["Score", "File Name", "Line Number", "Matched Content"])
                     for fname, rnum, ltext, score in self._current_results:
-                        writer.writerow([f"{score}%", self._display_filename(fname), rnum, ltext])
+                        writer.writerow([f"{score}%", fname, rnum, ltext])
 
                 filename_only = os.path.basename(file_path)
                 self._set_action_status("success", f"💾 Successfully saved {len(self._current_results)} results to '{filename_only}'")
@@ -3524,12 +3254,7 @@ def run_direct_cli_search(query, content_dir=DEFAULT_CONTENT_DIR, file_type="all
         print("No matches found.")
     else:
         for fname, rnum, ltext, score in results:
-            display_fname = str(fname)
-            try:
-                display_fname = str(Path(fname).resolve().relative_to(Path(content_dir).resolve()))
-            except (ValueError, OSError):
-                pass
-            print(f"[\033[1;32m{score}%\033[0m] 📄 \033[1;34m{display_fname}\033[0m (Row #\033[33m{rnum}\033[0m):")
+            print(f"[\033[1;32m{score}%\033[0m] 📄 \033[1;34m{fname}\033[0m (Row #\033[33m{rnum}\033[0m):")
             if fname.lower().endswith(".csv"):
                 headers = engine.get_file_headers(fname)
                 col_lines = format_record_multiline(headers, ltext)
