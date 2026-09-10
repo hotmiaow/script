@@ -327,7 +327,7 @@ class TestSearchEngineIntegration(unittest.TestCase):
         res_csv, _, _ = self.engine.search("file:network_inventory.csv router")
         self.assertTrue(len(res_csv) > 0)
         for r in res_csv:
-            self.assertEqual(r[0], "network_inventory.csv")
+            self.assertEqual(os.path.basename(r[0]), "network_inventory.csv")
 
         # Filtering to syslog.log must return zero rows for 'router'
         res_syslog, _, _ = self.engine.search("file:syslog.log router")

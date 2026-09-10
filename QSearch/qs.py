@@ -836,32 +836,47 @@ class SearchEngine:
 
     def get_file_headers(self, file_name):
         """Retrieves column header names for a CSV file from memory cache or DB."""
+        if not file_name:
+            return []
         if file_name in self._headers_cache:
             return self._headers_cache[file_name]
-        
-        base_name = os.path.basename(file_name)
-        if base_name in self._headers_cache:
-            return self._headers_cache[base_name]
+        base = os.path.basename(file_name)
+        if base in self._headers_cache:
+            return self._headers_cache[base]
 
-        conn = self.get_connection()
-        cur = conn.cursor()
-        canonical = str(Path(file_name).resolve()) if file_name else ""
-        cur.execute("SELECT headers FROM file_meta WHERE file_path = ? LIMIT 1;", (canonical,))
-        row = cur.fetchone()
-        if row is None and file_name != canonical:
-            cur.execute("SELECT headers FROM file_meta WHERE file_path = ? LIMIT 1;", (file_name,))
+        try:
+            conn = self.get_connection()
+            cur = conn.cursor()
+            canonical = str(Path(file_name).resolve())
+            cur.execute("SELECT headers FROM file_meta WHERE file_path = ? LIMIT 1;", (canonical,))
             row = cur.fetchone()
-        if row and row[0]:
-            try:
-                headers = json.loads(row[0])
-                self._headers_cache[file_name] = headers
-                return headers
-            except Exception:
-                pass
+            if row is None and file_name != canonical:
+                cur.execute("SELECT headers FROM file_meta WHERE file_path = ? LIMIT 1;", (file_name,))
+                row = cur.fetchone()
+            if row is None and hasattr(self, "content_dir"):
+                rel_canonical = str((self.content_dir / file_name).resolve())
+                if rel_canonical not in (canonical, file_name):
+                    cur.execute("SELECT headers FROM file_meta WHERE file_path = ? LIMIT 1;", (rel_canonical,))
+                    row = cur.fetchone()
+            if row is None:
+                cur.execute("SELECT headers FROM file_meta WHERE file_path LIKE ? OR file_path LIKE ? LIMIT 1;",
+                            (f"%/{base}", f"%{base}"))
+                row = cur.fetchone()
+            if row and row[0]:
+                try:
+                    headers = json.loads(row[0])
+                    self._headers_cache[file_name] = headers
+                    self._headers_cache[base] = headers
+                    self._headers_cache[canonical] = headers
+                    return headers
+                except Exception:
+                    return []
+        except Exception:
+            pass
         return []
 
-    def set_db_meta(self, key: str, value: str):
-        """Sets a key-value pair in db_meta."""
+    def set_meta_value(self, key, value):
+        """Stores key-value pair in db_meta."""
         try:
             conn = self.get_connection()
             cur = conn.cursor()
@@ -870,8 +885,10 @@ class SearchEngine:
         except Exception:
             pass
 
-    def get_db_meta(self, key: str, default=None):
-        """Gets a value by key from db_meta."""
+    set_db_meta = set_meta_value
+
+    def get_meta_value(self, key, default=None):
+        """Retrieves key-value pair from db_meta."""
         try:
             conn = self.get_connection()
             cur = conn.cursor()
@@ -881,14 +898,18 @@ class SearchEngine:
         except Exception:
             return default
 
+    get_db_meta = get_meta_value
+
     def get_file_info(self, file_name: str) -> Optional[Dict[str, Any]]:
         """Retrieves detailed file metadata (mtime, size, row_count, headers, indexed_at) from file_meta."""
+        if not file_name:
+            return None
         if hasattr(self, "_file_info_cache") and file_name in self._file_info_cache:
             return self._file_info_cache[file_name]
         try:
             conn = self.get_connection()
             cur = conn.cursor()
-            canonical = str(Path(file_name).resolve()) if file_name else ""
+            canonical = str(Path(file_name).resolve())
             cur.execute(
                 "SELECT mtime, size, row_count, headers, indexed_at, file_path "
                 "FROM file_meta WHERE file_path = ? LIMIT 1;",
@@ -900,6 +921,23 @@ class SearchEngine:
                     "SELECT mtime, size, row_count, headers, indexed_at, file_path "
                     "FROM file_meta WHERE file_path = ? LIMIT 1;",
                     (file_name,)
+                )
+                row = cur.fetchone()
+            if row is None and hasattr(self, "content_dir"):
+                rel_canonical = str((self.content_dir / file_name).resolve())
+                if rel_canonical not in (canonical, file_name):
+                    cur.execute(
+                        "SELECT mtime, size, row_count, headers, indexed_at, file_path "
+                        "FROM file_meta WHERE file_path = ? LIMIT 1;",
+                        (rel_canonical,)
+                    )
+                    row = cur.fetchone()
+            if row is None:
+                base = os.path.basename(file_name)
+                cur.execute(
+                    "SELECT mtime, size, row_count, headers, indexed_at, file_path "
+                    "FROM file_meta WHERE file_path LIKE ? OR file_path LIKE ? LIMIT 1;",
+                    (f"%/{base}", f"%{base}")
                 )
                 row = cur.fetchone()
             if row:
@@ -919,6 +957,7 @@ class SearchEngine:
                 }
                 if hasattr(self, "_file_info_cache"):
                     self._file_info_cache[file_name] = info
+                    self._file_info_cache[row[5]] = info
                 return info
         except Exception:
             pass
@@ -1103,7 +1142,7 @@ class SearchEngine:
     def _fuzzy_candidate_sql(self, term: str) -> str:
         """Returns a trigram MATCH expression to prefilter fuzzy candidates."""
         q = term.lower().strip()
-        if not self.use_fts or len(q) < 6:
+        if not self.use_fts or len(q) < 3:
             return ""
         trigrams = []
         seen = set()
@@ -1112,7 +1151,7 @@ class SearchEngine:
             if tri not in seen:
                 seen.add(tri)
                 trigrams.append(tri)
-        trigrams = trigrams[:4]
+        trigrams = trigrams[:6]
         if not trigrams:
             return ""
         return " OR ".join(f'"{t.replace(chr(34), chr(34) * 2)}"' for t in trigrams)
@@ -1271,7 +1310,7 @@ class SearchEngine:
                     else:
                         cur.execute(
                             f"SELECT file_name, row_num, line_text FROM {table_name} "
-                            f"WHERE 1=1{base_filter_sql};"
+                            f"WHERE 1=1{base_filter_sql} LIMIT 10000;"
                         )
                     candidate_rows = cur.fetchall()
 
@@ -1280,17 +1319,19 @@ class SearchEngine:
                     if not candidate_rows and fuzzy_expr:
                         cur.execute(
                             f"SELECT file_name, row_num, line_text FROM {table_name} "
-                            f"WHERE 1=1{base_filter_sql};"
+                            f"WHERE 1=1{base_filter_sql} LIMIT 10000;"
                         )
                         candidate_rows = cur.fetchall()
 
+                    fname_scores = {}
                     scored = []
                     for fname, rnum, ltext in candidate_rows:
-                        score = max(
-                            _fuzzy_score(keywords[0], ltext),
-                            _fuzzy_score(keywords[0], os.path.basename(fname)),
-                            _fuzzy_score(keywords[0], fname),
-                        )
+                        if fname not in fname_scores:
+                            fname_scores[fname] = max(
+                                _fuzzy_score(keywords[0], os.path.basename(fname)),
+                                _fuzzy_score(keywords[0], fname),
+                            )
+                        score = max(_fuzzy_score(keywords[0], ltext), fname_scores[fname])
                         if score >= 60:
                             scored.append((fname, rnum, ltext, score))
                     scored.sort(key=lambda r: r[3], reverse=True)
@@ -1478,12 +1519,15 @@ class BackgroundIndexer(threading.Thread):
                 and rfile not in disk_files
             ]
             for rfile in removed_files:
+                canon_rfile = str(Path(rfile).resolve())
                 rel_name = os.path.relpath(rfile, self.content_dir) if str(rfile).startswith(str(self.content_dir)) else os.path.basename(rfile)
-                cur.execute("DELETE FROM file_meta WHERE file_path = ?;", (rfile,))
+                cur.execute("DELETE FROM file_meta WHERE file_path = ? OR file_path = ?;", (rfile, canon_rfile))
                 if self.engine.use_fts:
-                    cur.execute("DELETE FROM fts_idx WHERE file_name = ? OR file_name = ?;", (rel_name, os.path.basename(rfile)))
+                    cur.execute("DELETE FROM fts_idx WHERE file_name = ? OR file_name = ? OR file_name = ? OR file_name = ?;",
+                                (canon_rfile, rfile, rel_name, os.path.basename(rfile)))
                 else:
-                    cur.execute("DELETE FROM std_idx WHERE file_name = ? OR file_name = ?;", (rel_name, os.path.basename(rfile)))
+                    cur.execute("DELETE FROM std_idx WHERE file_name = ? OR file_name = ? OR file_name = ? OR file_name = ?;",
+                                (canon_rfile, rfile, rel_name, os.path.basename(rfile)))
             if removed_files:
                 conn.commit()
 
@@ -1932,6 +1976,7 @@ if HAS_TKINTER:
 
             self.lbl_detail_header = ttk.Label(detail_top, text="Select a record above to view highlighted breakdown", font=("Helvetica", 10, "bold"))
             self.lbl_detail_header.pack(side="left")
+            self._header_tooltip = ToolTip(self.lbl_detail_header, "Select a record above to view file metadata and context")
 
             self.btn_load_full = ttk.Button(detail_top, text="Load Full File", command=self._load_full_text_file)
             self.btn_load_full.pack(side="right", padx=(4, 0))
@@ -2595,13 +2640,17 @@ if HAS_TKINTER:
             col_idx = {"file": 0, "row": 1, "content": 2}[col]
 
             def sort_key(row):
-                val = row[col_idx]
                 if col == "row":
                     try:
-                        return float(val)
+                        return float(row[1])
                     except (TypeError, ValueError):
                         return 0.0
-                return str(val).lower()
+                elif col == "file":
+                    return self._display_filename(row[0]).lower()
+                elif col == "content":
+                    score = row[3] if len(row) > 3 else 0
+                    return (score, str(row[2]).lower())
+                return str(row[col_idx]).lower()
 
             children = self.tree.get_children("")
             visible_count = len(children)
@@ -2821,8 +2870,7 @@ if HAS_TKINTER:
                         display_fname = self._display_filename(fname)
                         self.lbl_detail_header.config(text=f"[{score}%] 📄 {display_fname} (Line #{rnum}){time_hint}{idx_hint}")
 
-                        ToolTip(
-                            self.lbl_detail_header,
+                        tooltip_msg = (
                             f"📄 File Metadata & Timestamps:\n"
                             f"• File Name: {fname}\n"
                             f"• Full Path: {target_path}\n"
@@ -2830,6 +2878,10 @@ if HAS_TKINTER:
                             f"• Last Indexed in DB:   {format_timestamp(info.get('indexed_at') if info else None, '%Y-%m-%d %H:%M:%S')}\n"
                             f"• File Size: {size_kb} | Total File Rows: {rows_cnt}"
                         )
+                        if hasattr(self, "_header_tooltip"):
+                            self._header_tooltip.update_text(tooltip_msg)
+                        else:
+                            ToolTip(self.lbl_detail_header, tooltip_msg)
 
                         self.txt_detail.config(state="normal")
                         self.txt_detail.delete("1.0", tk.END)
