@@ -22,5 +22,9 @@ if __name__ == "__main__":
     print("=======================================================")
     print("   Google Finance Portfolio & Financial Calculator    ")
     print("=======================================================")
-    print("Starting desktop GUI...")
-    launch_app()
+    try:
+        launch_app()
+    except (KeyboardInterrupt, SystemExit):
+        pass
+    finally:
+        os._exit(0)

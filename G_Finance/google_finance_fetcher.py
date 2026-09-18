@@ -75,10 +75,22 @@ class GoogleFinanceFetcher:
         self.fx_cache[pair_key] = fallback
         return fallback
 
+    def _normalize_text(self, text: Optional[str]) -> str:
+        if not text:
+            return ""
+        return (
+            text.replace("\u2212", "-")
+            .replace("\u2013", "-")
+            .replace("\u2014", "-")
+            .replace("&minus;", "-")
+            .strip()
+        )
+
     def _clean_number(self, text: Optional[str]) -> Optional[float]:
         if not text:
             return None
-        cleaned = re.sub(r"[^\d.\-+]", "", text)
+        norm = self._normalize_text(text)
+        cleaned = re.sub(r"[^\d.\-+]", "", norm)
         try:
             return float(cleaned)
         except (ValueError, TypeError):
@@ -87,7 +99,8 @@ class GoogleFinanceFetcher:
     def _clean_price(self, text: Optional[str]) -> Optional[float]:
         if not text:
             return None
-        match = re.search(r"[\$€£¥]?\s*([\d,]+\.?\d*)", text)
+        norm = self._normalize_text(text)
+        match = re.search(r"[$€£¥]?\s*([\d,]+\.?\d*)", norm)
         if match:
             num_str = match.group(1).replace(",", "")
             try:
@@ -99,7 +112,8 @@ class GoogleFinanceFetcher:
     def _clean_percent(self, text: Optional[str]) -> Optional[float]:
         if not text:
             return None
-        match = re.search(r"([+-]?[\d,]+\.?\d*)\s*%", text)
+        norm = self._normalize_text(text)
+        match = re.search(r"([+-]?[\d,]+\.?\d*)\s*%", norm)
         if match:
             num_str = match.group(1).replace(",", "")
             try:
@@ -221,19 +235,42 @@ class GoogleFinanceFetcher:
         change_val = None
         pct_change_val = None
 
+        # Look in aria-labels first (Google Finance uses accessibility labels with exact values, e.g. "Down by 0.26 (1.45%) today")
+        for el in soup.find_all(attrs={"aria-label": True}):
+            aria = self._normalize_text(el.get("aria-label", ""))
+            m_aria = re.search(r"(Up|Down|Increased|Decreased|dropped|gained)\s*(?:by\s*)?([$€£¥]?\s*[\d,]+\.?\d+)\s*(?:\((?:by\s*)?([$€£¥]?\s*[\d,]+\.?\d+)\s*%\))?", aria, re.I)
+            if m_aria:
+                direction = -1.0 if m_aria.group(1).lower() in ("down", "decreased", "dropped") else 1.0
+                if m_aria.group(2) and change_val is None:
+                    try:
+                        raw_c = float(re.sub(r"[$€£¥\s,]", "", m_aria.group(2)))
+                        if raw_c < current_price:
+                            change_val = round(direction * raw_c, 2)
+                    except ValueError:
+                        pass
+                if m_aria.group(3) and pct_change_val is None:
+                    try:
+                        raw_p = float(re.sub(r"[$€£¥\s,]", "", m_aria.group(3)))
+                        pct_change_val = round(direction * raw_p, 2)
+                    except ValueError:
+                        pass
+                if change_val is not None:
+                    break
+
         pct_el = (
             soup.find("span", class_="ymyBi")
             or soup.find("div", class_=re.compile(r"JwB6zf"))
             or soup.find("span", class_=re.compile(r"JwB6zf"))
+            or soup.find(class_=re.compile(r"(NydbP|V55Du|BAA5Fd)"))
         )
-        if pct_el:
-            pct_change_text = pct_el.get_text(strip=True)
+        if pct_el and pct_change_val is None:
+            pct_change_text = self._normalize_text(pct_el.get_text(strip=True))
             pct_change_val = self._clean_percent(pct_change_text)
 
         hero = soup.find("div", class_="JZvoCc")
         if hero:
             for span in hero.find_all(["span", "div"]):
-                t = span.get_text(strip=True)
+                t = self._normalize_text(span.get_text(strip=True))
                 if "%" in t and pct_change_val is None:
                     pct_change_val = self._clean_percent(t)
                     pct_change_text = t
@@ -242,6 +279,14 @@ class GoogleFinanceFetcher:
                     if c is not None and abs(c) < current_price:
                         change_val = c
                         change_text = t
+
+        # Cross-calculate if one is found and the other is missing
+        if change_val is not None and pct_change_val is None and current_price > 0 and (current_price - change_val) > 0:
+            pct_change_val = round((change_val / (current_price - change_val)) * 100, 2)
+        elif pct_change_val is not None and change_val is None and current_price > 0:
+            pct_dec = pct_change_val / 100.0
+            prev_p = current_price / (1.0 + pct_dec) if (1.0 + pct_dec) != 0 else current_price
+            change_val = round(current_price - prev_p, 2)
 
         # 4. Currency and Timestamp
         currency = "USD"
@@ -269,6 +314,15 @@ class GoogleFinanceFetcher:
             val = item.find("div", class_="P6K39c")
             if lbl and val:
                 stats[lbl.get_text(strip=True)] = val.get_text(strip=True)
+
+        # Fallback to Previous close if change_val is still None
+        if change_val is None:
+            prev_close_text = stats.get("Previous close") or stats.get("Prev close")
+            prev_close = self._clean_price(prev_close_text) if prev_close_text else None
+            if prev_close and prev_close > 0 and current_price > 0:
+                change_val = round(current_price - prev_close, 2)
+                if pct_change_val is None:
+                    pct_change_val = round((change_val / prev_close) * 100, 2)
 
         # 6. Parse Dividend Info
         div_yield_text = stats.get("Dividend") or stats.get("Dividend yield") or "0.00%"

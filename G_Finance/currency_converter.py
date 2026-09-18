@@ -44,6 +44,7 @@ class CurrencyConverter:
         self._last_update: float = 0.0
         self._lock = threading.Lock()
         self._is_refreshing = False
+        self.is_running = True
 
     def get_usd_rate(self, currency: str) -> float:
         """
@@ -131,7 +132,11 @@ class CurrencyConverter:
                 ]
                 new_rates = {}
                 for pair, curr in pairs:
+                    if not getattr(self, "is_running", True):
+                        break
                     quote = self.fetcher.fetch_quote(pair)
+                    if not getattr(self, "is_running", True):
+                        break
                     if quote.get("success") and quote.get("price", 0) > 0:
                         p = float(quote["price"])
                         if pair.startswith("USD-"):

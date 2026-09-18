@@ -105,26 +105,54 @@ A Python desktop GUI application that auto-receives live stock and market inform
 - Features executive KPI summary cards, full active holdings table, day changes, and sales logs.
 - Integrated `🖨️ Print / Save as PDF` button formatted for physical print or digital PDF export.
 
+### 13. Complete BUY & SELL Transaction History
+- Universal transaction logging tracking both purchases (`BUY`) and sales (`SELL`).
+- Dual filtering controls: filter by individual portfolio or consolidated view, and by trade type.
+- Automatic logging on stock additions and sales execution, with manual entry capabilities.
+
+### 14. Automatic 5-File Rolling Backups & One-Click Restore
+- Automatic maintenance of up to 5 rotating historical backups in `backups/` whenever CSV data is modified.
+- Dedicated `🔄 Backups` dialog with slot timestamps, file sizes, and 1-click restore with automated safety backup.
+
+### 15. Tri-Lingual Internationalization (i18n)
+- Seamless real-time language switching directly in the top toolbar:
+  - **English** (`en`)
+  - **Traditional Chinese** (`zh_TW` - 繁體中文)
+  - **Simplified Chinese** (`zh_CN` - 简体中文)
+- Dynamic re-rendering across all 7 tabs, metric cards, tables, dialogs, and charts without restarting.
+- Persistent user preference saved in `settings.json`.
+
+---
+
+## Documentation
+
+For full functional requirements, non-functional requirements, data schemas, and the implementation traceability matrix, see:
+- **[Software Requirements Document (REQUIREMENTS.md)](REQUIREMENTS.md)**
+
 ---
 
 ## File Structure
 
 ```
 /home/keith/gemini/G_Finance/
-├── app.py                      # Application launcher entrypoint
-├── main_gui.py                 # Main Tkinter desktop GUI (7 tabs, charts, dark mode)
+├── app.py                      # Application launcher entrypoint with clean exit handler
+├── main_gui.py                 # Main Tkinter desktop GUI (7 tabs, charts, dark mode, i18n)
+├── i18n.py                     # Internationalization module (en, zh_TW, zh_CN, 100% key parity)
 ├── chart_canvas.py             # Native Tkinter Canvas chart engine (Donut & DRIP compounding)
 ├── report_generator.py         # Executive HTML / PDF portfolio report generator
 ├── chart_view.py               # Google Finance style interactive chart view
 ├── chart_fetcher.py            # Historical chart data fetcher
 ├── currency_converter.py       # Multi-currency manager with live FX thread
-├── google_finance_fetcher.py   # Google Finance live quote & FX pair scraper
+├── google_finance_fetcher.py   # Google Finance live quote & FX pair scraper (US & SSE)
 ├── google_account_sync.py      # Google Finance account sync & Beta HTML parser
 ├── financial_calc.py           # Financial calculation engine & portfolio metrics
-├── csv_manager.py              # Multi-portfolio CSV storage & sales history
-├── test_suite.py               # Automated unit test suite (17 tests)
-├── portfolio.csv               # Active holdings data
-└── sales_history.csv           # Sales & trade history log
+├── csv_manager.py              # Multi-portfolio CSV storage, backups rotation, & transaction history
+├── test_suite.py               # Automated unit test suite (29 tests)
+├── REQUIREMENTS.md             # Complete Software Requirements Document
+├── portfolio.csv               # Active holdings inventory data
+├── transaction_history.csv     # Complete BUY and SELL transaction log
+├── settings.json               # User preferences (language)
+└── backups/                    # Automatic 5-file rotating CSV backup archives
 ```
 
 ---
@@ -140,7 +168,8 @@ or
 python3 main_gui.py
 ```
 
-To run the automated tests:
+To run the automated test suite (all 29 unit tests):
 ```bash
 python3 test_suite.py
 ```
+

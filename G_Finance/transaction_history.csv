@@ -1,0 +1,10 @@
+Date,Type,Portfolio,Symbol,Shares,Price ($),Total Amount ($),Cost Basis ($),Commission ($),Estimated Tax ($),Net Amount ($),Net Profit ($),Net ROI (%),Currency,Notes
+7 May 2026,SELL,USD HSBC,AMD,6.0000,411.21,2467.26,928.32,0.00,0.00,2467.26,+1538.94,+165.78%,USD,Migrated from sales history
+8 May 2026,SELL,USD HSBC,INTC,100.0000,114.52,11452.00,3550.00,0.00,0.00,11452.00,+7902.00,+222.59%,USD,Migrated from sales history
+11 June 2026,SELL,USD HSBC,INTC,20.0000,116.36,2327.20,961.20,0.00,0.00,2327.20,+1366.00,+142.11%,USD,Migrated from sales history
+12 June 2026,SELL,USD HSBC,INTC,2.0000,123.97,247.94,96.12,0.00,0.00,247.94,+151.82,+157.95%,USD,Migrated from sales history
+12 June 2026,SELL,USD HSBC,INTC,100.0000,123.97,12397.00,4805.98,0.00,0.00,12397.00,+7591.02,+157.95%,USD,Migrated from sales history
+22 June 2026,SELL,USD HSBC,VOO,10.0000,680.42,6804.20,6554.69,0.00,0.00,6804.20,+249.51,+3.81%,USD,Migrated from sales history
+12 July 2026,SELL,USD HSBC,NOW,40.0000,111.53,4461.20,4096.30,0.00,0.00,4461.20,+364.90,+8.91%,USD,Migrated from sales history
+12 July 2026,SELL,USD HSBC,NOW,3.0000,111.53,334.59,307.22,0.00,0.00,334.59,+27.37,+8.91%,USD,Migrated from sales history
+9 September 2026,SELL,USD TSFA,INTC,75.0000,105.75,7931.25,6450.00,0.00,0.00,7931.25,+1481.25,+22.97%,USD,Migrated from sales history

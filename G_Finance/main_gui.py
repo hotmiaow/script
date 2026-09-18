@@ -31,6 +31,10 @@ from financial_calc import (
     calc_breakeven_sell_price,
     calc_target_profit_sell_price,
     calc_portfolio_metrics,
+    calc_holding_earned_already,
+    calc_future_dividend_milestones,
+    calc_split_future_projections,
+    parse_date_to_days_held,
 )
 from chart_canvas import draw_donut_chart, draw_drip_growth_chart, ChartTheme
 from report_generator import generate_html_report
@@ -39,6 +43,8 @@ from chart_view import GoogleFinanceChartView
 from csv_manager import (
     PORTFOLIO_CSV,
     SALES_HISTORY_CSV,
+    TRANSACTION_HISTORY_CSV,
+    BACKUP_DIR,
     DEFAULT_PORTFOLIO_NAME,
     save_portfolio,
     load_portfolio,
@@ -48,15 +54,26 @@ from csv_manager import (
     save_sales_history,
     load_sales_history,
     append_sale_record,
+    save_transactions,
+    load_transactions,
+    append_transaction,
     ensure_workspace_files,
+    get_backup_files,
+    restore_backup,
 )
 from tkinter import simpledialog
+from i18n import (
+    t,
+    get_current_language,
+    set_language,
+    get_available_languages,
+)
 
 
 class ModernPortfolioApp:
     def __init__(self, root: tk.Tk):
         self.root = root
-        self.root.title("Google Finance Portfolio Tracker & Calculator")
+        self.root.title(t("app_title"))
         self.root.geometry("1280x860")
         self.root.minsize(1020, 700)
 
@@ -73,7 +90,8 @@ class ModernPortfolioApp:
 
         # Active holdings filtered by current portfolio
         self.holdings: List[Dict[str, Any]] = list(self.all_holdings)
-        self.sales_history: List[Dict[str, Any]] = load_sales_history(SALES_HISTORY_CSV, portfolio_name=None)
+        self.transactions: List[Dict[str, Any]] = load_transactions(TRANSACTION_HISTORY_CSV, portfolio_name=None, tx_type=None)
+        self.sales_history: List[Dict[str, Any]] = self.transactions
         self.fetcher = GoogleFinanceFetcher()
         self.account_sync = GoogleAccountSync()
 
@@ -262,7 +280,7 @@ class ModernPortfolioApp:
         title_box.pack(side=tk.LEFT)
         self.lbl_title = tk.Label(
             title_box,
-            text="📈 Google Finance Portfolio Tracker",
+            text=t("app_header"),
             font=("Segoe UI", 14, "bold"),
             bg=self.bg_main,
             fg=self.primary_color,
@@ -274,9 +292,9 @@ class ModernPortfolioApp:
         ctrl_box.pack(side=tk.RIGHT)
 
         # Google Account Sync button
-        btn_sync = tk.Button(
+        self.btn_sync = tk.Button(
             ctrl_box,
-            text="🌐 Google Account Sync",
+            text=t("btn_google_sync"),
             font=("Segoe UI", 9, "bold"),
             bg="#fbbc04",
             fg="#202124",
@@ -286,12 +304,12 @@ class ModernPortfolioApp:
             pady=3,
             command=self._open_sync_dialog,
         )
-        btn_sync.pack(side=tk.LEFT, padx=(0, 8))
+        self.btn_sync.pack(side=tk.LEFT, padx=(0, 8))
 
         # Add Stock button
-        btn_add = tk.Button(
+        self.btn_add = tk.Button(
             ctrl_box,
-            text="➕ Add Stock",
+            text=t("btn_add_stock"),
             font=("Segoe UI", 9, "bold"),
             bg=self.primary_color,
             fg="#ffffff",
@@ -301,12 +319,12 @@ class ModernPortfolioApp:
             pady=3,
             command=self._open_add_dialog,
         )
-        btn_add.pack(side=tk.LEFT, padx=(0, 4))
+        self.btn_add.pack(side=tk.LEFT, padx=(0, 4))
 
         # Remove Stock button
-        btn_remove = tk.Button(
+        self.btn_remove = tk.Button(
             ctrl_box,
-            text="➖ Remove Stock",
+            text=t("btn_tbl_remove"),
             font=("Segoe UI", 9, "bold"),
             bg="#ffffff",
             fg=self.red_color,
@@ -317,12 +335,12 @@ class ModernPortfolioApp:
             pady=3,
             command=self._delete_selected_holding,
         )
-        btn_remove.pack(side=tk.LEFT, padx=(0, 8))
+        self.btn_remove.pack(side=tk.LEFT, padx=(0, 8))
 
         # Export Executive HTML Report
-        btn_report = tk.Button(
+        self.btn_report = tk.Button(
             ctrl_box,
-            text="📄 Report",
+            text=t("btn_report"),
             font=("Segoe UI", 9, "bold"),
             bg="#ffffff",
             fg=self.primary_color,
@@ -333,12 +351,12 @@ class ModernPortfolioApp:
             pady=3,
             command=self._export_html_report_dialog,
         )
-        btn_report.pack(side=tk.LEFT, padx=(0, 6))
+        self.btn_report.pack(side=tk.LEFT, padx=(0, 6))
 
         # Theme toggle button
         self.btn_theme_toggle = tk.Button(
             ctrl_box,
-            text="🌙 Dark",
+            text=t("btn_theme_light") if self.dark_mode else t("btn_theme_dark"),
             font=("Segoe UI", 9, "bold"),
             bg="#ffffff",
             fg="#202124",
@@ -348,12 +366,26 @@ class ModernPortfolioApp:
             pady=3,
             command=self._toggle_theme,
         )
-        self.btn_theme_toggle.pack(side=tk.LEFT, padx=(0, 8))
+        self.btn_theme_toggle.pack(side=tk.LEFT, padx=(0, 6))
+
+        # Language Selector combobox
+        avail_langs = get_available_languages()
+        cur_lang_name = dict(avail_langs).get(get_current_language(), "English")
+        self.lang_var = tk.StringVar(value=cur_lang_name)
+        self.lang_combo = ttk.Combobox(
+            ctrl_box,
+            textvariable=self.lang_var,
+            values=[name for _, name in avail_langs],
+            width=9,
+            state="readonly",
+            font=("Segoe UI", 9),
+        )
+        self.lang_combo.pack(side=tk.LEFT, padx=(0, 8))
+        self.lang_combo.bind("<<ComboboxSelected>>", self._on_language_changed)
 
         # Auto-Refresh controls
-        tk.Label(ctrl_box, text="Auto:", font=("Segoe UI", 9, "bold"), bg=self.bg_main).pack(
-            side=tk.LEFT, padx=(0, 4)
-        )
+        self.lbl_auto = tk.Label(ctrl_box, text="Auto:", font=("Segoe UI", 9, "bold"), bg=self.bg_main)
+        self.lbl_auto.pack(side=tk.LEFT, padx=(0, 4))
 
         self.interval_var = tk.StringVar(value="30s")
         interval_menu = ttk.Combobox(
@@ -366,9 +398,9 @@ class ModernPortfolioApp:
         interval_menu.pack(side=tk.LEFT, padx=(0, 6))
         interval_menu.bind("<<ComboboxSelected>>", self._on_interval_changed)
 
-        btn_refresh = tk.Button(
+        self.btn_refresh = tk.Button(
             ctrl_box,
-            text="🔄 Refresh",
+            text=t("btn_refresh"),
             font=("Segoe UI", 9, "bold"),
             bg="#ffffff",
             fg=self.primary_color,
@@ -379,11 +411,11 @@ class ModernPortfolioApp:
             pady=3,
             command=self.fetch_all_quotes,
         )
-        btn_refresh.pack(side=tk.LEFT, padx=(0, 4))
+        self.btn_refresh.pack(side=tk.LEFT, padx=(0, 4))
 
-        btn_import = tk.Button(
+        self.btn_import = tk.Button(
             ctrl_box,
-            text="📂 CSV",
+            text=t("btn_import_csv"),
             font=("Segoe UI", 8),
             bg="#ffffff",
             relief="solid",
@@ -392,11 +424,11 @@ class ModernPortfolioApp:
             pady=3,
             command=self._import_csv_dialog,
         )
-        btn_import.pack(side=tk.LEFT, padx=(0, 2))
+        self.btn_import.pack(side=tk.LEFT, padx=(0, 2))
 
-        btn_export = tk.Button(
+        self.btn_export = tk.Button(
             ctrl_box,
-            text="💾 CSV",
+            text=t("btn_export_csv"),
             font=("Segoe UI", 8),
             bg="#ffffff",
             relief="solid",
@@ -405,7 +437,257 @@ class ModernPortfolioApp:
             pady=3,
             command=self._export_csv_dialog,
         )
-        btn_export.pack(side=tk.LEFT)
+        self.btn_export.pack(side=tk.LEFT, padx=(0, 2))
+
+        self.btn_backups = tk.Button(
+            ctrl_box,
+            text=t("btn_backups"),
+            font=("Segoe UI", 8),
+            bg="#ffffff",
+            relief="solid",
+            bd=1,
+            padx=4,
+            pady=3,
+            command=self._open_backups_dialog,
+        )
+        self.btn_backups.pack(side=tk.LEFT)
+
+    def _on_language_changed(self, event=None):
+        selected_display = self.lang_var.get()
+        for code, name in get_available_languages():
+            if name == selected_display:
+                set_language(code)
+                break
+        self._apply_language()
+
+    def _apply_language(self):
+        # 1. Update window title
+        if hasattr(self, "current_portfolio"):
+            if self.current_portfolio in ("All Portfolios (Consolidated)", "All Portfolios", "All",
+                                          t("portfolio_all_consolidated"), t("portfolio_all_plain")):
+                self.root.title(f"{t('app_title')} - {t('portfolio_all_consolidated')}")
+            else:
+                self.root.title(f"{t('app_title')} - {self.current_portfolio}")
+
+        # 2. Update top bar
+        if hasattr(self, "lbl_title"):
+            self.lbl_title.config(text=t("app_header"))
+        if hasattr(self, "btn_sync"):
+            self.btn_sync.config(text=t("btn_google_sync"))
+        if hasattr(self, "btn_add"):
+            self.btn_add.config(text=t("btn_add_stock"))
+        if hasattr(self, "btn_remove"):
+            self.btn_remove.config(text=t("btn_tbl_remove"))
+        if hasattr(self, "btn_report"):
+            self.btn_report.config(text=t("btn_report"))
+        if hasattr(self, "btn_theme_toggle"):
+            self.btn_theme_toggle.config(text=t("btn_theme_light") if self.dark_mode else t("btn_theme_dark"))
+        if hasattr(self, "lbl_auto"):
+            self.lbl_auto.config(text=t("lbl_auto"))
+        if hasattr(self, "btn_refresh"):
+            self.btn_refresh.config(text=t("btn_refresh"))
+        if hasattr(self, "btn_import"):
+            self.btn_import.config(text=t("btn_import_csv"))
+        if hasattr(self, "btn_export"):
+            self.btn_export.config(text=t("btn_export_csv"))
+        if hasattr(self, "btn_backups"):
+            self.btn_backups.config(text=t("btn_backups"))
+
+        # 3. Update Portfolio bar
+        if hasattr(self, "lbl_portfolio"):
+            self.lbl_portfolio.config(text=t("lbl_portfolio"))
+        if hasattr(self, "btn_new_portfolio"):
+            self.btn_new_portfolio.config(text=t("btn_new_portfolio"))
+        if hasattr(self, "btn_rename_portfolio"):
+            self.btn_rename_portfolio.config(text=t("btn_rename_portfolio"))
+        if hasattr(self, "btn_delete_portfolio"):
+            self.btn_delete_portfolio.config(text=t("btn_delete_portfolio"))
+        if hasattr(self, "lbl_summary_in"):
+            self.lbl_summary_in.config(text=t("lbl_summary_in"))
+
+        # 4. Update Notebook tab titles
+        if hasattr(self, "notebook"):
+            tab_map = [
+                (getattr(self, "tab_holdings", None), t("tab_holdings")),
+                (getattr(self, "tab_analytics", None), t("tab_analytics")),
+                (getattr(self, "tab_chart", None), t("tab_chart")),
+                (getattr(self, "tab_dividend", None), t("tab_dividend")),
+                (getattr(self, "tab_split", None), t("tab_split")),
+                (getattr(self, "tab_sell", None), t("tab_selling")),
+                (getattr(self, "tab_history", None), t("tab_transactions")),
+            ]
+            for tab_widget, text in tab_map:
+                if tab_widget is not None:
+                    try:
+                        self.notebook.tab(tab_widget, text=text)
+                    except Exception:
+                        pass
+
+        # 5. Update Holdings tab
+        if hasattr(self, "lbl_search"):
+            self.lbl_search.config(text=t("lbl_search"))
+        if hasattr(self, "lbl_filter"):
+            self.lbl_filter.config(text=t("lbl_filter"))
+        if hasattr(self, "holdings_tree"):
+            headers = [
+                ("portfolio", t("col_portfolio")),
+                ("symbol", t("col_symbol")),
+                ("name", t("col_name")),
+                ("currency", t("col_currency")),
+                ("shares", t("col_shares")),
+                ("buy_price", t("col_buy_price")),
+                ("current_price", t("col_current_price")),
+                ("change", t("col_day_change")),
+                ("market_value", t("col_market_value")),
+                ("cost_basis", t("col_cost_basis")),
+                ("unrealized_gain", t("col_unrealized_gain")),
+                ("unrealized_gain_pct", t("col_unrealized_pct")),
+                ("div_yield", t("col_dividend_yield")),
+                ("annual_div", t("col_annual_div")),
+                ("updated", t("col_last_updated")),
+            ]
+            for col, heading in headers:
+                try:
+                    self.holdings_tree.heading(col, text=heading)
+                except Exception:
+                    pass
+
+        if hasattr(self, "btn_tbl_add"):
+            self.btn_tbl_add.config(text=t("btn_tbl_add"))
+        if hasattr(self, "btn_tbl_del"):
+            self.btn_tbl_del.config(text=t("btn_tbl_remove"))
+        if hasattr(self, "btn_tbl_chart"):
+            self.btn_tbl_chart.config(text=t("btn_tbl_chart"))
+        if hasattr(self, "btn_tbl_edit"):
+            self.btn_tbl_edit.config(text=t("btn_tbl_edit"))
+        if hasattr(self, "btn_tbl_to_div"):
+            self.btn_tbl_to_div.config(text=t("btn_tbl_to_div"))
+        if hasattr(self, "btn_tbl_to_split"):
+            self.btn_tbl_to_split.config(text=t("btn_tbl_to_split"))
+        if hasattr(self, "btn_tbl_to_sell"):
+            self.btn_tbl_to_sell.config(text=t("btn_tbl_to_sell"))
+
+        # Context menu
+        if hasattr(self, "context_menu"):
+            try:
+                self.context_menu.delete(0, tk.END)
+                self.context_menu.add_command(label=f"📈 {t('tab_chart').strip()}", command=self._send_selected_to_chart)
+                self.context_menu.add_separator()
+                self.context_menu.add_command(label=f"✏️ {t('btn_tbl_edit')}", command=self._open_edit_dialog)
+                self.context_menu.add_command(label=f"➖ {t('btn_tbl_remove')}", command=self._delete_selected_holding)
+                self.context_menu.add_separator()
+                self.context_menu.add_command(label=f"🔄 {t('btn_refresh')}", command=self._refresh_selected_quote)
+                self.context_menu.add_separator()
+                self.context_menu.add_command(label=f"💵 {t('btn_tbl_to_div')}", command=self._send_selected_to_dividend_calc)
+                self.context_menu.add_command(label=f"✂️ {t('btn_tbl_to_split')}", command=self._send_selected_to_split_calc)
+                self.context_menu.add_command(label=f"🏷️ {t('btn_tbl_to_sell')}", command=self._send_selected_to_selling_calc)
+            except Exception:
+                pass
+
+        # 6. Update Analytics tab
+        if hasattr(self, "analytics_left_box"):
+            self.analytics_left_box.config(text=f" {t('alloc_chart_title')} ")
+        if hasattr(self, "analytics_right_box"):
+            self.analytics_right_box.config(text=f" {t('health_box_title')} ")
+        if hasattr(self, "analytics_kpis"):
+            kpi_labels = {
+                "top_asset": t("kpi_top_position"),
+                "concentration": t("kpi_concentration"),
+                "portfolio_yoc": t("kpi_yield_on_cost"),
+                "div_yield": t("kpi_avg_dividend_yield"),
+                "best_performer": t("kpi_best_performer"),
+                "worst_performer": t("kpi_worst_performer"),
+            }
+            for k, lbl in kpi_labels.items():
+                if k in self.analytics_kpis:
+                    try:
+                        self.analytics_kpis[k][1].config(text=lbl)
+                    except Exception:
+                        pass
+        if hasattr(self, "lbl_alloc_weights"):
+            self.lbl_alloc_weights.config(text=t("lbl_alloc_weights"))
+        if hasattr(self, "alloc_tree"):
+            try:
+                self.alloc_tree.heading("symbol", text=t("col_symbol"))
+                self.alloc_tree.heading("name", text=t("col_name"))
+                self.alloc_tree.heading("value", text=t("col_market_value"))
+                self.alloc_tree.heading("weight", text=t("col_weight"))
+            except Exception:
+                pass
+
+        # 7. Update Transaction History tab
+        if hasattr(self, "lbl_tx_port"):
+            self.lbl_tx_port.config(text=t("lbl_tx_portfolio"))
+        if hasattr(self, "lbl_tx_type"):
+            self.lbl_tx_type.config(text=t("lbl_tx_type"))
+        if hasattr(self, "tx_type_filter_cb"):
+            cur_idx = self.tx_type_filter_cb.current()
+            new_vals = [t("tx_type_all"), t("tx_type_buy"), t("tx_type_sell")]
+            self.tx_type_filter_cb.config(values=new_vals)
+            if 0 <= cur_idx < len(new_vals):
+                self.tx_type_filter_var.set(new_vals[cur_idx])
+            else:
+                self.tx_type_filter_var.set(t("tx_type_all"))
+
+        if hasattr(self, "btn_tx_all"):
+            self.btn_tx_all.config(text=t("btn_tx_all"))
+        if hasattr(self, "btn_tx_match"):
+            self.btn_tx_match.config(text=t("btn_tx_match"))
+        if hasattr(self, "btn_tx_record"):
+            self.btn_tx_record.config(text=t("btn_tx_record"))
+        if hasattr(self, "btn_tx_export"):
+            self.btn_tx_export.config(text=t("btn_tx_export"))
+        if hasattr(self, "btn_tx_clear"):
+            self.btn_tx_clear.config(text=t("btn_tx_clear"))
+
+        if hasattr(self, "history_tree"):
+            hist_headers = [
+                ("date", t("col_tx_date")),
+                ("type", t("col_tx_type")),
+                ("portfolio", t("col_tx_port")),
+                ("symbol", t("col_tx_sym")),
+                ("currency", t("col_tx_curr")),
+                ("shares", t("col_tx_shares")),
+                ("price", t("col_tx_price")),
+                ("total_amount", t("col_tx_total")),
+                ("commission", t("col_tx_fees")),
+                ("tax", t("col_tx_tax")),
+                ("net_profit", t("col_tx_profit")),
+                ("roi", t("col_tx_roi")),
+            ]
+            for col, heading in hist_headers:
+                try:
+                    self.history_tree.heading(col, text=heading)
+                except Exception:
+                    pass
+
+        # 8. Update Dividend & DRIP Tab
+        if hasattr(self, "div_earned_box"):
+            self.div_earned_box.config(text=f" {t('div_sec_earned_already')} ")
+        if hasattr(self, "div_future_box"):
+            self.div_future_box.config(text=f" {t('div_sec_future_earnings')} ")
+        if hasattr(self, "div_income_box"):
+            self.div_income_box.config(text=f" {t('div_sec_projections')} ")
+
+        # 9. Update Split Tab
+        if hasattr(self, "split_earned_box"):
+            self.split_earned_box.config(text=f" {t('split_sec_earned_already')} ")
+        if hasattr(self, "split_comp_box"):
+            self.split_comp_box.config(text=f" {t('split_sec_comparison')} ")
+        if hasattr(self, "split_future_box"):
+            self.split_future_box.config(text=f" {t('split_sec_future')} ")
+        if hasattr(self, "btn_apply_split"):
+            self.btn_apply_split.config(text="✅ " + t("btn_apply_split"))
+        if hasattr(self, "btn_split_recov"):
+            self.btn_split_recov.config(text="🎯 " + t("lbl_split_presplit_recovery"))
+
+        # 10. Refresh views
+        self._update_filter_button_styles()
+        self._update_metric_cards()
+        self._refresh_holdings_table()
+        self._refresh_sales_table()
+        self._refresh_analytics_tab()
+        self._set_status(t("ready"))
 
     def _build_portfolio_bar(self):
         bar = ttk.Frame(self.root, padding="12 2 12 4")
@@ -415,7 +697,8 @@ class ModernPortfolioApp:
         p_box = ttk.Frame(bar)
         p_box.pack(side=tk.LEFT)
 
-        tk.Label(p_box, text="📁 Portfolio:", font=("Segoe UI", 9, "bold"), bg=self.bg_main).pack(side=tk.LEFT, padx=(0, 6))
+        self.lbl_portfolio = tk.Label(p_box, text=t("lbl_portfolio"), font=("Segoe UI", 9, "bold"), bg=self.bg_main)
+        self.lbl_portfolio.pack(side=tk.LEFT, padx=(0, 6))
 
         self.portfolio_var = tk.StringVar(value=self.current_portfolio)
         self.portfolio_combo = ttk.Combobox(
@@ -429,9 +712,9 @@ class ModernPortfolioApp:
         self.portfolio_combo.pack(side=tk.LEFT, padx=(0, 6))
         self.portfolio_combo.bind("<<ComboboxSelected>>", self._on_portfolio_selected)
 
-        btn_new_p = tk.Button(
+        self.btn_new_portfolio = tk.Button(
             p_box,
-            text="➕ New",
+            text=t("btn_new_portfolio"),
             font=("Segoe UI", 8, "bold"),
             bg="#ffffff",
             relief="solid",
@@ -440,11 +723,11 @@ class ModernPortfolioApp:
             pady=1,
             command=self._create_new_portfolio,
         )
-        btn_new_p.pack(side=tk.LEFT, padx=(0, 4))
+        self.btn_new_portfolio.pack(side=tk.LEFT, padx=(0, 4))
 
-        btn_ren_p = tk.Button(
+        self.btn_rename_portfolio = tk.Button(
             p_box,
-            text="✏️ Rename",
+            text=t("btn_rename_portfolio"),
             font=("Segoe UI", 8),
             bg="#ffffff",
             relief="solid",
@@ -453,11 +736,11 @@ class ModernPortfolioApp:
             pady=1,
             command=self._rename_current_portfolio,
         )
-        btn_ren_p.pack(side=tk.LEFT, padx=(0, 4))
+        self.btn_rename_portfolio.pack(side=tk.LEFT, padx=(0, 4))
 
-        btn_del_p = tk.Button(
+        self.btn_delete_portfolio = tk.Button(
             p_box,
-            text="🗑️ Delete",
+            text=t("btn_delete_portfolio"),
             font=("Segoe UI", 8),
             bg="#ffffff",
             fg=self.red_color,
@@ -467,13 +750,14 @@ class ModernPortfolioApp:
             pady=1,
             command=self._delete_current_portfolio,
         )
-        btn_del_p.pack(side=tk.LEFT, padx=(0, 16))
+        self.btn_delete_portfolio.pack(side=tk.LEFT, padx=(0, 16))
 
         # Currency summary selector on right
         curr_box = ttk.Frame(bar)
         curr_box.pack(side=tk.RIGHT)
 
-        tk.Label(curr_box, text="💱 Summary In:", font=("Segoe UI", 9, "bold"), bg=self.bg_main).pack(side=tk.LEFT, padx=(0, 6))
+        self.lbl_summary_in = tk.Label(curr_box, text=t("lbl_summary_in"), font=("Segoe UI", 9, "bold"), bg=self.bg_main)
+        self.lbl_summary_in.pack(side=tk.LEFT, padx=(0, 6))
 
         self.summary_curr_var = tk.StringVar(value=self.summary_currency)
         self.curr_combo = ttk.Combobox(
@@ -524,18 +808,64 @@ class ModernPortfolioApp:
             res.append("All Portfolios (Consolidated)")
         return res
 
+    def _get_holding_purchase_date(self, sym: str, portfolio: Optional[str] = None) -> str:
+        """
+        Finds the earliest BUY transaction date for this symbol and portfolio.
+        Falls back to holding last_updated date or 1 year ago.
+        """
+        if getattr(self, "transactions", None):
+            buys = [
+                tx for tx in self.transactions
+                if str(tx.get("type", "")).upper() == "BUY" and str(tx.get("symbol", "")).upper() == sym.upper()
+            ]
+            if portfolio and portfolio != "All Portfolios (Consolidated)":
+                port_buys = [tx for tx in buys if tx.get("portfolio") == portfolio]
+                if port_buys:
+                    buys = port_buys
+            if buys:
+                raw_d = str(buys[0].get("date", "")).strip()
+                if raw_d:
+                    # extract YYYY-MM-DD
+                    import re
+                    m = re.search(r"(\d{4}[-/]\d{1,2}[-/]\d{1,2})", raw_d)
+                    if m:
+                        return m.group(1).replace("/", "-")
+                    return raw_d.split()[0]
+
+        # Fallback to holding last_updated
+        h = next((x for x in getattr(self, "all_holdings", []) if str(x.get("symbol", "")).upper() == sym.upper()), None)
+        if h and h.get("last_updated"):
+            return str(h["last_updated"]).split()[0]
+
+        # Default to 1 year ago
+        from datetime import date, timedelta
+        return (date.today() - timedelta(days=365)).strftime("%Y-%m-%d")
+
     def _on_portfolio_selected(self, event=None):
         sel = self.portfolio_var.get()
         self.current_portfolio = sel
+        existing_changes = {
+            (h.get("portfolio"), h.get("symbol")): (h.get("change"), h.get("change_percent"))
+            for h in getattr(self, "all_holdings", [])
+            if h.get("change") is not None or h.get("change_percent") is not None
+        }
         self.all_holdings = load_portfolio(PORTFOLIO_CSV, portfolio_name=None)
-        if sel in ("All Portfolios (Consolidated)", "All Portfolios", "All"):
+        for h in self.all_holdings:
+            k = (h.get("portfolio"), h.get("symbol"))
+            if h.get("change") is None and k in existing_changes:
+                h["change"], h["change_percent"] = existing_changes[k]
+
+        if sel in ("All Portfolios (Consolidated)", "All Portfolios", "All",
+                   t("portfolio_all_consolidated"), t("portfolio_all_plain")):
             self.holdings = list(self.all_holdings)
-            self.root.title("Google Finance Portfolio Tracker - All Portfolios (Consolidated)")
-            self.sales_history = load_sales_history(SALES_HISTORY_CSV, portfolio_name=None)
+            self.root.title(f"{t('app_title')} - {t('portfolio_all_consolidated')}")
+            self.transactions = load_transactions(TRANSACTION_HISTORY_CSV, portfolio_name=None)
+            self.sales_history = self.transactions
         else:
             self.holdings = [h for h in self.all_holdings if h.get("portfolio") == sel]
-            self.root.title(f"Google Finance Portfolio Tracker - {sel}")
-            self.sales_history = load_sales_history(SALES_HISTORY_CSV, portfolio_name=sel)
+            self.root.title(f"{t('app_title')} - {sel}")
+            self.transactions = load_transactions(TRANSACTION_HISTORY_CSV, portfolio_name=sel)
+            self.sales_history = self.transactions
 
         self._refresh_holdings_table()
         self._refresh_sales_table()
@@ -657,37 +987,37 @@ class ModernPortfolioApp:
 
         # Tab 1: Portfolio Holdings
         self.tab_holdings = ttk.Frame(self.notebook)
-        self.notebook.add(self.tab_holdings, text=" 📋 Portfolio Holdings ")
+        self.notebook.add(self.tab_holdings, text=t("tab_holdings"))
         self._build_holdings_tab()
 
         # Tab 2: Allocation & Analytics
         self.tab_analytics = ttk.Frame(self.notebook)
-        self.notebook.add(self.tab_analytics, text=" 📊 Allocation & Analytics ")
+        self.notebook.add(self.tab_analytics, text=t("tab_analytics"))
         self._build_analytics_tab()
 
         # Tab 3: Interactive Chart (Google Finance style)
         self.tab_chart = ttk.Frame(self.notebook)
-        self.notebook.add(self.tab_chart, text=" 📈 Interactive Chart ")
+        self.notebook.add(self.tab_chart, text=t("tab_chart"))
         self._build_chart_tab()
 
         # Tab 4: Dividend & DRIP Calculator
         self.tab_dividend = ttk.Frame(self.notebook)
-        self.notebook.add(self.tab_dividend, text=" 💵 Dividend & DRIP Calculator ")
+        self.notebook.add(self.tab_dividend, text=t("tab_dividend"))
         self._build_dividend_tab()
 
         # Tab 5: Stock Division / Split
         self.tab_split = ttk.Frame(self.notebook)
-        self.notebook.add(self.tab_split, text=" ✂️ Stock Division (Split) ")
+        self.notebook.add(self.tab_split, text=t("tab_split"))
         self._build_split_tab()
 
         # Tab 6: Selling Calculator
         self.tab_sell = ttk.Frame(self.notebook)
-        self.notebook.add(self.tab_sell, text=" 🏷️ Selling & Profit Calculator ")
+        self.notebook.add(self.tab_sell, text=t("tab_selling"))
         self._build_selling_tab()
 
-        # Tab 7: Trade History
+        # Tab 7: Transaction History
         self.tab_history = ttk.Frame(self.notebook)
-        self.notebook.add(self.tab_history, text=" 📜 Sales History ")
+        self.notebook.add(self.tab_history, text=t("tab_transactions"))
         self._build_history_tab()
 
         self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
@@ -713,7 +1043,7 @@ class ModernPortfolioApp:
         # Left: Donut Chart Canvas
         left_box = tk.LabelFrame(
             container,
-            text=" Asset Allocation (By Market Value) ",
+            text=f" {t('alloc_chart_title')} ",
             font=("Segoe UI", 10, "bold"),
             bg=self.card_bg,
             fg=self.primary_color,
@@ -730,7 +1060,7 @@ class ModernPortfolioApp:
         # Right: KPI Cards and Concentration Weights
         right_box = tk.LabelFrame(
             container,
-            text=" Portfolio Health & Concentration ",
+            text=f" {t('health_box_title')} ",
             font=("Segoe UI", 10, "bold"),
             bg=self.card_bg,
             fg=self.primary_color,
@@ -747,12 +1077,12 @@ class ModernPortfolioApp:
 
         self.analytics_kpis = {}
         items = [
-            ("top_asset", "Top Position:", "-", self.primary_color),
-            ("concentration", "Concentration:", "0.0%", self.text_dark),
-            ("portfolio_yoc", "Portfolio YoC:", "0.00%", self.green_color),
-            ("div_yield", "Overall Div Yield:", "0.00%", self.primary_color),
-            ("best_performer", "Best Performer:", "-", self.green_color),
-            ("worst_performer", "Worst Performer:", "-", self.red_color),
+            ("top_asset", t("kpi_top_position"), "-", self.primary_color),
+            ("concentration", t("kpi_concentration"), "0.0%", self.text_dark),
+            ("portfolio_yoc", t("kpi_yield_on_cost"), "0.00%", self.green_color),
+            ("div_yield", t("kpi_avg_dividend_yield"), "0.00%", self.primary_color),
+            ("best_performer", t("kpi_best_performer"), "-", self.green_color),
+            ("worst_performer", t("kpi_worst_performer"), "-", self.red_color),
         ]
 
         for idx, (k, label, def_val, col) in enumerate(items):
@@ -769,26 +1099,27 @@ class ModernPortfolioApp:
             self.analytics_kpis[k] = (cell, lbl_t, lbl_v)
 
         # Ranked Position Weights Tree
-        tk.Label(
+        self.lbl_alloc_weights = tk.Label(
             right_box,
-            text="Ranked Position Weights",
+            text=t("lbl_alloc_weights"),
             font=("Segoe UI", 9, "bold"),
             bg=self.card_bg,
             fg=self.text_dark,
-        ).pack(anchor="w", pady=(6, 4))
+        )
+        self.lbl_alloc_weights.pack(anchor="w", pady=(6, 4))
 
         breakdown_frame = ttk.Frame(right_box)
         breakdown_frame.pack(fill=tk.BOTH, expand=True)
 
         cols = ("symbol", "name", "value", "weight")
         self.alloc_tree = ttk.Treeview(breakdown_frame, columns=cols, show="headings", height=8)
-        self.alloc_tree.heading("symbol", text="Symbol")
+        self.alloc_tree.heading("symbol", text=t("col_symbol"))
         self.alloc_tree.column("symbol", width=70, anchor="center")
-        self.alloc_tree.heading("name", text="Company / Asset")
+        self.alloc_tree.heading("name", text=t("col_name"))
         self.alloc_tree.column("name", width=125, anchor="w")
-        self.alloc_tree.heading("value", text="Market Value")
+        self.alloc_tree.heading("value", text=t("col_market_value"))
         self.alloc_tree.column("value", width=95, anchor="e")
-        self.alloc_tree.heading("weight", text="Weight")
+        self.alloc_tree.heading("weight", text=t("col_weight"))
         self.alloc_tree.column("weight", width=70, anchor="e")
 
         alloc_scroll = ttk.Scrollbar(breakdown_frame, orient=tk.VERTICAL, command=self.alloc_tree.yview)
@@ -809,8 +1140,8 @@ class ModernPortfolioApp:
         tot = metrics.get("total_value", 0.0)
         sym_char = self.converter.CURRENCY_SYMBOLS.get(base_curr, "$")
         center_str = f"{sym_char}{tot:,.2f}"
-
-        port_title = f"Allocation ({base_curr}) - {self.current_portfolio}"
+        port_name_display = t("portfolio_all_consolidated") if self.current_portfolio in ("All Portfolios (Consolidated)", "All Portfolios", "All") else self.current_portfolio
+        port_title = f"{t('alloc_chart_title')} ({base_curr}) - {port_name_display}"
         draw_donut_chart(
             self.donut_canvas,
             labels=labels,
@@ -964,7 +1295,16 @@ class ModernPortfolioApp:
     def _update_filter_button_styles(self):
         if not hasattr(self, "filter_buttons"):
             return
+        all_c = len(self.holdings) if hasattr(self, "holdings") else 0
+        gain_c = sum(1 for h in self.holdings if float(h.get("change", 0.0) or 0.0) > 0) if hasattr(self, "holdings") else 0
+        lose_c = sum(1 for h in self.holdings if float(h.get("change", 0.0) or 0.0) < 0) if hasattr(self, "holdings") else 0
+        lbls = {
+            "All": t("filter_all", count=all_c),
+            "Gainers": t("filter_gainers", count=gain_c),
+            "Losers": t("filter_losers", count=lose_c),
+        }
         for mode, btn in self.filter_buttons.items():
+            btn.config(text=lbls.get(mode, mode))
             if mode == self.filter_performance:
                 btn.config(bg=self.primary_color, fg="#ffffff")
             else:
@@ -977,7 +1317,8 @@ class ModernPortfolioApp:
         sf_bar = ttk.Frame(tab, padding="8 6 8 2")
         sf_bar.pack(fill=tk.X)
 
-        tk.Label(sf_bar, text="🔍 Search:", font=("Segoe UI", 9, "bold"), bg=self.bg_main, fg=self.text_dark).pack(side=tk.LEFT, padx=(0, 4))
+        self.lbl_search = tk.Label(sf_bar, text="🔍 Search:", font=("Segoe UI", 9, "bold"), bg=self.bg_main, fg=self.text_dark)
+        self.lbl_search.pack(side=tk.LEFT, padx=(0, 4))
         self.search_entry = tk.Entry(sf_bar, textvariable=self.search_filter_var, font=("Segoe UI", 9), width=22, bd=1, relief="solid")
         self.search_entry.pack(side=tk.LEFT, padx=(0, 4))
         self.search_entry.bind("<KeyRelease>", lambda e: self._refresh_holdings_table())
@@ -985,9 +1326,10 @@ class ModernPortfolioApp:
         btn_clear = tk.Button(sf_bar, text="✕", font=("Segoe UI", 8), bg="#ffffff", relief="solid", bd=1, padx=4, pady=1, command=self._clear_search)
         btn_clear.pack(side=tk.LEFT, padx=(0, 12))
 
-        tk.Label(sf_bar, text="Filter:", font=("Segoe UI", 9, "bold"), bg=self.bg_main, fg=self.text_dark).pack(side=tk.LEFT, padx=(0, 4))
+        self.lbl_filter = tk.Label(sf_bar, text="Filter:", font=("Segoe UI", 9, "bold"), bg=self.bg_main, fg=self.text_dark)
+        self.lbl_filter.pack(side=tk.LEFT, padx=(0, 4))
         self.filter_buttons = {}
-        for f_mode, f_lbl in [("All", "All"), ("Gainers", "Gainers ▲"), ("Losers", "Losers ▼")]:
+        for f_mode, f_lbl in [("All", t("filter_all", count=0)), ("Gainers", t("filter_gainers", count=0)), ("Losers", t("filter_losers", count=0))]:
             btn = tk.Button(
                 sf_bar,
                 text=f_lbl,
@@ -1029,21 +1371,21 @@ class ModernPortfolioApp:
         self.holdings_tree = ttk.Treeview(tree_frame, columns=columns, show="headings", selectmode="extended")
 
         headers = [
-            ("portfolio", "Portfolio", 100),
-            ("symbol", "Symbol", 75),
-            ("name", "Company Name", 150),
-            ("currency", "Curr", 55),
-            ("shares", "Shares", 70),
-            ("buy_price", "Buy Price", 85),
-            ("current_price", "Live Price", 85),
-            ("change", "Day Change", 90),
-            ("market_value", "Market Value", 105),
-            ("cost_basis", "Cost Basis", 100),
-            ("unrealized_gain", "Profit/Loss", 105),
-            ("unrealized_gain_pct", "P/L (%)", 75),
-            ("div_yield", "Div Yield", 75),
-            ("annual_div", "Est. Ann Div", 90),
-            ("updated", "Last Updated", 130),
+            ("portfolio", t("col_portfolio"), 100),
+            ("symbol", t("col_symbol"), 75),
+            ("name", t("col_name"), 150),
+            ("currency", t("col_currency"), 55),
+            ("shares", t("col_shares"), 70),
+            ("buy_price", t("col_buy_price"), 85),
+            ("current_price", t("col_current_price"), 85),
+            ("change", t("col_day_change"), 90),
+            ("market_value", t("col_market_value"), 105),
+            ("cost_basis", t("col_cost_basis"), 100),
+            ("unrealized_gain", t("col_unrealized_gain"), 105),
+            ("unrealized_gain_pct", t("col_unrealized_pct"), 75),
+            ("div_yield", t("col_dividend_yield"), 75),
+            ("annual_div", t("col_annual_div"), 90),
+            ("updated", t("col_last_updated"), 130),
         ]
 
         for col, heading, width in headers:
@@ -1064,7 +1406,7 @@ class ModernPortfolioApp:
         self.holdings_tree.tag_configure("neutral", foreground=self.text_dark)
 
         # Bindings
-        self.holdings_tree.bind("<Double-1>", lambda e: self._open_edit_dialog())
+        self.holdings_tree.bind("<Double-1>", self._on_tree_double_click)
         self.holdings_tree.bind("<Button-3>", self._show_context_menu)
         self.holdings_tree.bind("<Delete>", lambda e: self._delete_selected_holding())
         self.holdings_tree.bind("<BackSpace>", lambda e: self._delete_selected_holding())
@@ -1073,20 +1415,21 @@ class ModernPortfolioApp:
         btn_bar = ttk.Frame(tab, padding="8 4 8 8")
         btn_bar.pack(fill=tk.X)
 
-        tk.Button(
+        self.btn_tbl_add = tk.Button(
             btn_bar,
-            text="➕ Add Stock",
+            text=t("btn_tbl_add"),
             font=("Segoe UI", 9, "bold"),
             bg=self.primary_color,
             fg="#ffffff",
             relief="flat",
             padx=10,
             command=self._open_add_dialog,
-        ).pack(side=tk.LEFT, padx=4)
+        )
+        self.btn_tbl_add.pack(side=tk.LEFT, padx=4)
 
-        tk.Button(
+        self.btn_tbl_del = tk.Button(
             btn_bar,
-            text="➖ Remove Stock",
+            text=t("btn_tbl_remove"),
             font=("Segoe UI", 9, "bold"),
             bg="#ffffff",
             fg=self.red_color,
@@ -1094,11 +1437,12 @@ class ModernPortfolioApp:
             bd=1,
             padx=8,
             command=self._delete_selected_holding,
-        ).pack(side=tk.LEFT, padx=4)
+        )
+        self.btn_tbl_del.pack(side=tk.LEFT, padx=4)
 
-        tk.Button(
+        self.btn_tbl_chart = tk.Button(
             btn_bar,
-            text="📈 View Chart",
+            text=t("tab_chart").strip(),
             font=("Segoe UI", 9, "bold"),
             bg="#ffffff",
             fg=self.primary_color,
@@ -1106,64 +1450,72 @@ class ModernPortfolioApp:
             bd=1,
             padx=8,
             command=self._send_selected_to_chart,
-        ).pack(side=tk.LEFT, padx=4)
+        )
+        self.btn_tbl_chart.pack(side=tk.LEFT, padx=4)
 
-        tk.Button(
+        self.btn_tbl_edit = tk.Button(
             btn_bar,
-            text="✏️ Edit Selected",
+            text=t("btn_tbl_edit"),
             bg="#ffffff",
             relief="solid",
             bd=1,
             padx=8,
             command=self._open_edit_dialog,
-        ).pack(side=tk.LEFT, padx=4)
+        )
+        self.btn_tbl_edit.pack(side=tk.LEFT, padx=4)
 
-        tk.Button(
+        self.btn_tbl_to_div = tk.Button(
             btn_bar,
-            text="💵 Send to Dividend Calc",
+            text=t("btn_tbl_to_div"),
             bg="#ffffff",
             relief="solid",
             bd=1,
             padx=8,
             command=self._send_selected_to_dividend_calc,
-        ).pack(side=tk.LEFT, padx=4)
+        )
+        self.btn_tbl_to_div.pack(side=tk.LEFT, padx=4)
 
-        tk.Button(
+        self.btn_tbl_to_split = tk.Button(
             btn_bar,
-            text="✂️ Send to Stock Split",
+            text=t("tab_split").strip(),
             bg="#ffffff",
             relief="solid",
             bd=1,
             padx=8,
             command=self._send_selected_to_split_calc,
-        ).pack(side=tk.LEFT, padx=4)
+        )
+        self.btn_tbl_to_split.pack(side=tk.LEFT, padx=4)
 
-        tk.Button(
+        self.btn_tbl_to_sell = tk.Button(
             btn_bar,
-            text="🏷️ Send to Selling Calc",
+            text=t("btn_tbl_to_sell"),
             bg="#ffffff",
             relief="solid",
             bd=1,
             padx=8,
             command=self._send_selected_to_selling_calc,
-        ).pack(side=tk.LEFT, padx=4)
+        )
+        self.btn_tbl_to_sell.pack(side=tk.LEFT, padx=4)
 
+    # -------------------------------------------------------------
+    # Tab 2: Dividend & DRIP Calculator
+    # -------------------------------------------------------------
     # -------------------------------------------------------------
     # Tab 2: Dividend & DRIP Calculator
     # -------------------------------------------------------------
     def _build_dividend_tab(self):
         tab = self.tab_dividend
 
-        container = ttk.Frame(tab, padding=12)
+        container = ttk.Frame(tab, padding=10)
         container.pack(fill=tk.BOTH, expand=True)
 
-        left_frame = tk.LabelFrame(container, text=" Dividend Parameters ", font=("Segoe UI", 10, "bold"), bg="#ffffff", padx=12, pady=12)
+        left_frame = tk.LabelFrame(container, text=" Dividend Parameters ", font=("Segoe UI", 10, "bold"), bg="#ffffff", padx=10, pady=10)
         left_frame.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 10))
 
         tk.Label(left_frame, text="Select from Portfolio:", font=("Segoe UI", 9, "bold"), bg="#ffffff").pack(anchor="w", pady=(0, 2))
         self.div_holding_var = tk.StringVar()
         self.div_holding_cb = ttk.Combobox(left_frame, textvariable=self.div_holding_var, state="readonly", width=22)
-        self.div_holding_cb.pack(fill=tk.X, pady=(0, 10))
+        self.div_holding_cb.pack(fill=tk.X, pady=(0, 6))
         self.div_holding_cb.bind("<<ComboboxSelected>>", self._on_div_holding_selected)
 
         self.div_inputs = {}
@@ -1172,20 +1524,46 @@ class ModernPortfolioApp:
             ("shares", "Number of Shares:", "50"),
             ("current_price", "Current Share Price ($):", "220.00"),
             ("buy_price", "Buy Price / Cost Basis ($):", "180.00"),
+            ("purchase_date", "Purchase Date (YYYY-MM-DD):", ""),
             ("div_yield", "Dividend Yield (%):", "2.5"),
             ("div_per_share", "Annual Div/Share ($):", ""),
         ]
 
+        from datetime import date, timedelta
+        def_date = (date.today() - timedelta(days=365)).strftime("%Y-%m-%d")
+
         for key, lbl, default in fields:
-            tk.Label(left_frame, text=lbl, font=("Segoe UI", 9), bg="#ffffff").pack(anchor="w", pady=(2, 0))
+            tk.Label(left_frame, text=lbl, font=("Segoe UI", 8, "bold" if "Price" in lbl or "Shares" in lbl or "Date" in lbl else "normal"), bg="#ffffff").pack(anchor="w", pady=(2, 0))
             entry = tk.Entry(left_frame, font=("Segoe UI", 9), bd=1, relief="solid")
-            entry.insert(0, default)
-            entry.pack(fill=tk.X, pady=(0, 6))
+            if key == "purchase_date":
+                entry.insert(0, def_date)
+            else:
+                entry.insert(0, default)
+            entry.pack(fill=tk.X, pady=(0, 2))
             self.div_inputs[key] = entry
+
+            if key == "purchase_date":
+                d_row = ttk.Frame(left_frame)
+                d_row.pack(fill=tk.X, pady=(0, 2))
+                for p_lbl, p_days in [("Today", 0), ("6M", 182), ("1Y", 365), ("2Y", 730)]:
+                    b = tk.Button(
+                        d_row,
+                        text=p_lbl,
+                        font=("Segoe UI", 7),
+                        bg="#f1f3f4",
+                        relief="solid",
+                        bd=1,
+                        padx=2,
+                        pady=1,
+                        command=lambda d=p_days: self._set_div_purchase_date_days_ago(d),
+                    )
+                    b.pack(side=tk.LEFT, padx=1, expand=True, fill=tk.X)
+                self.div_holding_days_lbl = tk.Label(left_frame, text="Holding: 365 days (1.00 yrs)", font=("Segoe UI", 8, "italic"), bg="#ffffff", fg=self.text_muted)
+                self.div_holding_days_lbl.pack(anchor="w", pady=(0, 2))
 
         btn_calc_div = tk.Button(
             left_frame,
-            text="Calculate Dividends",
+            text="Calculate Dividends & Returns",
             font=("Segoe UI", 9, "bold"),
             bg=self.primary_color,
             fg="#ffffff",
@@ -1193,29 +1571,29 @@ class ModernPortfolioApp:
             pady=4,
             command=self._calc_dividend_results,
         )
-        btn_calc_div.pack(fill=tk.X, pady=(8, 12))
+        btn_calc_div.pack(fill=tk.X, pady=(6, 8))
 
-        tk.Label(left_frame, text="DRIP Simulation Settings", font=("Segoe UI", 9, "bold"), bg="#ffffff").pack(anchor="w", pady=(6, 2))
+        tk.Label(left_frame, text="DRIP Simulation Settings", font=("Segoe UI", 9, "bold"), bg="#ffffff").pack(anchor="w", pady=(4, 2))
         
         tk.Label(left_frame, text="Years to Simulate:", font=("Segoe UI", 8), bg="#ffffff").pack(anchor="w")
         self.drip_years_entry = tk.Entry(left_frame, font=("Segoe UI", 9), bd=1, relief="solid")
         self.drip_years_entry.insert(0, "10")
-        self.drip_years_entry.pack(fill=tk.X, pady=(0, 4))
+        self.drip_years_entry.pack(fill=tk.X, pady=(0, 2))
 
         tk.Label(left_frame, text="Annual Dividend Growth (%):", font=("Segoe UI", 8), bg="#ffffff").pack(anchor="w")
         self.drip_div_growth_entry = tk.Entry(left_frame, font=("Segoe UI", 9), bd=1, relief="solid")
         self.drip_div_growth_entry.insert(0, "5.0")
-        self.drip_div_growth_entry.pack(fill=tk.X, pady=(0, 4))
+        self.drip_div_growth_entry.pack(fill=tk.X, pady=(0, 2))
 
         tk.Label(left_frame, text="Annual Stock Price Growth (%):", font=("Segoe UI", 8), bg="#ffffff").pack(anchor="w")
         self.drip_price_growth_entry = tk.Entry(left_frame, font=("Segoe UI", 9), bd=1, relief="solid")
         self.drip_price_growth_entry.insert(0, "6.0")
-        self.drip_price_growth_entry.pack(fill=tk.X, pady=(0, 4))
+        self.drip_price_growth_entry.pack(fill=tk.X, pady=(0, 2))
 
         tk.Label(left_frame, text="Monthly Contribution ($):", font=("Segoe UI", 8), bg="#ffffff").pack(anchor="w")
         self.drip_monthly_entry = tk.Entry(left_frame, font=("Segoe UI", 9), bd=1, relief="solid")
         self.drip_monthly_entry.insert(0, "0.0")
-        self.drip_monthly_entry.pack(fill=tk.X, pady=(0, 8))
+        self.drip_monthly_entry.pack(fill=tk.X, pady=(0, 6))
 
         tk.Button(
             left_frame,
@@ -1231,43 +1609,85 @@ class ModernPortfolioApp:
         right_frame = ttk.Frame(container)
         right_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        sum_box = tk.LabelFrame(right_frame, text=" Dividend Projection Summary ", font=("Segoe UI", 10, "bold"), bg="#ffffff", padx=10, pady=8)
-        sum_box.pack(fill=tk.X, pady=(0, 8))
+        # 1. Earned Already Box (From Purchase Day Till Today)
+        self.div_earned_box = tk.LabelFrame(right_frame, text=f" {t('div_sec_earned_already')} ", font=("Segoe UI", 10, "bold"), bg="#ffffff", padx=10, pady=6)
+        self.div_earned_box.pack(fill=tk.X, pady=(0, 6))
+
+        self.div_earned_labels = {}
+        earned_fields = [
+            ("cost_basis", t("lbl_cost_basis_invested"), "$0.00"),
+            ("market_value", t("card_total_value"), "$0.00"),
+            ("capital_gain", t("lbl_capital_gain_so_far"), "+$0.00 (+0.00%)"),
+            ("past_dividends", t("lbl_past_divs_earned"), "$0.00"),
+            ("total_earned", t("lbl_total_earned_already"), "+$0.00 (+0.00%)"),
+            ("cagr", t("lbl_cagr"), "0.00% / yr"),
+        ]
+        for i, (k, label, default) in enumerate(earned_fields):
+            r = i // 3
+            c = (i % 3) * 2
+            tk.Label(self.div_earned_box, text=label, font=("Segoe UI", 8, "bold"), bg="#ffffff", fg=self.text_muted).grid(row=r * 2, column=c, sticky="w", padx=6)
+            val_lbl = tk.Label(self.div_earned_box, text=default, font=("Segoe UI", 10, "bold"), bg="#ffffff", fg=self.primary_color)
+            val_lbl.grid(row=r * 2 + 1, column=c, sticky="w", padx=6, pady=(0, 2))
+            self.div_earned_labels[k] = val_lbl
+
+        # 2. Future Growth & Compounding Milestones Box (Till Later How Much You Can Earn)
+        self.div_future_box = tk.LabelFrame(right_frame, text=f" {t('div_sec_future_earnings')} ", font=("Segoe UI", 10, "bold"), bg="#ffffff", padx=10, pady=6)
+        self.div_future_box.pack(fill=tk.X, pady=(0, 6))
+
+        self.div_milestone_labels = {}
+        milestone_defs = [
+            (1, t("lbl_milestone_1yr")),
+            (3, t("lbl_milestone_3yr")),
+            (5, t("lbl_milestone_5yr")),
+            (10, t("lbl_milestone_10yr")),
+        ]
+        for idx, (yr, title) in enumerate(milestone_defs):
+            cell = tk.Frame(self.div_future_box, bg="#f8f9fa", bd=1, relief="solid", padx=6, pady=4)
+            cell.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=2)
+            tk.Label(cell, text=title, font=("Segoe UI", 8, "bold"), bg="#f8f9fa", fg=self.primary_color).pack(anchor="w")
+            lbl_val = tk.Label(cell, text="$0.00", font=("Segoe UI", 10, "bold"), bg="#f8f9fa", fg=self.text_dark)
+            lbl_val.pack(anchor="w")
+            lbl_new = tk.Label(cell, text=f"{t('lbl_future_new_profit')}: +$0.00", font=("Segoe UI", 8), bg="#f8f9fa", fg=self.green_color)
+            lbl_new.pack(anchor="w")
+            lbl_tot = tk.Label(cell, text=f"{t('lbl_future_total_profit')}: +$0.00", font=("Segoe UI", 8), bg="#f8f9fa", fg=self.text_muted)
+            lbl_tot.pack(anchor="w")
+            self.div_milestone_labels[yr] = (lbl_val, lbl_new, lbl_tot)
+
+        # 3. Dividend Projection Summary Box
+        self.div_income_box = tk.LabelFrame(right_frame, text=f" {t('div_sec_projections')} ", font=("Segoe UI", 9, "bold"), bg="#ffffff", padx=10, pady=4)
+        self.div_income_box.pack(fill=tk.X, pady=(0, 6))
 
         self.div_results = {}
         disp_fields = [
-            ("annual_total", "Annual Income ($):", "$0.00"),
-            ("quarterly_total", "Quarterly Payout ($):", "$0.00"),
-            ("monthly_total", "Monthly Average ($):", "$0.00"),
-            ("yield_on_cost", "Yield on Cost (YoC):", "0.00%"),
+            ("annual_total", t("div_proj_annual") + " ($):", "$0.00"),
+            ("quarterly_total", t("div_proj_quarterly") + " ($):", "$0.00"),
+            ("monthly_total", t("div_proj_monthly") + " ($):", "$0.00"),
+            ("yield_on_cost", t("div_proj_yoc") + ":", "0.00%"),
             ("div_per_share", "Div / Share:", "$0.00"),
-            ("total_value", "Current Position Value:", "$0.00"),
         ]
-
         for i, (k, label, default) in enumerate(disp_fields):
-            r = i // 3
-            c = (i % 3) * 2
-            tk.Label(sum_box, text=label, font=("Segoe UI", 8, "bold"), bg="#ffffff", fg=self.text_muted).grid(row=r * 2, column=c, sticky="w", padx=6)
-            val_lbl = tk.Label(sum_box, text=default, font=("Segoe UI", 11, "bold"), bg="#ffffff", fg=self.primary_color)
-            val_lbl.grid(row=r * 2 + 1, column=c, sticky="w", padx=6, pady=(0, 4))
+            tk.Label(self.div_income_box, text=label, font=("Segoe UI", 8), bg="#ffffff", fg=self.text_muted).grid(row=0, column=i, sticky="w", padx=6)
+            val_lbl = tk.Label(self.div_income_box, text=default, font=("Segoe UI", 10, "bold"), bg="#ffffff", fg=self.primary_color)
+            val_lbl.grid(row=1, column=i, sticky="w", padx=6, pady=(0, 2))
             self.div_results[k] = val_lbl
 
-        drip_box = tk.LabelFrame(right_frame, text=" Dividend Reinvestment Plan (DRIP) Compounding Projection ", font=("Segoe UI", 10, "bold"), bg=self.card_bg, fg=self.primary_color, padx=8, pady=8)
+        # 4. DRIP Box (Table + Chart)
+        drip_box = tk.LabelFrame(right_frame, text=f" {t('div_sec_drip')} ", font=("Segoe UI", 9, "bold"), bg=self.card_bg, fg=self.primary_color, padx=8, pady=4)
         drip_box.pack(fill=tk.BOTH, expand=True)
 
         tree_container = ttk.Frame(drip_box)
         tree_container.pack(fill=tk.BOTH, expand=True)
 
         cols = ("year", "shares", "price", "annual_div", "portfolio_val", "invested", "profit")
-        self.drip_tree = ttk.Treeview(tree_container, columns=cols, show="headings", height=5)
+        self.drip_tree = ttk.Treeview(tree_container, columns=cols, show="headings", height=4)
         drip_headers = [
-            ("year", "Year", 50),
-            ("shares", "Shares Owned", 90),
-            ("price", "Est. Share Price", 100),
-            ("annual_div", "Annual Dividend", 100),
-            ("portfolio_val", "Portfolio Value", 110),
-            ("invested", "Total Invested", 100),
-            ("profit", "Total Gain / Profit", 110),
+            ("year", t("col_year"), 50),
+            ("shares", t("col_drip_shares"), 90),
+            ("price", t("col_current_price"), 95),
+            ("annual_div", t("col_drip_income"), 95),
+            ("portfolio_val", t("col_drip_val"), 105),
+            ("invested", t("col_cost_basis"), 95),
+            ("profit", t("col_unrealized_gain"), 105),
         ]
         for col, h, w in drip_headers:
             self.drip_tree.heading(col, text=h)
@@ -1278,116 +1698,253 @@ class ModernPortfolioApp:
         drip_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.drip_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        self.drip_canvas = tk.Canvas(drip_box, height=190, bg=self.card_bg, highlightthickness=0)
-        self.drip_canvas.pack(fill=tk.X, expand=False, pady=(6, 0))
+        self.drip_canvas = tk.Canvas(drip_box, height=155, bg=self.card_bg, highlightthickness=0)
+        self.drip_canvas.pack(fill=tk.X, expand=False, pady=(4, 0))
+
+    def _set_div_purchase_date_days_ago(self, days: int):
+        from datetime import date, timedelta
+        target_d = (date.today() - timedelta(days=days)).strftime("%Y-%m-%d")
+        if "purchase_date" in getattr(self, "div_inputs", {}):
+            self.div_inputs["purchase_date"].delete(0, tk.END)
+            self.div_inputs["purchase_date"].insert(0, target_d)
+            self._calc_dividend_results()
 
     # -------------------------------------------------------------
     # Tab 3: Stock Division (Split) Calculator
     # -------------------------------------------------------------
     def _build_split_tab(self):
         tab = self.tab_split
-        container = ttk.Frame(tab, padding=16)
+        container = ttk.Frame(tab, padding=12)
         container.pack(fill=tk.BOTH, expand=True)
 
-        left_card = tk.LabelFrame(container, text=" Stock Split / Division Parameters ", font=("Segoe UI", 10, "bold"), bg="#ffffff", padx=14, pady=14)
-        left_card.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 16))
+        left_card = tk.LabelFrame(container, text=" Stock Split / Division Parameters ", font=("Segoe UI", 10, "bold"), bg="#ffffff", padx=10, pady=10)
+        left_card.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 12))
 
-        tk.Label(left_card, text="Select Holding to Split:", font=("Segoe UI", 9, "bold"), bg="#ffffff").pack(anchor="w", pady=(0, 2))
+        tk.Label(left_card, text=t("lbl_split_holding"), font=("Segoe UI", 9, "bold"), bg="#ffffff").pack(anchor="w", pady=(0, 2))
         self.split_holding_var = tk.StringVar()
         self.split_holding_cb = ttk.Combobox(left_card, textvariable=self.split_holding_var, state="readonly", width=22)
-        self.split_holding_cb.pack(fill=tk.X, pady=(0, 10))
+        self.split_holding_cb.pack(fill=tk.X, pady=(0, 6))
         self.split_holding_cb.bind("<<ComboboxSelected>>", self._on_split_holding_selected)
 
-        tk.Label(left_card, text="Stock Symbol:", font=("Segoe UI", 9), bg="#ffffff").pack(anchor="w")
+        tk.Label(left_card, text=t("col_symbol") + ":", font=("Segoe UI", 8, "bold"), bg="#ffffff").pack(anchor="w")
         self.split_sym_entry = tk.Entry(left_card, font=("Segoe UI", 9), bd=1, relief="solid")
-        self.split_sym_entry.pack(fill=tk.X, pady=(0, 6))
+        self.split_sym_entry.pack(fill=tk.X, pady=(0, 4))
 
-        tk.Label(left_card, text="Current Shares Owned:", font=("Segoe UI", 9), bg="#ffffff").pack(anchor="w")
+        tk.Label(left_card, text=t("col_shares") + ":", font=("Segoe UI", 8, "bold"), bg="#ffffff").pack(anchor="w")
         self.split_shares_entry = tk.Entry(left_card, font=("Segoe UI", 9), bd=1, relief="solid")
-        self.split_shares_entry.pack(fill=tk.X, pady=(0, 6))
+        self.split_shares_entry.pack(fill=tk.X, pady=(0, 4))
 
-        tk.Label(left_card, text="Current Buy Price / Cost Basis ($):", font=("Segoe UI", 9), bg="#ffffff").pack(anchor="w")
+        tk.Label(left_card, text=t("lbl_split_before_price"), font=("Segoe UI", 8, "bold"), bg="#ffffff").pack(anchor="w")
         self.split_price_entry = tk.Entry(left_card, font=("Segoe UI", 9), bd=1, relief="solid")
-        self.split_price_entry.pack(fill=tk.X, pady=(0, 10))
+        self.split_price_entry.pack(fill=tk.X, pady=(0, 4))
 
-        tk.Label(left_card, text="Split Ratio Preset:", font=("Segoe UI", 9, "bold"), bg="#ffffff").pack(anchor="w")
+        tk.Label(left_card, text=t("lbl_split_current_price"), font=("Segoe UI", 8, "bold"), bg="#ffffff").pack(anchor="w")
+        self.split_cur_price_entry = tk.Entry(left_card, font=("Segoe UI", 9), bd=1, relief="solid")
+        self.split_cur_price_entry.pack(fill=tk.X, pady=(0, 4))
+
+        tk.Label(left_card, text=t("lbl_purchase_date"), font=("Segoe UI", 8), bg="#ffffff").pack(anchor="w")
+        self.split_purchase_date_entry = tk.Entry(left_card, font=("Segoe UI", 9), bd=1, relief="solid")
+        from datetime import date, timedelta
+        self.split_purchase_date_entry.insert(0, (date.today() - timedelta(days=365)).strftime("%Y-%m-%d"))
+        self.split_purchase_date_entry.pack(fill=tk.X, pady=(0, 2))
+
+        split_date_btn_row = ttk.Frame(left_card)
+        split_date_btn_row.pack(fill=tk.X, pady=(0, 2))
+        for p_lbl, p_days in [("Today", 0), ("6M", 182), ("1Y", 365), ("2Y", 730)]:
+            b = tk.Button(
+                split_date_btn_row,
+                text=p_lbl,
+                font=("Segoe UI", 7),
+                bg="#f1f3f4",
+                relief="solid",
+                bd=1,
+                padx=2,
+                pady=1,
+                command=lambda d=p_days: self._set_split_purchase_date_days_ago(d),
+            )
+            b.pack(side=tk.LEFT, padx=1, expand=True, fill=tk.X)
+        self.split_holding_days_lbl = tk.Label(left_card, text="Holding: 365 days (1.00 yrs)", font=("Segoe UI", 8, "italic"), bg="#ffffff", fg=self.text_muted)
+        self.split_holding_days_lbl.pack(anchor="w", pady=(0, 4))
+
+        tk.Label(left_card, text=t("lbl_split_target_price"), font=("Segoe UI", 8, "bold"), bg="#ffffff").pack(anchor="w")
+        self.split_target_price_entry = tk.Entry(left_card, font=("Segoe UI", 9), bd=1, relief="solid")
+        self.split_target_price_entry.pack(fill=tk.X, pady=(0, 2))
+
+        split_target_presets_row = ttk.Frame(left_card)
+        split_target_presets_row.pack(fill=tk.X, pady=(0, 4))
+        for p_lbl, p_mult in [("+10%", 1.10), ("+25%", 1.25), ("+50%", 1.50), ("+100%", 2.0)]:
+            b = tk.Button(
+                split_target_presets_row,
+                text=p_lbl,
+                font=("Segoe UI", 7),
+                bg="#f1f3f4",
+                relief="solid",
+                bd=1,
+                padx=2,
+                pady=1,
+                command=lambda m=p_mult: self._apply_split_target_multiplier(m),
+            )
+            b.pack(side=tk.LEFT, padx=1, expand=True, fill=tk.X)
+        self.btn_split_recov = tk.Button(
+            left_card,
+            text="🎯 " + t("lbl_split_presplit_recovery"),
+            font=("Segoe UI", 8),
+            bg="#f1f3f4",
+            relief="solid",
+            bd=1,
+            padx=3,
+            pady=1,
+            command=self._apply_split_target_presplit,
+        )
+        self.btn_split_recov.pack(fill=tk.X, pady=(0, 6))
+
+        tk.Label(left_card, text=t("lbl_split_ratio"), font=("Segoe UI", 8, "bold"), bg="#ffffff").pack(anchor="w")
         self.split_preset_var = tk.StringVar(value="2:1")
         presets = ["2:1 Split", "3:1 Split", "4:1 Split", "5:1 Split", "10:1 Split", "1:5 Reverse Split", "1:10 Reverse Split", "Custom"]
         preset_cb = ttk.Combobox(left_card, textvariable=self.split_preset_var, values=presets, state="readonly")
-        preset_cb.pack(fill=tk.X, pady=(0, 6))
+        preset_cb.pack(fill=tk.X, pady=(0, 4))
         preset_cb.bind("<<ComboboxSelected>>", self._on_split_preset_selected)
 
         ratio_frame = ttk.Frame(left_card)
-        ratio_frame.pack(fill=tk.X, pady=(0, 12))
+        ratio_frame.pack(fill=tk.X, pady=(0, 8))
         tk.Label(ratio_frame, text="Ratio To:", font=("Segoe UI", 8), bg=self.bg_main).pack(side=tk.LEFT)
-        self.split_to_entry = tk.Entry(ratio_frame, width=6, bd=1, relief="solid")
+        self.split_to_entry = tk.Entry(ratio_frame, width=5, bd=1, relief="solid")
         self.split_to_entry.insert(0, "2")
-        self.split_to_entry.pack(side=tk.LEFT, padx=4)
+        self.split_to_entry.pack(side=tk.LEFT, padx=3)
 
-        tk.Label(ratio_frame, text="for Every:", font=("Segoe UI", 8), bg=self.bg_main).pack(side=tk.LEFT, padx=4)
-        self.split_from_entry = tk.Entry(ratio_frame, width=6, bd=1, relief="solid")
+        tk.Label(ratio_frame, text="for Every:", font=("Segoe UI", 8), bg=self.bg_main).pack(side=tk.LEFT, padx=3)
+        self.split_from_entry = tk.Entry(ratio_frame, width=5, bd=1, relief="solid")
         self.split_from_entry.insert(0, "1")
-        self.split_from_entry.pack(side=tk.LEFT, padx=4)
+        self.split_from_entry.pack(side=tk.LEFT, padx=3)
 
         tk.Button(
             left_card,
-            text="Calculate Split",
+            text="Calculate Split & Returns",
             font=("Segoe UI", 9, "bold"),
             bg=self.primary_color,
             fg="#ffffff",
             relief="flat",
             pady=4,
             command=self._calc_split_results,
-        ).pack(fill=tk.X, pady=(0, 8))
+        ).pack(fill=tk.X, pady=(0, 6))
 
         self.btn_apply_split = tk.Button(
             left_card,
-            text="✅ Apply Split to Portfolio",
+            text="✅ " + t("btn_apply_split"),
             font=("Segoe UI", 9, "bold"),
             bg="#0f9d58",
             fg="#ffffff",
             relief="flat",
-            pady=6,
+            pady=5,
             command=self._apply_split_to_portfolio,
         )
         self.btn_apply_split.pack(fill=tk.X)
 
-        right_card = tk.LabelFrame(container, text=" Stock Split Comparison Results ", font=("Segoe UI", 10, "bold"), bg="#ffffff", padx=16, pady=16)
+        right_card = ttk.Frame(container)
         right_card.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        comp_frame = ttk.Frame(right_card)
-        comp_frame.pack(fill=tk.X, pady=8)
+        # 1. Earned Already Card
+        self.split_earned_box = tk.LabelFrame(right_card, text=f" {t('split_sec_earned_already')} ", font=("Segoe UI", 10, "bold"), bg="#ffffff", padx=10, pady=8)
+        self.split_earned_box.pack(fill=tk.X, pady=(0, 8))
 
-        before_box = tk.LabelFrame(comp_frame, text=" ⏪ Before Split ", font=("Segoe UI", 9, "bold"), bg="#f8f9fa", padx=12, pady=12)
-        before_box.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 8))
+        self.split_earned_labels = {}
+        split_earned_fields = [
+            ("cost_basis", t("lbl_cost_basis_invested")),
+            ("market_value", t("card_total_value")),
+            ("capital_gain", t("lbl_capital_gain_so_far")),
+            ("holding_period", t("lbl_holding_period")),
+        ]
+        for i, (k, lbl) in enumerate(split_earned_fields):
+            r = i // 2
+            c = (i % 2) * 2
+            tk.Label(self.split_earned_box, text=lbl, font=("Segoe UI", 8, "bold"), bg="#ffffff", fg=self.text_muted).grid(row=r * 2, column=c, sticky="w", padx=8)
+            v = tk.Label(self.split_earned_box, text="-", font=("Segoe UI", 10, "bold"), bg="#ffffff", fg=self.text_dark)
+            v.grid(row=r * 2 + 1, column=c, sticky="w", padx=8, pady=(0, 4))
+            self.split_earned_labels[k] = v
+
+        # 2. Before / After Split Comparison Card
+        self.split_comp_box = tk.LabelFrame(right_card, text=f" {t('split_sec_comparison')} ", font=("Segoe UI", 10, "bold"), bg="#ffffff", padx=10, pady=8)
+        self.split_comp_box.pack(fill=tk.X, pady=(0, 8))
+
+        comp_frame = ttk.Frame(self.split_comp_box)
+        comp_frame.pack(fill=tk.X)
+
+        before_box = tk.LabelFrame(comp_frame, text=" ⏪ Before Split ", font=("Segoe UI", 9, "bold"), bg="#f8f9fa", padx=10, pady=8)
+        before_box.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 6))
 
         self.split_before_labels = {}
-        for k, lbl in [("shares", "Shares:"), ("price", "Cost Basis / Share:"), ("total", "Total Cost Basis:")]:
+        for k, lbl in [("shares", "Shares:"), ("price", "Cost Basis / Share:"), ("cur_price", "Current Share Price:"), ("total", "Total Cost Basis:"), ("val", "Market Value:")]:
             tk.Label(before_box, text=lbl, font=("Segoe UI", 8, "bold"), bg="#f8f9fa", fg=self.text_muted).pack(anchor="w")
-            v = tk.Label(before_box, text="-", font=("Segoe UI", 11, "bold"), bg="#f8f9fa", fg=self.text_dark)
-            v.pack(anchor="w", pady=(0, 4))
+            v = tk.Label(before_box, text="-", font=("Segoe UI", 10, "bold"), bg="#f8f9fa", fg=self.text_dark)
+            v.pack(anchor="w", pady=(0, 2))
             self.split_before_labels[k] = v
 
-        after_box = tk.LabelFrame(comp_frame, text=" ⏩ After Split ", font=("Segoe UI", 9, "bold"), bg="#e8f0fe", padx=12, pady=12)
+        after_box = tk.LabelFrame(comp_frame, text=" ⏩ After Split ", font=("Segoe UI", 9, "bold"), bg="#e8f0fe", padx=10, pady=8)
         after_box.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         self.split_after_labels = {}
-        for k, lbl in [("shares", "New Shares:"), ("price", "New Cost Basis / Share:"), ("total", "Total Cost Basis:")]:
+        for k, lbl in [("shares", "New Shares:"), ("price", "New Cost Basis / Share:"), ("cur_price", "New Effective Price:"), ("total", "Total Cost Basis:"), ("val", "Market Value:")]:
             tk.Label(after_box, text=lbl, font=("Segoe UI", 8, "bold"), bg="#e8f0fe", fg=self.text_muted).pack(anchor="w")
-            v = tk.Label(after_box, text="-", font=("Segoe UI", 11, "bold"), bg="#e8f0fe", fg=self.primary_color)
-            v.pack(anchor="w", pady=(0, 4))
+            v = tk.Label(after_box, text="-", font=("Segoe UI", 10, "bold"), bg="#e8f0fe", fg=self.primary_color)
+            v.pack(anchor="w", pady=(0, 2))
             self.split_after_labels[k] = v
 
-        info_box = tk.Label(
-            right_card,
-            text="ℹ️ Note: Stock splits / divisions divide or multiply the number of shares while proportionally adjusting the cost basis per share. The total invested capital and overall value remain identical.",
-            font=("Segoe UI", 8),
-            bg="#ffffff",
-            fg=self.text_muted,
-            wraplength=450,
-            justify="left",
-        )
-        info_box.pack(anchor="w", pady=(16, 0))
+        # 3. Future Potential Earnings Card ("Till later how much you can earn")
+        self.split_future_box = tk.LabelFrame(right_card, text=f" {t('split_sec_future')} ", font=("Segoe UI", 10, "bold"), bg="#ffffff", padx=12, pady=8)
+        self.split_future_box.pack(fill=tk.BOTH, expand=True)
+
+        self.split_future_labels = {}
+        fut_top_row = ttk.Frame(self.split_future_box)
+        fut_top_row.pack(fill=tk.X, pady=(0, 6))
+
+        fut_fields = [
+            ("target_val", t("lbl_split_future_value")),
+            ("total_prof", t("lbl_future_total_profit") + ":"),
+            ("new_gain", t("lbl_split_extra_gain")),
+        ]
+        for i, (k, lbl) in enumerate(fut_fields):
+            cell = tk.Frame(fut_top_row, bg="#f8f9fa", bd=1, relief="solid", padx=8, pady=4)
+            cell.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=2)
+            tk.Label(cell, text=lbl, font=("Segoe UI", 8, "bold"), bg="#f8f9fa", fg=self.text_muted).pack(anchor="w")
+            v = tk.Label(cell, text="-", font=("Segoe UI", 11, "bold"), bg="#f8f9fa", fg=self.primary_color)
+            v.pack(anchor="w")
+            self.split_future_labels[k] = v
+
+        tk.Label(self.split_future_box, text="Future Growth Milestone Scenarios:", font=("Segoe UI", 8, "bold"), bg="#ffffff", fg=self.text_muted).pack(anchor="w", pady=(4, 2))
+        self.split_scenarios_frame = ttk.Frame(self.split_future_box)
+        self.split_scenarios_frame.pack(fill=tk.X, pady=(0, 4))
+        self.split_scenario_cells = []
+
+    def _set_split_purchase_date_days_ago(self, days: int):
+        from datetime import date, timedelta
+        target_d = (date.today() - timedelta(days=days)).strftime("%Y-%m-%d")
+        if hasattr(self, "split_purchase_date_entry"):
+            self.split_purchase_date_entry.delete(0, tk.END)
+            self.split_purchase_date_entry.insert(0, target_d)
+            self._calc_split_results()
+
+    def _apply_split_target_multiplier(self, mult: float):
+        try:
+            cur_p = float(self.split_cur_price_entry.get().strip())
+            ratio_to = float(self.split_to_entry.get().strip())
+            ratio_from = float(self.split_from_entry.get().strip())
+            mult_split = ratio_to / ratio_from if ratio_from > 0 else 1.0
+            new_cur_p = cur_p / mult_split if mult_split > 0 else cur_p
+            target_p = round(new_cur_p * mult, 2)
+            self.split_target_price_entry.delete(0, tk.END)
+            self.split_target_price_entry.insert(0, f"{target_p:.2f}")
+            self._calc_split_results()
+        except ValueError:
+            pass
+
+    def _apply_split_target_presplit(self):
+        try:
+            cur_p = float(self.split_cur_price_entry.get().strip())
+            self.split_target_price_entry.delete(0, tk.END)
+            self.split_target_price_entry.insert(0, f"{cur_p:.2f}")
+            self._calc_split_results()
+        except ValueError:
+            pass
 
     # -------------------------------------------------------------
     # Tab 4: Selling & Profit Calculator
@@ -1537,27 +2094,43 @@ class ModernPortfolioApp:
     def _build_history_tab(self):
         tab = self.tab_history
 
-        # Top Filter Bar inside Sales History Tab
+        # Top Filter Bar inside Transaction History Tab
         filter_bar = ttk.Frame(tab, padding="8 6 8 2")
         filter_bar.pack(fill=tk.X)
 
-        tk.Label(filter_bar, text="📁 Filter by Portfolio:", font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT, padx=(0, 6))
+        self.lbl_tx_port = tk.Label(filter_bar, text=t("lbl_tx_portfolio"), font=("Segoe UI", 9, "bold"))
+        self.lbl_tx_port.pack(side=tk.LEFT, padx=(0, 4))
 
-        self.sales_filter_var = tk.StringVar(value="All Portfolios (Consolidated)")
+        self.sales_filter_var = tk.StringVar(value=t("portfolio_all_consolidated"))
         self.sales_filter_cb = ttk.Combobox(
             filter_bar,
             textvariable=self.sales_filter_var,
             values=self._get_portfolio_dropdown_values(),
             state="readonly",
-            width=26,
+            width=22,
             font=("Segoe UI", 9)
         )
         self.sales_filter_cb.pack(side=tk.LEFT, padx=(0, 8))
         self.sales_filter_cb.bind("<<ComboboxSelected>>", self._on_sales_filter_changed)
 
-        btn_show_all_sales = tk.Button(
+        self.lbl_tx_type = tk.Label(filter_bar, text=t("lbl_tx_type"), font=("Segoe UI", 9, "bold"))
+        self.lbl_tx_type.pack(side=tk.LEFT, padx=(0, 4))
+
+        self.tx_type_filter_var = tk.StringVar(value=t("tx_type_all"))
+        self.tx_type_filter_cb = ttk.Combobox(
             filter_bar,
-            text="🌐 Show All Sales",
+            textvariable=self.tx_type_filter_var,
+            values=[t("tx_type_all"), t("tx_type_buy"), t("tx_type_sell")],
+            state="readonly",
+            width=14,
+            font=("Segoe UI", 9)
+        )
+        self.tx_type_filter_cb.pack(side=tk.LEFT, padx=(0, 8))
+        self.tx_type_filter_cb.bind("<<ComboboxSelected>>", self._on_sales_filter_changed)
+
+        self.btn_tx_all = tk.Button(
+            filter_bar,
+            text=t("btn_tx_all"),
             font=("Segoe UI", 8, "bold"),
             bg="#ffffff",
             relief="solid",
@@ -1566,11 +2139,11 @@ class ModernPortfolioApp:
             pady=1,
             command=self._show_all_sales_clicked,
         )
-        btn_show_all_sales.pack(side=tk.LEFT, padx=(0, 8))
+        self.btn_tx_all.pack(side=tk.LEFT, padx=(0, 6))
 
-        btn_match_active = tk.Button(
+        self.btn_tx_match = tk.Button(
             filter_bar,
-            text="🎯 Match Active Portfolio",
+            text=t("btn_tx_match"),
             font=("Segoe UI", 8),
             bg="#ffffff",
             relief="solid",
@@ -1579,7 +2152,20 @@ class ModernPortfolioApp:
             pady=1,
             command=self._match_active_portfolio_sales,
         )
-        btn_match_active.pack(side=tk.LEFT, padx=(0, 8))
+        self.btn_tx_match.pack(side=tk.LEFT, padx=(0, 6))
+
+        self.btn_tx_record = tk.Button(
+            filter_bar,
+            text=t("btn_tx_record"),
+            font=("Segoe UI", 8, "bold"),
+            bg=self.primary_color,
+            fg="#ffffff",
+            relief="flat",
+            padx=8,
+            pady=2,
+            command=self._open_record_transaction_dialog,
+        )
+        self.btn_tx_record.pack(side=tk.LEFT, padx=(0, 8))
 
         self.lbl_sales_stats = tk.Label(
             filter_bar,
@@ -1594,41 +2180,37 @@ class ModernPortfolioApp:
 
         cols = (
             "date",
+            "type",
             "portfolio",
             "symbol",
             "currency",
             "shares",
-            "buy_price",
-            "sell_price",
-            "gross_proceeds",
-            "cost_basis",
+            "price",
+            "total_amount",
             "commission",
             "tax",
-            "net_proceeds",
             "net_profit",
             "roi",
         )
         self.history_tree = ttk.Treeview(tree_frame, columns=cols, show="headings")
         hist_headers = [
-            ("date", "Date & Time", 120),
-            ("portfolio", "Portfolio", 95),
-            ("symbol", "Symbol", 65),
-            ("currency", "Curr", 50),
-            ("shares", "Shares", 65),
-            ("buy_price", "Buy Price", 75),
-            ("sell_price", "Sell Price", 75),
-            ("gross_proceeds", "Gross Sale", 85),
-            ("cost_basis", "Cost Basis", 85),
-            ("commission", "Fees", 55),
-            ("tax", "Tax", 55),
-            ("net_proceeds", "Net Proceeds", 90),
-            ("net_profit", "Net Profit", 90),
-            ("roi", "ROI (%)", 70),
+            ("date", t("col_tx_date"), 125),
+            ("type", t("col_tx_type"), 75),
+            ("portfolio", t("col_tx_port"), 95),
+            ("symbol", t("col_tx_sym"), 65),
+            ("currency", t("col_tx_curr"), 45),
+            ("shares", t("col_tx_shares"), 65),
+            ("price", t("col_tx_price"), 75),
+            ("total_amount", t("col_tx_total"), 90),
+            ("commission", t("col_tx_fees"), 55),
+            ("tax", t("col_tx_tax"), 50),
+            ("net_profit", t("col_tx_profit"), 95),
+            ("roi", t("col_tx_roi"), 70),
         ]
 
         for col, h, w in hist_headers:
             self.history_tree.heading(col, text=h)
-            self.history_tree.column(col, width=w, anchor="e" if col not in ("symbol", "portfolio", "currency", "date") else "center")
+            self.history_tree.column(col, width=w, anchor="e" if col not in ("type", "symbol", "portfolio", "currency", "date") else "center")
 
         v_scroll = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self.history_tree.yview)
         self.history_tree.configure(yscrollcommand=v_scroll.set)
@@ -1637,30 +2219,34 @@ class ModernPortfolioApp:
 
         self.history_tree.tag_configure("positive", foreground=self.green_color)
         self.history_tree.tag_configure("negative", foreground=self.red_color)
+        self.history_tree.tag_configure("buy", foreground="#00897b")
+        self.history_tree.tag_configure("neutral", foreground=self.text_dark)
 
         btn_bar = ttk.Frame(tab, padding="8 4 8 8")
         btn_bar.pack(fill=tk.X)
 
-        tk.Button(
+        self.btn_tx_export = tk.Button(
             btn_bar,
-            text="💾 Export History to CSV",
+            text=t("btn_tx_export"),
             bg="#ffffff",
             relief="solid",
             bd=1,
             padx=8,
             command=self._export_sales_csv,
-        ).pack(side=tk.LEFT, padx=4)
+        )
+        self.btn_tx_export.pack(side=tk.LEFT, padx=4)
 
-        tk.Button(
+        self.btn_tx_clear = tk.Button(
             btn_bar,
-            text="🗑️ Clear History",
+            text=t("btn_tx_clear"),
             bg="#ffffff",
             fg=self.red_color,
             relief="solid",
             bd=1,
             padx=8,
             command=self._clear_sales_history,
-        ).pack(side=tk.LEFT, padx=4)
+        )
+        self.btn_tx_clear.pack(side=tk.LEFT, padx=4)
 
         self.lbl_total_realized = tk.Label(
             btn_bar,
@@ -1680,7 +2266,7 @@ class ModernPortfolioApp:
         dlg.geometry("640x520")
         dlg.minsize(560, 460)
         dlg.transient(self.root)
-        dlg.grab_set()
+        dlg.configure(bg=self.bg_main)
 
         sync_notebook = ttk.Notebook(dlg)
         sync_notebook.pack(fill=tk.BOTH, expand=True, padx=12, pady=12)
@@ -1949,16 +2535,39 @@ class ModernPortfolioApp:
         help_lbl = tk.Label(tab_help, text=help_text, font=("Segoe UI", 8), justify="left", wraplength=580)
         help_lbl.pack(anchor="w")
 
+        dlg.bind("<Escape>", lambda e: dlg.destroy())
+
+        dlg.update_idletasks()
+        try:
+            rw = self.root.winfo_width()
+            rh = self.root.winfo_height()
+            rx = self.root.winfo_rootx()
+            ry = self.root.winfo_rooty()
+            dw, dh = 640, 520
+            x = max(0, rx + (rw - dw) // 2)
+            y = max(0, ry + (rh - dh) // 2)
+            dlg.geometry(f"{dw}x{dh}+{x}+{y}")
+        except Exception:
+            pass
+
+        dlg.deiconify()
+        dlg.lift()
+        dlg.focus_set()
+        try:
+            dlg.grab_set()
+        except Exception:
+            pass
+
     # -------------------------------------------------------------
     # Enhanced Add Stock / Asset Dialog
     # -------------------------------------------------------------
     def _open_add_dialog(self):
         dlg = tk.Toplevel(self.root)
         dlg.title("Add New Stock / Asset")
-        dlg.geometry("460x540")
+        dlg.geometry("460x560")
         dlg.resizable(False, False)
         dlg.transient(self.root)
-        dlg.grab_set()
+        dlg.configure(bg=self.bg_main)
 
         frame = ttk.Frame(dlg, padding=16)
         frame.pack(fill=tk.BOTH, expand=True)
@@ -2177,13 +2786,32 @@ class ModernPortfolioApp:
                 self.all_holdings.append(holding_record)
 
             save_portfolio(self.all_holdings, PORTFOLIO_CSV)
+
+            # Record BUY transaction in transaction history
+            buy_tx = {
+                "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "type": "BUY",
+                "portfolio": target_port,
+                "symbol": sym,
+                "shares": shares,
+                "price": buy_price,
+                "total_amount": round(shares * buy_price, 2),
+                "cost_basis": round(shares * buy_price, 2),
+                "commission_fee": 0.0,
+                "estimated_tax": 0.0,
+                "net_amount": round(shares * buy_price, 2),
+                "currency": curr,
+                "notes": f"Bought for {target_port}",
+            }
+            append_transaction(buy_tx, TRANSACTION_HISTORY_CSV)
+
             self.portfolio_combo.config(values=self._get_portfolio_dropdown_values())
             if self.current_portfolio not in ("All Portfolios (Consolidated)", target_port):
                 self.current_portfolio = target_port
                 self.portfolio_var.set(target_port)
             self._on_portfolio_selected()
             dlg.destroy()
-            self._set_status(f"Added {sym} to {target_port} ({curr}) and saved to portfolio.csv.")
+            self._set_status(f"Added {sym} to {target_port} ({curr}) and recorded BUY transaction.")
 
         tk.Button(
             frame,
@@ -2196,9 +2824,39 @@ class ModernPortfolioApp:
             command=on_save,
         ).pack(fill=tk.X)
 
+        dlg.bind("<Escape>", lambda e: dlg.destroy())
+
+        dlg.update_idletasks()
+        try:
+            rw = self.root.winfo_width()
+            rh = self.root.winfo_height()
+            rx = self.root.winfo_rootx()
+            ry = self.root.winfo_rooty()
+            dw, dh = 460, 560
+            x = max(0, rx + (rw - dw) // 2)
+            y = max(0, ry + (rh - dh) // 2)
+            dlg.geometry(f"{dw}x{dh}+{x}+{y}")
+        except Exception:
+            pass
+
+        dlg.deiconify()
+        dlg.lift()
+        dlg.focus_set()
+        try:
+            dlg.grab_set()
+        except Exception:
+            pass
+
     # -------------------------------------------------------------
     # Edit / Delete Selected Holding(s)
     # -------------------------------------------------------------
+    def _on_tree_double_click(self, event):
+        item_id = self.holdings_tree.identify_row(event.y)
+        if item_id:
+            self.holdings_tree.selection_set(item_id)
+            self.holdings_tree.focus(item_id)
+            self._open_edit_dialog()
+
     def _open_edit_dialog(self):
         selected = self.holdings_tree.selection()
         if not selected:
@@ -2208,8 +2866,16 @@ class ModernPortfolioApp:
         item_id = selected[0]
         holding = self.holding_map.get(item_id) if hasattr(self, "holding_map") else None
         if not holding:
-            raw_sym = str(self.holdings_tree.item(item_id)["values"][0]).strip().upper()
-            holding = next((h for h in self.holdings if str(h.get("symbol", "")).strip().upper() == raw_sym or str(h.get("symbol", "")).split(":")[0].strip().upper() == raw_sym), None)
+            try:
+                row_vals = self.holdings_tree.item(item_id).get("values", [])
+                raw_sym = ""
+                if len(row_vals) > 1:
+                    raw_sym = str(row_vals[1]).replace("🎯 ", "").replace("⚠️ ", "").strip().upper()
+                elif len(row_vals) == 1:
+                    raw_sym = str(row_vals[0]).strip().upper()
+                holding = next((h for h in self.holdings if str(h.get("symbol", "")).strip().upper() == raw_sym or str(h.get("symbol", "")).split(":")[0].strip().upper() == raw_sym), None)
+            except Exception:
+                holding = None
 
         if not holding:
             return
@@ -2220,20 +2886,26 @@ class ModernPortfolioApp:
 
         dlg = tk.Toplevel(self.root)
         dlg.title(f"Edit Holding: {sym}")
-        dlg.geometry("420x450")
+        dlg.geometry("440x480")
         dlg.resizable(False, False)
         dlg.transient(self.root)
-        dlg.grab_set()
+        dlg.configure(bg=self.bg_main)
 
         frame = ttk.Frame(dlg, padding=16)
         frame.pack(fill=tk.BOTH, expand=True)
 
-        tk.Label(frame, text=f"Symbol: {sym} ({holding.get('name', '')})", font=("Segoe UI", 10, "bold"), fg=self.primary_color).pack(anchor="w", pady=(0, 8))
+        tk.Label(
+            frame,
+            text=f"Symbol: {sym} ({holding.get('name', '')})",
+            font=("Segoe UI", 10, "bold"),
+            fg=self.primary_color,
+            bg=self.bg_main,
+        ).pack(anchor="w", pady=(0, 8))
 
         # Portfolio selection
         port_row = ttk.Frame(frame)
         port_row.pack(fill=tk.X, pady=(0, 8))
-        tk.Label(port_row, text="Portfolio:", font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT, padx=(0, 6))
+        tk.Label(port_row, text="Portfolio:", font=("Segoe UI", 9, "bold"), bg=self.bg_main, fg=self.text_dark).pack(side=tk.LEFT, padx=(0, 6))
         available_ports = [p for p in get_portfolio_names(PORTFOLIO_CSV) if p != "All Portfolios (Consolidated)"]
         if cur_port not in available_ports:
             available_ports.append(cur_port)
@@ -2242,19 +2914,19 @@ class ModernPortfolioApp:
         port_edit_cb.pack(side=tk.LEFT, padx=(0, 10))
 
         # Currency selection
-        tk.Label(port_row, text="Currency:", font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT, padx=(0, 6))
+        tk.Label(port_row, text="Currency:", font=("Segoe UI", 9, "bold"), bg=self.bg_main, fg=self.text_dark).pack(side=tk.LEFT, padx=(0, 6))
         curr_edit_cb = ttk.Combobox(port_row, values=["USD", "CAD", "HKD", "EUR", "GBP", "AUD", "JPY", "CNY"], state="readonly", width=8)
         curr_edit_cb.set(cur_curr)
         curr_edit_cb.pack(side=tk.LEFT)
 
-        tk.Label(frame, text="Number of Shares:", font=("Segoe UI", 9, "bold")).pack(anchor="w")
-        shares_entry = tk.Entry(frame, font=("Segoe UI", 10), bd=1, relief="solid")
-        shares_entry.insert(0, str(holding["shares"]))
+        tk.Label(frame, text="Number of Shares:", font=("Segoe UI", 9, "bold"), bg=self.bg_main, fg=self.text_dark).pack(anchor="w")
+        shares_entry = tk.Entry(frame, font=("Segoe UI", 10), bd=1, relief="solid", bg=self.card_bg, fg=self.text_dark, insertbackground=self.text_dark)
+        shares_entry.insert(0, str(holding.get("shares", 0)))
         shares_entry.pack(fill=tk.X, pady=(2, 8))
 
-        tk.Label(frame, text="Buy Price / Cost Basis ($):", font=("Segoe UI", 9, "bold")).pack(anchor="w")
-        price_entry = tk.Entry(frame, font=("Segoe UI", 10), bd=1, relief="solid")
-        price_entry.insert(0, str(holding["buy_price"]))
+        tk.Label(frame, text="Buy Price / Cost Basis ($):", font=("Segoe UI", 9, "bold"), bg=self.bg_main, fg=self.text_dark).pack(anchor="w")
+        price_entry = tk.Entry(frame, font=("Segoe UI", 10), bd=1, relief="solid", bg=self.card_bg, fg=self.text_dark, insertbackground=self.text_dark)
+        price_entry.insert(0, str(holding.get("buy_price", 0)))
         price_entry.pack(fill=tk.X, pady=(2, 10))
 
         # Alert thresholds: Target Price and Stop Loss
@@ -2263,15 +2935,15 @@ class ModernPortfolioApp:
 
         target_sub = ttk.Frame(alert_row)
         target_sub.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
-        tk.Label(target_sub, text="🎯 Target Sell ($):", font=("Segoe UI", 8, "bold")).pack(anchor="w")
-        target_entry = tk.Entry(target_sub, font=("Segoe UI", 9), bd=1, relief="solid")
+        tk.Label(target_sub, text="🎯 Target Sell ($):", font=("Segoe UI", 8, "bold"), bg=self.bg_main, fg=self.text_dark).pack(anchor="w")
+        target_entry = tk.Entry(target_sub, font=("Segoe UI", 9), bd=1, relief="solid", bg=self.card_bg, fg=self.text_dark, insertbackground=self.text_dark)
         target_entry.insert(0, str(holding.get("target_sell_price") or ""))
         target_entry.pack(fill=tk.X, pady=(2, 0))
 
         stop_sub = ttk.Frame(alert_row)
         stop_sub.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        tk.Label(stop_sub, text="⚠️ Stop Loss ($):", font=("Segoe UI", 8, "bold")).pack(anchor="w")
-        stop_entry = tk.Entry(stop_sub, font=("Segoe UI", 9), bd=1, relief="solid")
+        tk.Label(stop_sub, text="⚠️ Stop Loss ($):", font=("Segoe UI", 8, "bold"), bg=self.bg_main, fg=self.text_dark).pack(anchor="w")
+        stop_entry = tk.Entry(stop_sub, font=("Segoe UI", 9), bd=1, relief="solid", bg=self.card_bg, fg=self.text_dark, insertbackground=self.text_dark)
         stop_entry.insert(0, str(holding.get("stop_loss_price") or ""))
         stop_entry.pack(fill=tk.X, pady=(2, 0))
 
@@ -2306,7 +2978,7 @@ class ModernPortfolioApp:
             summary = calc_holding_summary(
                 shares,
                 buy_price,
-                holding["current_price"],
+                holding.get("current_price", buy_price),
                 holding.get("dividend_yield", 0.0),
                 holding.get("annual_div_per_share", 0.0),
             )
@@ -2318,8 +2990,11 @@ class ModernPortfolioApp:
             dlg.destroy()
             self._set_status(f"Updated holding {sym} ({new_port}, {new_curr}).")
 
+        btn_row = ttk.Frame(frame)
+        btn_row.pack(fill=tk.X, pady=(10, 0))
+
         tk.Button(
-            frame,
+            btn_row,
             text="Save Changes",
             font=("Segoe UI", 9, "bold"),
             bg=self.primary_color,
@@ -2327,7 +3002,42 @@ class ModernPortfolioApp:
             relief="flat",
             pady=6,
             command=on_save_edit,
-        ).pack(fill=tk.X)
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
+
+        tk.Button(
+            btn_row,
+            text="Cancel",
+            font=("Segoe UI", 9),
+            bg=self.tab_inactive_bg,
+            fg=self.text_dark,
+            relief="flat",
+            pady=6,
+            command=dlg.destroy,
+        ).pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=(4, 0))
+
+        dlg.bind("<Escape>", lambda e: dlg.destroy())
+
+        # Ensure layout is computed, center dialog over parent, and safely focus & grab
+        dlg.update_idletasks()
+        try:
+            rw = self.root.winfo_width()
+            rh = self.root.winfo_height()
+            rx = self.root.winfo_rootx()
+            ry = self.root.winfo_rooty()
+            dw, dh = 440, 480
+            x = max(0, rx + (rw - dw) // 2)
+            y = max(0, ry + (rh - dh) // 2)
+            dlg.geometry(f"{dw}x{dh}+{x}+{y}")
+        except Exception:
+            pass
+
+        dlg.deiconify()
+        dlg.lift()
+        dlg.focus_set()
+        try:
+            dlg.grab_set()
+        except Exception:
+            pass
 
     def _delete_selected_holding(self):
         selected = self.holdings_tree.selection()
@@ -2507,6 +3217,11 @@ class ModernPortfolioApp:
         self.div_inputs["buy_price"].delete(0, tk.END)
         self.div_inputs["buy_price"].insert(0, str(holding["buy_price"]))
 
+        p_date = self._get_holding_purchase_date(holding["symbol"], holding.get("portfolio"))
+        if "purchase_date" in self.div_inputs:
+            self.div_inputs["purchase_date"].delete(0, tk.END)
+            self.div_inputs["purchase_date"].insert(0, p_date)
+
         self.div_inputs["div_yield"].delete(0, tk.END)
         self.div_inputs["div_yield"].insert(0, str(holding.get("dividend_yield", 0.0)))
 
@@ -2524,18 +3239,63 @@ class ModernPortfolioApp:
             div_yield = float(self.div_inputs["div_yield"].get().strip())
             ann_div_str = self.div_inputs["div_per_share"].get().strip()
             ann_div = float(ann_div_str) if ann_div_str else 0.0
+            purchase_date_str = self.div_inputs["purchase_date"].get().strip() if "purchase_date" in self.div_inputs else None
         except ValueError:
             messagebox.showerror("Error", "Please enter valid numeric values for dividend calculation.")
             return
 
-        res = calc_dividend_projection(shares, price, div_yield, ann_div, buy_price)
+        # 1. Past Performance from Purchase Day Till Today (Earned Already)
+        past = calc_holding_earned_already(shares, buy_price, price, purchase_date_str, ann_div, div_yield)
+        if hasattr(self, "div_earned_labels"):
+            self.div_earned_labels["cost_basis"].config(text=f"${past['cost_basis']:,.2f}")
+            self.div_earned_labels["market_value"].config(text=f"${past['market_value']:,.2f}")
+            
+            gain_sign = "+" if past["capital_gain"] >= 0 else ""
+            gain_fg = self.green_color if past["capital_gain"] >= 0 else self.red_color
+            self.div_earned_labels["capital_gain"].config(
+                text=f"{gain_sign}${past['capital_gain']:,.2f} ({gain_sign}{past['capital_gain_pct']:.2f}%)",
+                fg=gain_fg
+            )
+            self.div_earned_labels["past_dividends"].config(text=f"${past['past_dividends']:,.2f}")
+            
+            tot_sign = "+" if past["total_earned_already"] >= 0 else ""
+            tot_fg = self.green_color if past["total_earned_already"] >= 0 else self.red_color
+            self.div_earned_labels["total_earned"].config(
+                text=f"{tot_sign}${past['total_earned_already']:,.2f} ({tot_sign}{past['total_roi_pct']:.2f}%)",
+                fg=tot_fg
+            )
+            self.div_earned_labels["cagr"].config(text=f"{past['cagr_pct']:.2f}% / yr")
 
+        if hasattr(self, "div_holding_days_lbl"):
+            self.div_holding_days_lbl.config(text=f"Holding: {past['days_held']} days ({past['years_held']:.2f} yrs)")
+
+        # 2. Future Milestones (Till Later How Much You Can Earn)
+        try:
+            div_growth = float(self.drip_div_growth_entry.get().strip())
+            price_growth = float(self.drip_price_growth_entry.get().strip())
+            monthly_contrib = float(self.drip_monthly_entry.get().strip())
+        except (ValueError, AttributeError):
+            div_growth, price_growth, monthly_contrib = 5.0, 6.0, 0.0
+
+        fut_res = calc_future_dividend_milestones(
+            shares, price, buy_price, div_yield, ann_div, div_growth, price_growth, monthly_contrib, horizons=[1, 3, 5, 10]
+        )
+        if hasattr(self, "div_milestone_labels"):
+            for yr, (lbl_val, lbl_new, lbl_tot) in self.div_milestone_labels.items():
+                m = fut_res["milestones"].get(yr)
+                if m:
+                    lbl_val.config(text=f"${m['portfolio_value']:,.2f}")
+                    lbl_new.config(text=f"{t('lbl_future_new_profit')}: +${m['new_profit_from_today']:,.2f}")
+                    tot_s = "+" if m["total_profit_from_start"] >= 0 else ""
+                    lbl_tot.config(text=f"{t('lbl_future_total_profit')}: {tot_s}${m['total_profit_from_start']:,.2f} ({tot_s}{m['roi_from_start_pct']:.1f}%)")
+
+        # 3. Dividend Projection Cash Flow Summary
+        res = calc_dividend_projection(shares, price, div_yield, ann_div, buy_price)
         self.div_results["annual_total"].config(text=f"${res['annual_total']:,.2f}")
         self.div_results["quarterly_total"].config(text=f"${res['quarterly_total']:,.2f}")
         self.div_results["monthly_total"].config(text=f"${res['monthly_total']:,.2f}")
         self.div_results["yield_on_cost"].config(text=f"{res['yield_on_cost']:.2f}%")
         self.div_results["div_per_share"].config(text=f"${res['annual_div_per_share']:.4f}")
-        self.div_results["total_value"].config(text=f"${shares * price:,.2f}")
 
     def _calc_drip_results(self):
         try:
@@ -2601,6 +3361,20 @@ class ModernPortfolioApp:
         self.split_price_entry.delete(0, tk.END)
         self.split_price_entry.insert(0, str(holding["buy_price"]))
 
+        cur_p = holding.get("current_price", holding["buy_price"])
+        if hasattr(self, "split_cur_price_entry"):
+            self.split_cur_price_entry.delete(0, tk.END)
+            self.split_cur_price_entry.insert(0, f"{cur_p:.2f}")
+
+        p_date = self._get_holding_purchase_date(holding["symbol"], holding.get("portfolio"))
+        if hasattr(self, "split_purchase_date_entry"):
+            self.split_purchase_date_entry.delete(0, tk.END)
+            self.split_purchase_date_entry.insert(0, p_date)
+
+        if hasattr(self, "split_target_price_entry"):
+            self.split_target_price_entry.delete(0, tk.END)
+            self.split_target_price_entry.insert(0, f"{cur_p:.2f}")
+
         self._calc_split_results()
 
     def _on_split_preset_selected(self, event=None):
@@ -2626,21 +3400,85 @@ class ModernPortfolioApp:
         try:
             shares = float(self.split_shares_entry.get().strip())
             buy_price = float(self.split_price_entry.get().strip())
+            cur_price = float(self.split_cur_price_entry.get().strip()) if hasattr(self, "split_cur_price_entry") else buy_price
             ratio_to = float(self.split_to_entry.get().strip())
             ratio_from = float(self.split_from_entry.get().strip())
+            p_date = self.split_purchase_date_entry.get().strip() if hasattr(self, "split_purchase_date_entry") else None
+            tgt_p = float(self.split_target_price_entry.get().strip()) if hasattr(self, "split_target_price_entry") and self.split_target_price_entry.get().strip() else 0.0
         except ValueError:
             return
 
-        res = calc_stock_split(shares, buy_price, ratio_from, ratio_to)
+        res = calc_split_future_projections(shares, buy_price, cur_price, ratio_from, ratio_to, p_date, tgt_p)
         self.last_split_result = res
 
-        self.split_before_labels["shares"].config(text=f"{res['original_shares']:.4g}")
-        self.split_before_labels["price"].config(text=f"${res['original_buy_price']:.2f}")
-        self.split_before_labels["total"].config(text=f"${res['original_basis']:,.2f}")
+        # 1. Earned Already Card
+        if hasattr(self, "split_earned_labels"):
+            self.split_earned_labels["cost_basis"].config(text=f"${res['cost_basis']:,.2f}")
+            self.split_earned_labels["market_value"].config(text=f"${res['market_value']:,.2f}")
+            g_sign = "+" if res["earned_already"] >= 0 else ""
+            g_fg = self.green_color if res["earned_already"] >= 0 else self.red_color
+            self.split_earned_labels["capital_gain"].config(
+                text=f"{g_sign}${res['earned_already']:,.2f} ({g_sign}{res['earned_already_pct']:.2f}%)",
+                fg=g_fg
+            )
+            self.split_earned_labels["holding_period"].config(
+                text=f"{res['days_held']} days ({res['years_held']:.2f} yrs)"
+            )
+            if hasattr(self, "split_holding_days_lbl"):
+                self.split_holding_days_lbl.config(text=f"Holding: {res['days_held']} days ({res['years_held']:.2f} yrs)")
 
-        self.split_after_labels["shares"].config(text=f"{res['new_shares']:.4g}")
-        self.split_after_labels["price"].config(text=f"${res['new_buy_price']:.4f}")
-        self.split_after_labels["total"].config(text=f"${res['new_basis']:,.2f}")
+        # 2. Before / After Split Comparison
+        if hasattr(self, "split_before_labels"):
+            self.split_before_labels["shares"].config(text=f"{res['original_shares']:.4g}")
+            self.split_before_labels["price"].config(text=f"${res['original_buy_price']:.2f}")
+            if "cur_price" in self.split_before_labels:
+                self.split_before_labels["cur_price"].config(text=f"${res['original_current_price']:.2f}")
+            self.split_before_labels["total"].config(text=f"${res['cost_basis']:,.2f}")
+            if "val" in self.split_before_labels:
+                self.split_before_labels["val"].config(text=f"${res['market_value']:,.2f}")
+
+        if hasattr(self, "split_after_labels"):
+            self.split_after_labels["shares"].config(text=f"{res['new_shares']:.4g}")
+            self.split_after_labels["price"].config(text=f"${res['new_buy_price']:.4f}")
+            if "cur_price" in self.split_after_labels:
+                self.split_after_labels["cur_price"].config(text=f"${res['new_current_price']:.4f}")
+            self.split_after_labels["total"].config(text=f"${res['new_cost_basis']:,.2f}")
+            if "val" in self.split_after_labels:
+                self.split_after_labels["val"].config(text=f"${res['new_market_value']:,.2f}")
+
+        # 3. Future Potential Earnings Card ("Till later how much you can earn")
+        if hasattr(self, "split_future_labels"):
+            target_data = res.get("custom_target") or res.get("pre_split_recovery")
+            if target_data:
+                self.split_future_labels["target_val"].config(
+                    text=f"${target_data['future_value']:,.2f} (@ ${target_data['target_price']:.2f})"
+                )
+                t_sign = "+" if target_data["total_profit_from_start"] >= 0 else ""
+                t_fg = self.green_color if target_data["total_profit_from_start"] >= 0 else self.red_color
+                self.split_future_labels["total_prof"].config(
+                    text=f"{t_sign}${target_data['total_profit_from_start']:,.2f} ({t_sign}{target_data['total_roi_pct']:.1f}%)",
+                    fg=t_fg
+                )
+                n_sign = "+" if target_data["new_profit_from_today"] >= 0 else ""
+                n_fg = self.green_color if target_data["new_profit_from_today"] >= 0 else self.red_color
+                self.split_future_labels["new_gain"].config(
+                    text=f"{n_sign}${target_data['new_profit_from_today']:,.2f}",
+                    fg=n_fg
+                )
+
+        # Update Scenario Pills in Frame
+        if hasattr(self, "split_scenarios_frame"):
+            for child in self.split_scenarios_frame.winfo_children():
+                child.destroy()
+            for sc in res.get("scenarios", []):
+                pill = tk.Frame(self.split_scenarios_frame, bg="#f8f9fa", bd=1, relief="solid", padx=6, pady=3)
+                pill.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=2)
+                tk.Label(pill, text=f"+{sc['growth_pct']:g}% (${sc['future_price']:.2f})", font=("Segoe UI", 8, "bold"), bg="#f8f9fa", fg=self.primary_color).pack(anchor="w")
+                tk.Label(pill, text=f"Val: ${sc['future_value']:,.2f}", font=("Segoe UI", 8), bg="#f8f9fa").pack(anchor="w")
+                tot_s = "+" if sc["total_profit_from_start"] >= 0 else ""
+                tk.Label(pill, text=f"Total: {tot_s}${sc['total_profit_from_start']:,.2f}", font=("Segoe UI", 7), bg="#f8f9fa", fg=self.green_color).pack(anchor="w")
+                new_s = "+" if sc["new_profit_from_today"] >= 0 else ""
+                tk.Label(pill, text=f"New: {new_s}${sc['new_profit_from_today']:,.2f}", font=("Segoe UI", 7), bg="#f8f9fa", fg=self.text_muted).pack(anchor="w")
 
     def _apply_split_to_portfolio(self):
         sym = self.split_sym_entry.get().strip().upper()
@@ -2810,9 +3648,26 @@ class ModernPortfolioApp:
 
         res["portfolio"] = holding.get("portfolio", self.current_portfolio) if holding else (self.current_portfolio if self.current_portfolio != "All Portfolios (Consolidated)" else DEFAULT_PORTFOLIO_NAME)
         res["currency"] = holding.get("currency", "USD") if holding else "USD"
-
-        append_sale_record(res, SALES_HISTORY_CSV)
-        self.sales_history = load_sales_history(SALES_HISTORY_CSV, portfolio_name=self.current_portfolio)
+        sell_tx = {
+            "date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "type": "SELL",
+            "portfolio": res["portfolio"],
+            "symbol": sym,
+            "shares": shares_to_sell,
+            "price": res["sell_price"],
+            "total_amount": res["gross_proceeds"],
+            "cost_basis": res["cost_basis"],
+            "commission_fee": res["commission_fee"],
+            "estimated_tax": res["estimated_tax"],
+            "net_amount": res["net_proceeds"],
+            "net_profit": res["net_profit"],
+            "net_roi_pct": res["net_roi_pct"],
+            "currency": res["currency"],
+            "notes": "Sold via Selling Calculator",
+        }
+        append_transaction(sell_tx, TRANSACTION_HISTORY_CSV)
+        self.transactions = load_transactions(TRANSACTION_HISTORY_CSV, portfolio_name=self.current_portfolio if self.current_portfolio != "All Portfolios (Consolidated)" else None)
+        self.sales_history = self.transactions
         self._refresh_sales_table()
 
         if holding:
@@ -2904,10 +3759,15 @@ class ModernPortfolioApp:
         def worker():
             results = []
             for sym in symbols:
+                if not getattr(self, "is_running", True):
+                    return
                 quote = self.fetcher.fetch_quote(sym)
+                if not getattr(self, "is_running", True):
+                    return
                 results.append((sym, quote))
                 time.sleep(0.3)
-            self.fetch_queue.put(("ALL_QUOTES", results))
+            if getattr(self, "is_running", True):
+                self.fetch_queue.put(("ALL_QUOTES", results))
 
         t = threading.Thread(target=worker, daemon=True)
         t.start()
@@ -2943,6 +3803,8 @@ class ModernPortfolioApp:
                 pass
 
     def _handle_all_quotes_result(self, results):
+        if not getattr(self, "is_running", True):
+            return
         self.is_fetching = False
         updated_count = 0
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -3039,18 +3901,24 @@ class ModernPortfolioApp:
 
             tag = "positive" if unrealized > 0 else ("negative" if unrealized < 0 else "neutral")
 
-            chg = h.get("change")
-            chg_pct = h.get("change_percent")
-            if chg is not None and chg_pct is not None:
-                chg_str = f"{chg:+.2f} ({chg_pct:+.2f}%)"
-            elif chg_pct is not None:
-                chg_str = f"{chg_pct:+.2f}%"
-            else:
-                chg_str = "-"
-
             curr = h.get("currency", "USD").strip().upper() or "USD"
             sym_char = self.converter.CURRENCY_SYMBOLS.get(curr, "$")
             unreal_sign = "+" if unrealized >= 0 else "-"
+
+            chg = h.get("change")
+            chg_pct = h.get("change_percent")
+            if chg is not None and chg_pct is not None:
+                c_val = float(chg)
+                c_sign = "+" if c_val >= 0 else "-"
+                chg_str = f"{c_sign}{sym_char}{abs(c_val):.2f} ({float(chg_pct):+.2f}%)"
+            elif chg is not None:
+                c_val = float(chg)
+                c_sign = "+" if c_val >= 0 else "-"
+                chg_str = f"{c_sign}{sym_char}{abs(c_val):.2f}"
+            elif chg_pct is not None:
+                chg_str = f"{float(chg_pct):+.2f}%"
+            else:
+                chg_str = "-"
 
             # Target alert indicators
             target_p = float(h.get("target_sell_price") or 0.0)
@@ -3087,7 +3955,7 @@ class ModernPortfolioApp:
 
         if hasattr(self, "lbl_holdings_count"):
             self.lbl_holdings_count.config(
-                text=f"Showing {displayed_count} of {len(self.holdings)} holdings"
+                text=t("showing_holdings", shown=displayed_count, total=len(self.holdings))
             )
 
     def _refresh_sales_table(self):
@@ -3095,29 +3963,46 @@ class ModernPortfolioApp:
             self.history_tree.delete(item)
 
         filter_sel = self.sales_filter_var.get() if hasattr(self, "sales_filter_var") else "All Portfolios (Consolidated)"
+        type_filter_val = self.tx_type_filter_var.get() if hasattr(self, "tx_type_filter_var") else "All Types"
         target_curr = self.summary_currency if hasattr(self, "summary_currency") else "USD"
 
-        # Load sales for filter_sel
-        if filter_sel in ("All Portfolios (Consolidated)", "All Portfolios", "All", "*"):
-            displayed_sales = load_sales_history(SALES_HISTORY_CSV, portfolio_name=None)
+        # Determine portfolio filter
+        is_all_p = (
+            filter_sel in ("All Portfolios (Consolidated)", "All Portfolios", "All", "*",
+                           t("portfolio_all_consolidated"), t("portfolio_all_plain"))
+            or "consolidated" in filter_sel.lower()
+            or "合併" in filter_sel
+            or "合并" in filter_sel
+        )
+        port_param = None if is_all_p else filter_sel
+
+        # Determine type filter
+        if "BUY" in type_filter_val.upper() or "買入" in type_filter_val or "买入" in type_filter_val:
+            type_param = "BUY"
+        elif "SELL" in type_filter_val.upper() or "賣出" in type_filter_val or "卖出" in type_filter_val:
+            type_param = "SELL"
         else:
-            displayed_sales = load_sales_history(SALES_HISTORY_CSV, portfolio_name=filter_sel)
+            type_param = None
+
+        displayed_txs = load_transactions(TRANSACTION_HISTORY_CSV, portfolio_name=port_param, tx_type=type_param)
+        self.transactions = displayed_txs
+        self.sales_history = [t for t in displayed_txs if t.get("type", "BUY") == "SELL"]
 
         total_profit_target = 0.0
+        buy_count = 0
+        sell_count = 0
 
-        if not displayed_sales:
-            all_sales = load_sales_history(SALES_HISTORY_CSV, portfolio_name=None)
-            total_across = len(all_sales)
+        if not displayed_txs:
+            all_txs = load_transactions(TRANSACTION_HISTORY_CSV, portfolio_name=None, tx_type=None)
+            total_across = len(all_txs)
             self.history_tree.insert(
                 "",
                 tk.END,
                 values=(
                     "-",
+                    "-",
                     filter_sel,
-                    f"No sales recorded in '{filter_sel}' ({total_across} trades in other portfolios — click 'Show All Sales')",
-                    "-",
-                    "-",
-                    "-",
+                    f"No transactions found matching filters ({total_across} total in history — click 'Show All')",
                     "-",
                     "-",
                     "-",
@@ -3129,39 +4014,60 @@ class ModernPortfolioApp:
                 ),
             )
             if hasattr(self, "lbl_sales_stats"):
-                self.lbl_sales_stats.config(text=f"0 trade(s) in {filter_sel} ({total_across} total across accounts)")
+                self.lbl_sales_stats.config(text=f"0 transaction(s) found ({total_across} total across accounts)")
         else:
-            for s in displayed_sales:
-                profit = s.get("net_profit", 0.0)
-                s_curr = s.get("currency", "USD").strip().upper() or "USD"
-                total_profit_target += self.converter.convert(profit, s_curr, target_curr)
-                tag = "positive" if profit >= 0 else "negative"
-                c_sym = "C$" if s_curr == "CAD" else "$"
+            for tx in displayed_txs:
+                t_type = str(tx.get("type", "BUY")).strip().upper() or "BUY"
+                s_curr = tx.get("currency", "USD").strip().upper() or "USD"
+                c_sym = self.converter.CURRENCY_SYMBOLS.get(s_curr, "$")
+                shares = float(tx.get("shares", 0.0))
+                price = float(tx.get("price", 0.0))
+                tot_amt = float(tx.get("total_amount", 0.0))
+                comm = float(tx.get("commission_fee", 0.0))
+                tax = float(tx.get("estimated_tax", 0.0))
+
+                if t_type == "SELL":
+                    sell_count += 1
+                    profit = float(tx.get("net_profit", 0.0))
+                    roi = float(tx.get("net_roi_pct", 0.0))
+                    total_profit_target += self.converter.convert(profit, s_curr, target_curr)
+                    tag = "positive" if profit >= 0 else "negative"
+                    type_display = "🔴 SELL"
+                    profit_str = f"{c_sym}{profit:+,.2f}"
+                    roi_str = f"{roi:+.2f}%"
+                    tax_str = f"{c_sym}{tax:.2f}"
+                else:
+                    buy_count += 1
+                    tag = "buy"
+                    type_display = "🟢 BUY"
+                    profit_str = "—"
+                    roi_str = "—"
+                    tax_str = "—"
 
                 self.history_tree.insert(
                     "",
                     tk.END,
                     values=(
-                        s.get("date", ""),
-                        s.get("portfolio", "USD HSBC"),
-                        s.get("symbol", ""),
+                        tx.get("date", ""),
+                        type_display,
+                        tx.get("portfolio", DEFAULT_PORTFOLIO_NAME),
+                        tx.get("symbol", ""),
                         s_curr,
-                        f"{s.get('shares_to_sell', 0.0):.4g}",
-                        f"{c_sym}{s.get('buy_price', 0.0):.2f}",
-                        f"{c_sym}{s.get('sell_price', 0.0):.2f}",
-                        f"{c_sym}{s.get('gross_proceeds', 0.0):,.2f}",
-                        f"{c_sym}{s.get('cost_basis', 0.0):,.2f}",
-                        f"{c_sym}{s.get('commission_fee', 0.0):.2f}",
-                        f"{c_sym}{s.get('estimated_tax', 0.0):.2f}",
-                        f"{c_sym}{s.get('net_proceeds', 0.0):,.2f}",
-                        f"{c_sym}{profit:+,.2f}",
-                        f"{s.get('net_roi_pct', 0.0):+.2f}%",
+                        f"{shares:.4g}",
+                        f"{c_sym}{price:.2f}",
+                        f"{c_sym}{tot_amt:,.2f}",
+                        f"{c_sym}{comm:.2f}",
+                        tax_str,
+                        profit_str,
+                        roi_str,
                     ),
                     tags=(tag,),
                 )
 
             if hasattr(self, "lbl_sales_stats"):
-                self.lbl_sales_stats.config(text=f"Showing {len(displayed_sales)} completed trade(s)")
+                self.lbl_sales_stats.config(
+                    text=f"Showing {len(displayed_txs)} transaction(s) ({buy_count} BUY, {sell_count} SELL)"
+                )
 
         color = self.green_color if total_profit_target >= 0 else self.red_color
         formatted_profit = self.converter.format_money(total_profit_target, target_curr)
@@ -3174,12 +4080,245 @@ class ModernPortfolioApp:
     def _show_all_sales_clicked(self):
         if hasattr(self, "sales_filter_var"):
             self.sales_filter_var.set("All Portfolios (Consolidated)")
+        if hasattr(self, "tx_type_filter_var"):
+            self.tx_type_filter_var.set("All Types")
         self._refresh_sales_table()
 
     def _match_active_portfolio_sales(self):
         if hasattr(self, "sales_filter_var"):
             self.sales_filter_var.set(self.current_portfolio)
         self._refresh_sales_table()
+
+    def _open_record_transaction_dialog(self):
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Record Transaction (BUY / SELL)")
+        dlg.geometry("460x540")
+        dlg.resizable(False, False)
+        dlg.transient(self.root)
+        dlg.configure(bg=self.bg_main)
+
+        frame = ttk.Frame(dlg, padding=16)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        tk.Label(
+            frame,
+            text="Record Buy / Sell Transaction",
+            font=("Segoe UI", 12, "bold"),
+            fg=self.primary_color,
+            bg=self.bg_main,
+        ).pack(anchor="w", pady=(0, 10))
+
+        # Row 1: Type & Portfolio
+        row1 = ttk.Frame(frame)
+        row1.pack(fill=tk.X, pady=(0, 8))
+
+        tk.Label(row1, text="Type:", font=("Segoe UI", 9, "bold"), bg=self.bg_main, fg=self.text_dark).pack(side=tk.LEFT, padx=(0, 6))
+        type_cb = ttk.Combobox(row1, values=["BUY", "SELL"], state="readonly", width=8)
+        type_cb.set("BUY")
+        type_cb.pack(side=tk.LEFT, padx=(0, 12))
+
+        tk.Label(row1, text="Portfolio:", font=("Segoe UI", 9, "bold"), bg=self.bg_main, fg=self.text_dark).pack(side=tk.LEFT, padx=(0, 6))
+        available_ports = [p for p in get_portfolio_names(PORTFOLIO_CSV) if p != "All Portfolios (Consolidated)"]
+        if not available_ports:
+            available_ports = [DEFAULT_PORTFOLIO_NAME]
+        default_port = self.current_portfolio if self.current_portfolio in available_ports else available_ports[0]
+        port_cb = ttk.Combobox(row1, values=available_ports, width=16)
+        port_cb.set(default_port)
+        port_cb.pack(side=tk.LEFT)
+
+        # Row 2: Symbol & Currency
+        row2 = ttk.Frame(frame)
+        row2.pack(fill=tk.X, pady=(0, 8))
+
+        tk.Label(row2, text="Symbol:", font=("Segoe UI", 9, "bold"), bg=self.bg_main, fg=self.text_dark).pack(side=tk.LEFT, padx=(0, 6))
+        sym_entry = tk.Entry(row2, font=("Segoe UI", 10), bd=1, relief="solid", bg=self.card_bg, fg=self.text_dark, width=12)
+        sym_entry.pack(side=tk.LEFT, padx=(0, 12))
+
+        tk.Label(row2, text="Currency:", font=("Segoe UI", 9, "bold"), bg=self.bg_main, fg=self.text_dark).pack(side=tk.LEFT, padx=(0, 6))
+        curr_cb = ttk.Combobox(row2, values=["USD", "CAD", "HKD", "EUR", "GBP", "AUD", "JPY", "CNY"], state="readonly", width=8)
+        curr_cb.set("USD")
+        curr_cb.pack(side=tk.LEFT)
+
+        # Row 3: Shares & Price
+        row3 = ttk.Frame(frame)
+        row3.pack(fill=tk.X, pady=(0, 8))
+
+        tk.Label(row3, text="Shares:", font=("Segoe UI", 9, "bold"), bg=self.bg_main, fg=self.text_dark).pack(side=tk.LEFT, padx=(0, 6))
+        shares_entry = tk.Entry(row3, font=("Segoe UI", 10), bd=1, relief="solid", bg=self.card_bg, fg=self.text_dark, width=12)
+        shares_entry.pack(side=tk.LEFT, padx=(0, 12))
+
+        tk.Label(row3, text="Price ($):", font=("Segoe UI", 9, "bold"), bg=self.bg_main, fg=self.text_dark).pack(side=tk.LEFT, padx=(0, 6))
+        price_entry = tk.Entry(row3, font=("Segoe UI", 10), bd=1, relief="solid", bg=self.card_bg, fg=self.text_dark, width=12)
+        price_entry.pack(side=tk.LEFT)
+
+        # Row 4: Fees / Commission
+        row4 = ttk.Frame(frame)
+        row4.pack(fill=tk.X, pady=(0, 8))
+        tk.Label(row4, text="Commission / Fees ($):", font=("Segoe UI", 9, "bold"), bg=self.bg_main, fg=self.text_dark).pack(side=tk.LEFT, padx=(0, 6))
+        comm_entry = tk.Entry(row4, font=("Segoe UI", 10), bd=1, relief="solid", bg=self.card_bg, fg=self.text_dark, width=12)
+        comm_entry.insert(0, "0.00")
+        comm_entry.pack(side=tk.LEFT)
+
+        # Row 5: Date
+        tk.Label(frame, text="Date & Time (YYYY-MM-DD HH:MM):", font=("Segoe UI", 9, "bold"), bg=self.bg_main, fg=self.text_dark).pack(anchor="w")
+        date_entry = tk.Entry(frame, font=("Segoe UI", 10), bd=1, relief="solid", bg=self.card_bg, fg=self.text_dark)
+        date_entry.insert(0, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        date_entry.pack(fill=tk.X, pady=(2, 8))
+
+        # Row 6: Notes
+        tk.Label(frame, text="Notes / Memo (optional):", font=("Segoe UI", 9, "bold"), bg=self.bg_main, fg=self.text_dark).pack(anchor="w")
+        notes_entry = tk.Entry(frame, font=("Segoe UI", 10), bd=1, relief="solid", bg=self.card_bg, fg=self.text_dark)
+        notes_entry.pack(fill=tk.X, pady=(2, 12))
+
+        # Checkbox: Update portfolio holdings
+        update_holdings_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(
+            frame,
+            text="Also update active Portfolio Holdings (add shares for BUY / deduct for SELL)",
+            variable=update_holdings_var,
+            bg=self.bg_main,
+            fg=self.text_dark,
+            font=("Segoe UI", 8),
+            activebackground=self.bg_main,
+        ).pack(anchor="w", pady=(0, 12))
+
+        def on_save_manual_tx():
+            t_type = type_cb.get().strip().upper()
+            target_port = port_cb.get().strip() or DEFAULT_PORTFOLIO_NAME
+            sym = sym_entry.get().strip().upper()
+            curr = curr_cb.get().strip().upper() or "USD"
+            if not sym:
+                messagebox.showerror("Error", "Please enter a valid ticker symbol.", parent=dlg)
+                return
+
+            try:
+                shares = float(shares_entry.get().strip())
+                price = float(price_entry.get().strip())
+                comm = float(comm_entry.get().strip() or "0.0")
+                if shares <= 0 or price < 0:
+                    raise ValueError
+            except ValueError:
+                messagebox.showerror("Error", "Please enter positive numeric values for Shares and Price.", parent=dlg)
+                return
+
+            dt = date_entry.get().strip() or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            notes = notes_entry.get().strip()
+            tot_amt = round(shares * price, 2)
+
+            tx_record = {
+                "date": dt,
+                "type": t_type,
+                "portfolio": target_port,
+                "symbol": sym,
+                "shares": shares,
+                "price": price,
+                "total_amount": tot_amt,
+                "cost_basis": tot_amt,
+                "commission_fee": comm,
+                "estimated_tax": 0.0,
+                "net_amount": (tot_amt - comm) if t_type == "SELL" else (tot_amt + comm),
+                "net_profit": 0.0,
+                "net_roi_pct": 0.0,
+                "currency": curr,
+                "notes": notes,
+            }
+
+            if update_holdings_var.get():
+                existing = next((h for h in self.all_holdings if h["symbol"] == sym and h.get("portfolio") == target_port), None)
+                if t_type == "BUY":
+                    if existing:
+                        tot_sh = existing["shares"] + shares
+                        avg_p = (existing["shares"] * existing["buy_price"] + shares * price) / tot_sh
+                        existing["shares"] = tot_sh
+                        existing["buy_price"] = avg_p
+                        existing.update(calc_holding_summary(tot_sh, avg_p, existing.get("current_price", avg_p), existing.get("dividend_yield", 0.0), existing.get("annual_div_per_share", 0.0)))
+                    else:
+                        new_h = {
+                            "portfolio": target_port,
+                            "symbol": sym,
+                            "name": sym,
+                            "shares": shares,
+                            "buy_price": price,
+                            "current_price": price,
+                            "dividend_yield": 0.0,
+                            "annual_div_per_share": 0.0,
+                            "currency": curr,
+                            "last_updated": dt,
+                        }
+                        new_h.update(calc_holding_summary(shares, price, price, 0.0, 0.0))
+                        self.all_holdings.append(new_h)
+                    save_portfolio(self.all_holdings, PORTFOLIO_CSV)
+                elif t_type == "SELL" and existing:
+                    cb = round(shares * existing["buy_price"], 2)
+                    gain = round(tot_amt - comm - cb, 2)
+                    roi = round((gain / cb * 100), 2) if cb > 0 else 0.0
+                    tx_record["cost_basis"] = cb
+                    tx_record["net_profit"] = gain
+                    tx_record["net_roi_pct"] = roi
+
+                    rem = round(existing["shares"] - shares, 6)
+                    if rem <= 0.0001:
+                        self.all_holdings = [h for h in self.all_holdings if h is not existing]
+                    else:
+                        existing["shares"] = rem
+                        existing.update(calc_holding_summary(rem, existing["buy_price"], existing.get("current_price", existing["buy_price"]), existing.get("dividend_yield", 0.0), existing.get("annual_div_per_share", 0.0)))
+                    save_portfolio(self.all_holdings, PORTFOLIO_CSV)
+
+            append_transaction(tx_record, TRANSACTION_HISTORY_CSV)
+            self.transactions = load_transactions(TRANSACTION_HISTORY_CSV, portfolio_name=self.current_portfolio if self.current_portfolio != "All Portfolios (Consolidated)" else None)
+            self.sales_history = self.transactions
+            self._refresh_sales_table()
+            self._on_portfolio_selected()
+            dlg.destroy()
+            self._set_status(f"Recorded {t_type} transaction for {shares} shares of {sym}.")
+
+        btn_row = ttk.Frame(frame)
+        btn_row.pack(fill=tk.X, pady=(10, 0))
+
+        tk.Button(
+            btn_row,
+            text="💾 Save Transaction",
+            font=("Segoe UI", 9, "bold"),
+            bg=self.primary_color,
+            fg="#ffffff",
+            relief="flat",
+            pady=6,
+            command=on_save_manual_tx,
+        ).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 4))
+
+        tk.Button(
+            btn_row,
+            text="Cancel",
+            font=("Segoe UI", 9),
+            bg=self.tab_inactive_bg,
+            fg=self.text_dark,
+            relief="flat",
+            pady=6,
+            command=dlg.destroy,
+        ).pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=(4, 0))
+
+        dlg.bind("<Escape>", lambda e: dlg.destroy())
+
+        dlg.update_idletasks()
+        try:
+            rw = self.root.winfo_width()
+            rh = self.root.winfo_height()
+            rx = self.root.winfo_rootx()
+            ry = self.root.winfo_rooty()
+            dw, dh = 460, 540
+            x = max(0, rx + (rw - dw) // 2)
+            y = max(0, ry + (rh - dh) // 2)
+            dlg.geometry(f"{dw}x{dh}+{x}+{y}")
+        except Exception:
+            pass
+
+        dlg.deiconify()
+        dlg.lift()
+        dlg.focus_set()
+        try:
+            dlg.grab_set()
+        except Exception:
+            pass
 
     def _update_metric_cards(self):
         target_curr = self.summary_currency if hasattr(self, "summary_currency") else "USD"
@@ -3226,6 +4365,20 @@ class ModernPortfolioApp:
         total_gain_pct = (total_gain / total_cost * 100) if total_cost > 0 else 0.0
         monthly_div = total_ann_div / 12.0
 
+        total_day_chg = 0.0
+        has_any_day_chg = False
+        for h in self.holdings:
+            chg = h.get("change")
+            if chg is not None:
+                has_any_day_chg = True
+                s = float(h.get("shares", 0.0))
+                h_curr = h.get("currency", "USD").strip().upper() or "USD"
+                chg_converted = self.converter.convert(float(chg) * s, h_curr, target_curr) if target_curr != "Native" else float(chg) * s
+                total_day_chg += chg_converted
+
+        day_chg_pct = (total_day_chg / (total_val - total_day_chg) * 100) if (total_val - total_day_chg) > 0 else 0.0
+        day_sign = "+" if total_day_chg >= 0 else "-"
+
         curr_label = target_curr if target_curr != "Native" else "Mix"
         sym = self.converter.CURRENCY_SYMBOLS.get(target_curr, "$") if target_curr != "Native" else "$"
 
@@ -3243,11 +4396,16 @@ class ModernPortfolioApp:
         self.cards["monthly_dividend"].config(text=self.converter.format_money(monthly_div, target_curr))
 
         if hasattr(self, "card_titles"):
-            self.card_titles["total_value"].config(text=f"Portfolio Value ({curr_label})")
-            self.card_titles["total_cost"].config(text=f"Total Cost Basis ({curr_label})")
-            self.card_titles["total_gain"].config(text=f"Total Unrealized P/L ({curr_label})")
-            self.card_titles["annual_dividend"].config(text=f"Projected Annual Div ({curr_label})")
-            self.card_titles["monthly_dividend"].config(text=f"Monthly Div Avg ({curr_label})")
+            if has_any_day_chg:
+                self.card_titles["total_value"].config(
+                    text=f"{t('card_total_value')} ({curr_label}) • Day: {day_sign}{sym}{abs(total_day_chg):,.2f} ({day_chg_pct:+.2f}%)"
+                )
+            else:
+                self.card_titles["total_value"].config(text=f"{t('card_total_value')} ({curr_label})")
+            self.card_titles["total_cost"].config(text=f"{t('col_cost_basis')} ({curr_label})")
+            self.card_titles["total_gain"].config(text=f"{t('card_unrealized_pl')} ({curr_label})")
+            self.card_titles["annual_dividend"].config(text=f"{t('card_annual_dividend')} ({curr_label})")
+            self.card_titles["monthly_dividend"].config(text=f"{t('div_proj_monthly')} ({curr_label})")
 
     def _refresh_dropdowns(self):
         syms = [f"{h['symbol']} ({h.get('name', '')})" for h in self.holdings]
@@ -3402,26 +4560,195 @@ class ModernPortfolioApp:
 
     def _export_sales_csv(self):
         filename = filedialog.asksaveasfilename(
-            title="Export Sales History to CSV",
+            title="Export Transaction History to CSV",
             defaultextension=".csv",
             filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
-            initialfile="my_sales_history_export.csv",
+            initialfile="my_transactions_export.csv",
         )
         if filename:
-            if save_sales_history(self.sales_history, filename):
-                messagebox.showinfo("Success", f"Sales history exported to:\n{filename}")
+            txs_to_export = getattr(self, "transactions", self.sales_history)
+            if save_transactions(txs_to_export, filename):
+                messagebox.showinfo("Success", f"Transaction history exported to:\n{filename}")
             else:
-                messagebox.showerror("Error", "Failed to export sales history.")
+                messagebox.showerror("Error", "Failed to export transaction history.")
 
     def _clear_sales_history(self):
-        if messagebox.askyesno("Confirm Clear", "Are you sure you want to clear all sales transaction history?"):
+        if messagebox.askyesno("Confirm Clear", "Are you sure you want to clear all transaction history?"):
+            self.transactions = []
             self.sales_history = []
+            save_transactions([], TRANSACTION_HISTORY_CSV)
             save_sales_history([], SALES_HISTORY_CSV)
             self._refresh_sales_table()
-            self._set_status("Cleared sales history.")
+            self._set_status("Cleared transaction history.")
+
+    def _open_backups_dialog(self):
+        """Displays rolling backups dialog with restore capabilities."""
+        dlg = tk.Toplevel(self.root)
+        dlg.title(t("backup_dlg_title"))
+        dlg.geometry("640x440")
+        dlg.minsize(540, 340)
+        dlg.configure(bg=self.bg_main)
+        dlg.transient(self.root)
+
+        # Header
+        hdr = ttk.Frame(dlg, padding="16 12 16 6")
+        hdr.pack(fill=tk.X)
+        tk.Label(
+            hdr,
+            text=t("backup_dlg_header"),
+            font=("Segoe UI", 12, "bold"),
+            fg=self.primary_color,
+            bg=self.bg_main,
+        ).pack(anchor="w")
+        tk.Label(
+            hdr,
+            text=t("backup_dlg_sub"),
+            font=("Segoe UI", 9),
+            fg=self.text_muted,
+            bg=self.bg_main,
+        ).pack(anchor="w", pady=(2, 6))
+
+        # Target selection
+        sel_frame = ttk.Frame(dlg, padding="16 0 16 6")
+        sel_frame.pack(fill=tk.X)
+        tk.Label(sel_frame, text=t("backup_select_file"), font=("Segoe UI", 9, "bold"), bg=self.bg_main).pack(side=tk.LEFT, padx=(0, 8))
+
+        file_choices = {
+            "Portfolio Holdings (portfolio.csv)": PORTFOLIO_CSV,
+            "Transaction History (transaction_history.csv)": TRANSACTION_HISTORY_CSV,
+            "Sales History (sales_history.csv)": SALES_HISTORY_CSV,
+        }
+        file_var = tk.StringVar(value="Portfolio Holdings (portfolio.csv)")
+        combo = ttk.Combobox(sel_frame, textvariable=file_var, values=list(file_choices.keys()), state="readonly", width=38)
+        combo.pack(side=tk.LEFT)
+
+        # Table frame
+        tbl_frame = ttk.Frame(dlg, padding="16 6 16 10")
+        tbl_frame.pack(fill=tk.BOTH, expand=True)
+
+        cols = ("slot", "filename", "modified", "size")
+        tree = ttk.Treeview(tbl_frame, columns=cols, show="headings", height=6)
+        tree.heading("slot", text=t("backup_slot"))
+        tree.heading("filename", text=t("backup_filename"))
+        tree.heading("modified", text=t("backup_timestamp"))
+        tree.heading("size", text=t("backup_size"))
+        tree.column("slot", width=100, anchor="center")
+        tree.column("filename", width=180, anchor="w")
+        tree.column("modified", width=160, anchor="center")
+        tree.column("size", width=100, anchor="e")
+        tree.pack(fill=tk.BOTH, expand=True)
+
+        def populate_tree():
+            for item in tree.get_children():
+                tree.delete(item)
+            curr_target = file_choices[file_var.get()]
+            backups = get_backup_files(curr_target)
+            if not backups:
+                tree.insert("", "end", values=("-", "No backups available yet", "-", "-"))
+                return
+            for b in backups:
+                slot_label = f"#{b['index']} (Newest)" if b['index'] == 1 else (f"#{b['index']} (Oldest)" if b['index'] == 5 else f"#{b['index']}")
+                tree.insert("", "end", iid=str(b['index']), values=(slot_label, b['filename'], b['modified_str'], f"{b['size_bytes']} B"))
+
+        combo.bind("<<ComboboxSelected>>", lambda e: populate_tree())
+        populate_tree()
+
+        # Action buttons
+        btn_frame = ttk.Frame(dlg, padding="16 8 16 16")
+        btn_frame.pack(fill=tk.X)
+
+        def restore_selected():
+            sel = tree.selection()
+            if not sel or sel[0] not in [str(i) for i in range(1, 6)]:
+                messagebox.showwarning("Select Backup", "Please select a valid backup row from the list.", parent=dlg)
+                return
+            idx = int(sel[0])
+            curr_target = file_choices[file_var.get()]
+            fname = os.path.basename(curr_target)
+            if not messagebox.askyesno(
+                t("msg_warning"),
+                t("confirm_restore_backup", idx=idx, filename=fname),
+                parent=dlg,
+            ):
+                return
+            if restore_backup(curr_target, backup_index=idx):
+                messagebox.showinfo(t("msg_success"), f"Successfully restored backup #{idx}!", parent=dlg)
+                # Reload data in memory
+                if curr_target == PORTFOLIO_CSV:
+                    self.holdings = load_portfolio(PORTFOLIO_CSV, portfolio_name=None)
+                    self.portfolio_combo.config(values=self._get_portfolio_dropdown_values())
+                    self._on_portfolio_selected()
+                elif curr_target == TRANSACTION_HISTORY_CSV:
+                    self.transactions = load_transactions(TRANSACTION_HISTORY_CSV, portfolio_name=None, tx_type=None)
+                    self._refresh_sales_table()
+                populate_tree()
+                self._set_status(f"Restored {fname} from backup #{idx}.")
+            else:
+                messagebox.showerror(t("msg_error"), "Failed to restore backup.", parent=dlg)
+
+        def open_folder():
+            os.makedirs(BACKUP_DIR, exist_ok=True)
+            webbrowser.open(f"file://{os.path.abspath(BACKUP_DIR)}")
+
+        btn_restore = tk.Button(
+            btn_frame,
+            text=t("btn_backup_restore"),
+            font=("Segoe UI", 9, "bold"),
+            bg="#1a73e8",
+            fg="#ffffff",
+            relief="flat",
+            padx=10,
+            pady=4,
+            command=restore_selected,
+        )
+        btn_restore.pack(side=tk.LEFT, padx=(0, 8))
+
+        btn_folder = tk.Button(
+            btn_frame,
+            text=t("btn_backup_open_folder"),
+            font=("Segoe UI", 9),
+            relief="solid",
+            bd=1,
+            padx=10,
+            pady=4,
+            command=open_folder,
+        )
+        btn_folder.pack(side=tk.LEFT)
+
+        btn_close = tk.Button(
+            btn_frame,
+            text=t("btn_close"),
+            font=("Segoe UI", 9),
+            relief="solid",
+            bd=1,
+            padx=12,
+            pady=4,
+            command=dlg.destroy,
+        )
+        btn_close.pack(side=tk.RIGHT)
+
+        dlg.update_idletasks()
+        try:
+            x = self.root.winfo_x() + (self.root.winfo_width() // 2) - (dlg.winfo_width() // 2)
+            y = self.root.winfo_y() + (self.root.winfo_height() // 2) - (dlg.winfo_height() // 2)
+            dlg.geometry(f"+{x}+{y}")
+            dlg.grab_set()
+        except Exception:
+            pass
 
     def on_close(self):
         self.is_running = False
+        try:
+            get_currency_converter().is_running = False
+        except Exception:
+            pass
+
+        if hasattr(self, "chart_view"):
+            try:
+                self.chart_view.cleanup()
+            except Exception:
+                pass
+
         if getattr(self, "queue_job", None):
             try:
                 self.root.after_cancel(self.queue_job)
@@ -3437,6 +4764,11 @@ class ModernPortfolioApp:
             self.auto_refresh_job = None
 
         try:
+            self.root.quit()
+        except Exception:
+            pass
+
+        try:
             self.root.destroy()
         except Exception:
             pass
@@ -3448,7 +4780,14 @@ def launch_app():
     try:
         root.mainloop()
     except (KeyboardInterrupt, SystemExit):
-        app.on_close()
+        pass
+    finally:
+        try:
+            app.on_close()
+        except Exception:
+            pass
+        # Force immediate exit of Python CLI process to prevent hanging on background sockets/threads
+        os._exit(0)
 
 
 if __name__ == "__main__":

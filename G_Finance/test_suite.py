@@ -13,6 +13,10 @@ from financial_calc import (
     calc_selling_proceeds,
     calc_breakeven_sell_price,
     calc_target_profit_sell_price,
+    calc_holding_earned_already,
+    calc_future_dividend_milestones,
+    calc_split_future_projections,
+    parse_date_to_days_held,
 )
 from csv_manager import (
     save_portfolio,
@@ -20,6 +24,14 @@ from csv_manager import (
     save_sales_history,
     load_sales_history,
     append_sale_record,
+    save_transactions,
+    load_transactions,
+    append_transaction,
+    TRANSACTION_HISTORY_CSV,
+    rotate_file_backups,
+    get_backup_files,
+    restore_backup,
+    parse_day_change_string,
 )
 from google_finance_fetcher import GoogleFinanceFetcher
 from google_account_sync import (
@@ -140,6 +152,65 @@ class TestCSVManager(unittest.TestCase):
         self.assertEqual(loaded[0]["shares"], 25.0)
         self.assertEqual(loaded[0]["buy_price"], 150.0)
         self.assertEqual(loaded[0]["current_price"], 220.0)
+
+    def test_day_change_persistence_and_parsing(self):
+        # 1. Test parsing of various string formats
+        # Positive change
+        d_val, d_pct = parse_day_change_string("+1.85 (+1.70%)")
+        self.assertEqual(d_val, 1.85)
+        self.assertEqual(d_pct, 1.70)
+
+        # Negative change with standard ASCII minus
+        d_val, d_pct = parse_day_change_string("-0.26 (-1.45%)")
+        self.assertEqual(d_val, -0.26)
+        self.assertEqual(d_pct, -1.45)
+
+        # Negative change with Google Finance Unicode minus (\u2212)
+        d_val, d_pct = parse_day_change_string("−0.26 (−1.45%)")
+        self.assertEqual(d_val, -0.26)
+        self.assertEqual(d_pct, -1.45)
+
+        # Cross calculation from dollar change only
+        d_val, d_pct = parse_day_change_string("+10.00", current_price=110.0)
+        self.assertEqual(d_val, 10.00)
+        self.assertEqual(d_pct, 10.00)  # 10 / (110 - 10) * 100 = 10.0%
+
+        # Empty / dash format
+        self.assertEqual(parse_day_change_string("-"), (None, None))
+        self.assertEqual(parse_day_change_string(""), (None, None))
+
+        # 2. Test roundtrip persistence in portfolio CSV
+        holdings = [
+            {
+                "symbol": "GOOGL",
+                "name": "Alphabet Inc",
+                "shares": 10.0,
+                "buy_price": 100.0,
+                "current_price": 150.0,
+                "change": -2.50,
+                "change_percent": -1.64,
+                "currency": "USD",
+            },
+            {
+                "symbol": "NVDA",
+                "name": "NVIDIA Corp",
+                "shares": 5.0,
+                "buy_price": 100.0,
+                "current_price": 120.0,
+                "change": 3.75,
+                "change_percent": 3.23,
+                "currency": "USD",
+            },
+        ]
+        self.assertTrue(save_portfolio(holdings, self.test_port_csv))
+        loaded = load_portfolio(self.test_port_csv)
+        self.assertEqual(len(loaded), 2)
+        self.assertEqual(loaded[0]["symbol"], "GOOGL")
+        self.assertEqual(loaded[0]["change"], -2.50)
+        self.assertEqual(loaded[0]["change_percent"], -1.64)
+        self.assertEqual(loaded[1]["symbol"], "NVDA")
+        self.assertEqual(loaded[1]["change"], 3.75)
+        self.assertEqual(loaded[1]["change_percent"], 3.23)
 
     def test_sales_history_roundtrip(self):
         sale = {
@@ -320,6 +391,75 @@ class TestPortfolioMetrics(unittest.TestCase):
         self.assertEqual(metrics["best_performer"]["symbol"], "AAPL")
         self.assertEqual(metrics["worst_performer"]["symbol"], "600519")
 
+    def test_combined_duplicate_holdings_in_analytics(self):
+        # Multiple holdings of VOO across different accounts/portfolios
+        holdings = [
+            {
+                "symbol": "VOO",
+                "name": "Vanguard S&P 500 ETF",
+                "shares": 50.0,
+                "buy_price": 400.0,
+                "current_price": 500.0,
+                "currency": "USD",
+                "annual_dividend": 200.0,
+                "change": 5.0,
+                "portfolio": "USD HSBC",
+            },
+            {
+                "symbol": "VOO",
+                "name": "Vanguard S&P 500 ETF",
+                "shares": 30.0,
+                "buy_price": 420.0,
+                "current_price": 500.0,
+                "currency": "USD",
+                "annual_dividend": 120.0,
+                "change": 5.0,
+                "portfolio": "CAD RRSP",
+            },
+            {
+                "symbol": "VOO",
+                "name": "Vanguard S&P 500 ETF",
+                "shares": 20.0,
+                "buy_price": 450.0,
+                "current_price": 500.0,
+                "currency": "USD",
+                "annual_dividend": 80.0,
+                "change": 5.0,
+                "portfolio": "USD TSFA",
+            },
+            {
+                "symbol": "AAPL",
+                "name": "Apple Inc",
+                "shares": 10.0,
+                "buy_price": 150.0,
+                "current_price": 200.0,
+                "currency": "USD",
+                "annual_dividend": 25.0,
+                "change": 2.0,
+                "portfolio": "USD HSBC",
+            },
+        ]
+        metrics = calc_portfolio_metrics(holdings, base_currency="USD")
+        allocs = metrics["allocations"]
+
+        # 4 total holdings, but only 2 unique tickers: VOO and AAPL
+        self.assertEqual(len(allocs), 2)
+
+        voo = next(a for a in allocs if a["symbol"] == "VOO")
+        # Total shares = 50 + 30 + 20 = 100
+        self.assertEqual(voo["shares"], 100.0)
+        # Total market value = 100 * 500 = 50,000 USD
+        self.assertEqual(voo["value_base"], 50000.0)
+        # Total cost basis = 50*400 (20k) + 30*420 (12.6k) + 20*450 (9k) = 41,600 USD
+        self.assertEqual(voo["cost_basis"], 41600.0)
+        # Total portfolio value = 50,000 (VOO) + 2,000 (AAPL) = 52,000 USD
+        self.assertEqual(metrics["total_value"], 52000.0)
+        # VOO weight = 50,000 / 52,000 * 100 = 96.15%
+        self.assertAlmostEqual(voo["weight_pct"], 96.15, places=1)
+        self.assertEqual(metrics["top_concentration_pct"], voo["weight_pct"])
+        self.assertEqual(metrics["best_performer"]["symbol"], "AAPL")  # 33.33% vs 20.19%
+
+
 
 class TestReportGenerator(unittest.TestCase):
     def setUp(self):
@@ -367,5 +507,447 @@ class TestReportGenerator(unittest.TestCase):
         self.assertIn("$6,300.00", content)
 
 
+class TestChartViewScopeDeduplication(unittest.TestCase):
+    def test_scope_deduplication(self):
+        # Simulate holdings with duplicate symbols across multiple portfolios
+        holdings = [
+            {"symbol": "VOO", "name": "Vanguard S&P 500 ETF", "portfolio": "USD HSBC"},
+            {"symbol": "VOO", "name": "Vanguard S&P 500 ETF", "portfolio": "CAD RRSP"},
+            {"symbol": "VOO", "name": "Vanguard S&P 500 ETF", "portfolio": "USD RRSP"},
+            {"symbol": "VFV:TSE", "name": "Vanguard S&P 500 Index ETF", "portfolio": "CAD RRSP"},
+            {"symbol": "VFV:TSE", "name": "Vanguard S&P 500 Index ETF", "portfolio": "USD TSFA"},
+            {"symbol": "NOK", "name": "Nokia Oyj", "portfolio": "USD HSBC"},
+        ]
+        port_name = "All Portfolios (Consolidated)"
+        values = [f"📁 Portfolio: {port_name}"]
+        seen_syms = set()
+        for h in holdings:
+            sym = str(h.get("symbol", "")).strip()
+            if not sym:
+                continue
+            sym_key = sym.upper()
+            if sym_key in seen_syms:
+                continue
+            seen_syms.add(sym_key)
+            name = h.get("name", "")
+            display = f"{sym} - {name}" if name else sym
+            values.append(display)
+
+        # Ensure VOO appears exactly once
+        voo_entries = [v for v in values if v.startswith("VOO")]
+        self.assertEqual(len(voo_entries), 1)
+        self.assertEqual(voo_entries[0], "VOO - Vanguard S&P 500 ETF")
+
+        # Ensure VFV:TSE appears exactly once
+        vfv_entries = [v for v in values if v.startswith("VFV:TSE")]
+        self.assertEqual(len(vfv_entries), 1)
+        self.assertEqual(vfv_entries[0], "VFV:TSE - Vanguard S&P 500 Index ETF")
+
+        # Ensure total unique options is 1 (portfolio) + 3 (unique symbols)
+        self.assertEqual(len(values), 4)
+
+    def test_holding_selection_symbol_lookup(self):
+        # Tests resolving symbol with or without alert indicators
+        test_rows = [
+            (["USD HSBC", "NOK", "Nokia Oyj"], "NOK"),
+            (["USD HSBC", "🎯 NOK", "Nokia Oyj"], "NOK"),
+            (["USD HSBC", "⚠️ TSLA", "Tesla Inc"], "TSLA"),
+            (["NOK"], "NOK"),
+        ]
+        for row_vals, expected in test_rows:
+            raw_sym = ""
+            if len(row_vals) > 1:
+                raw_sym = str(row_vals[1]).replace("🎯 ", "").replace("⚠️ ", "").strip().upper()
+            elif len(row_vals) == 1:
+                raw_sym = str(row_vals[0]).strip().upper()
+            self.assertEqual(raw_sym, expected)
+
+
+class TestTransactionHistory(unittest.TestCase):
+    def setUp(self):
+        self.test_tx_file = "test_tx_history_suite.csv"
+        if os.path.exists(self.test_tx_file):
+            os.remove(self.test_tx_file)
+
+    def tearDown(self):
+        if os.path.exists(self.test_tx_file):
+            os.remove(self.test_tx_file)
+
+    def test_transactions_roundtrip_and_filtering(self):
+        tx_buy = {
+            "type": "BUY",
+            "portfolio": "USD HSBC",
+            "symbol": "VOO",
+            "shares": 10.0,
+            "price": 500.0,
+            "total_amount": 5000.0,
+            "currency": "USD",
+            "notes": "Initial purchase",
+        }
+        tx_sell = {
+            "type": "SELL",
+            "portfolio": "USD HSBC",
+            "symbol": "VOO",
+            "shares": 5.0,
+            "price": 550.0,
+            "total_amount": 2750.0,
+            "cost_basis": 2500.0,
+            "commission_fee": 10.0,
+            "estimated_tax": 30.0,
+            "net_amount": 2710.0,
+            "net_profit": 210.0,
+            "net_roi_pct": 8.4,
+            "currency": "USD",
+            "notes": "Partial profit taking",
+        }
+        tx_cad_buy = {
+            "type": "BUY",
+            "portfolio": "CAD RRSP",
+            "symbol": "VFV:TSE",
+            "shares": 25.0,
+            "price": 120.0,
+            "total_amount": 3000.0,
+            "currency": "CAD",
+            "notes": "RRSP contribution",
+        }
+
+        # Save all 3 transactions
+        save_transactions([tx_buy, tx_sell, tx_cad_buy], self.test_tx_file)
+
+        # 1. Load All
+        all_tx = load_transactions(self.test_tx_file, portfolio_name=None, tx_type=None)
+        self.assertEqual(len(all_tx), 3)
+
+        # 2. Filter by Type: BUY
+        buys = load_transactions(self.test_tx_file, portfolio_name=None, tx_type="BUY")
+        self.assertEqual(len(buys), 2)
+        self.assertTrue(all(b["type"] == "BUY" for b in buys))
+
+        # 3. Filter by Type: SELL
+        sells = load_transactions(self.test_tx_file, portfolio_name=None, tx_type="SELL")
+        self.assertEqual(len(sells), 1)
+        self.assertEqual(sells[0]["type"], "SELL")
+        self.assertEqual(sells[0]["symbol"], "VOO")
+        self.assertEqual(sells[0]["net_profit"], 210.0)
+
+        # 4. Filter by Portfolio: "CAD RRSP"
+        cad_tx = load_transactions(self.test_tx_file, portfolio_name="CAD RRSP", tx_type=None)
+        self.assertEqual(len(cad_tx), 1)
+        self.assertEqual(cad_tx[0]["symbol"], "VFV:TSE")
+
+        # 5. Dual Filter: Portfolio "USD HSBC" + Type "BUY"
+        hsbc_buys = load_transactions(self.test_tx_file, portfolio_name="USD HSBC", tx_type="BUY")
+        self.assertEqual(len(hsbc_buys), 1)
+        self.assertEqual(hsbc_buys[0]["symbol"], "VOO")
+
+        # 6. Append new transaction
+        new_buy = {
+            "type": "BUY",
+            "portfolio": "USD TSFA",
+            "symbol": "AAPL",
+            "shares": 15.0,
+            "price": 220.0,
+            "total_amount": 3300.0,
+            "currency": "USD",
+        }
+        self.assertTrue(append_transaction(new_buy, self.test_tx_file))
+        updated_all = load_transactions(self.test_tx_file, portfolio_name=None, tx_type=None)
+        self.assertEqual(len(updated_all), 4)
+        self.assertEqual(updated_all[0]["symbol"], "AAPL")
+
+
+class TestCsvBackupRotation(unittest.TestCase):
+    def setUp(self):
+        self.test_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_backup_sandbox")
+        os.makedirs(self.test_dir, exist_ok=True)
+        self.test_port_csv = os.path.join(self.test_dir, "test_portfolio.csv")
+        self.test_tx_csv = os.path.join(self.test_dir, "test_transactions.csv")
+        self.backup_dir = os.path.join(self.test_dir, "backups")
+
+    def tearDown(self):
+        import shutil
+        if os.path.exists(self.test_dir):
+            shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def test_portfolio_5_backup_rotation(self):
+        # 1. Save initial version (Save 1) -> No backups yet
+        save_portfolio([{"symbol": "V1", "shares": 1.0, "buy_price": 10.0}], self.test_port_csv)
+        self.assertTrue(os.path.exists(self.test_port_csv))
+        backups = get_backup_files(self.test_port_csv, backup_dir=self.backup_dir)
+        self.assertEqual(len(backups), 0)
+
+        # 2. Save V2 -> 1 backup created (contains V1)
+        save_portfolio([{"symbol": "V2", "shares": 2.0, "buy_price": 20.0}], self.test_port_csv)
+        backups = get_backup_files(self.test_port_csv, backup_dir=self.backup_dir)
+        self.assertEqual(len(backups), 1)
+        self.assertEqual(backups[0]["index"], 1)
+        b1_holdings = load_portfolio(backups[0]["path"], portfolio_name=None)
+        self.assertEqual(b1_holdings[0]["symbol"], "V1")
+
+        # 3. Save V3, V4, V5, V6 -> exactly 5 backups should exist
+        for i in range(3, 7):
+            save_portfolio([{"symbol": f"V{i}", "shares": float(i), "buy_price": 10.0 * i}], self.test_port_csv)
+
+        backups = get_backup_files(self.test_port_csv, backup_dir=self.backup_dir)
+        self.assertEqual(len(backups), 5)
+        # Check slot indices 1..5 exist
+        indices = [b["index"] for b in backups]
+        self.assertEqual(indices, [1, 2, 3, 4, 5])
+        # Slot 1 is newest (V5), Slot 5 is oldest (V1)
+        self.assertEqual(load_portfolio(backups[0]["path"])[0]["symbol"], "V5")
+        self.assertEqual(load_portfolio(backups[4]["path"])[0]["symbol"], "V1")
+
+        # 4. Save V7 -> still capped at 5 backups; V1 purged, slot 5 is V2, slot 1 is V6
+        save_portfolio([{"symbol": "V7", "shares": 7.0, "buy_price": 70.0}], self.test_port_csv)
+        backups = get_backup_files(self.test_port_csv, backup_dir=self.backup_dir)
+        self.assertEqual(len(backups), 5)
+        self.assertEqual(load_portfolio(backups[0]["path"])[0]["symbol"], "V6")
+        self.assertEqual(load_portfolio(backups[4]["path"])[0]["symbol"], "V2")
+
+        # 5. Restore from backup slot 3 (which is V4)
+        ok = restore_backup(self.test_port_csv, backup_index=3, backup_dir=self.backup_dir)
+        self.assertTrue(ok)
+        restored = load_portfolio(self.test_port_csv)
+        self.assertEqual(restored[0]["symbol"], "V4")
+
+        # Verify safety backup retained the prior state (V7) in slot 1
+        backups_after = get_backup_files(self.test_port_csv, backup_dir=self.backup_dir)
+        self.assertEqual(load_portfolio(backups_after[0]["path"])[0]["symbol"], "V7")
+
+    def test_transaction_history_rotation(self):
+        # Save transactions 3 times
+        for i in range(1, 4):
+            tx = {
+                "type": "BUY",
+                "portfolio": "USD HSBC",
+                "symbol": f"TX{i}",
+                "shares": 10.0,
+                "price": 100.0,
+                "total_amount": 1000.0,
+            }
+            save_transactions([tx], self.test_tx_csv)
+
+        backups = get_backup_files(self.test_tx_csv, backup_dir=self.backup_dir)
+        # Save 1: 0 backups; Save 2: 1 backup (TX1); Save 3: 2 backups (.1 has TX2, .2 has TX1)
+        self.assertEqual(len(backups), 2)
+        tx_b1 = load_transactions(backups[0]["path"])
+        self.assertEqual(tx_b1[0]["symbol"], "TX2")
+        tx_b2 = load_transactions(backups[1]["path"])
+        self.assertEqual(tx_b2[0]["symbol"], "TX1")
+
+
+class TestI18nSupport(unittest.TestCase):
+    """Unit tests for multi-language (i18n) support across en, zh_TW, and zh_CN."""
+
+    def setUp(self):
+        from i18n import get_current_language
+        self.orig_lang = get_current_language()
+
+    def tearDown(self):
+        from i18n import set_language
+        set_language(self.orig_lang)
+
+    def test_key_parity_across_languages(self):
+        from i18n import TRANSLATIONS
+        en_keys = set(TRANSLATIONS["en"].keys())
+        tw_keys = set(TRANSLATIONS["zh_TW"].keys())
+        cn_keys = set(TRANSLATIONS["zh_CN"].keys())
+
+        missing_in_tw = en_keys - tw_keys
+        missing_in_cn = en_keys - cn_keys
+
+        self.assertEqual(missing_in_tw, set(), f"zh_TW missing keys: {missing_in_tw}")
+        self.assertEqual(missing_in_cn, set(), f"zh_CN missing keys: {missing_in_cn}")
+        self.assertGreater(len(en_keys), 100, "Should have rich dictionary coverage")
+
+    def test_translation_retrieval_and_switching(self):
+        from i18n import t, set_language, get_current_language
+
+        set_language("en")
+        self.assertEqual(get_current_language(), "en")
+        self.assertEqual(t("app_title"), "Google Finance Portfolio Tracker & Calculator")
+        self.assertEqual(t("btn_add_stock"), "➕ Add Stock")
+
+        set_language("zh_TW")
+        self.assertEqual(get_current_language(), "zh_TW")
+        self.assertEqual(t("app_title"), "Google 財經投資組合追蹤與計算器")
+        self.assertEqual(t("btn_add_stock"), "➕ 新增股票")
+
+        set_language("zh_CN")
+        self.assertEqual(get_current_language(), "zh_CN")
+        self.assertEqual(t("app_title"), "Google 财经投资组合跟踪与计算器")
+        self.assertEqual(t("btn_add_stock"), "➕ 添加股票")
+
+    def test_string_interpolation(self):
+        from i18n import t, set_language
+
+        set_language("en")
+        self.assertEqual(t("showing_holdings", shown=3, total=10), "Showing 3 of 10 holdings")
+        self.assertEqual(t("confirm_delete_holding", sym="MSFT"), "Are you sure you want to remove MSFT from your portfolio?")
+
+        set_language("zh_TW")
+        self.assertEqual(t("showing_holdings", shown=3, total=10), "顯示 3 / 10 隻持倉股票")
+        self.assertEqual(t("confirm_delete_holding", sym="MSFT"), "確定要從投資組合中移除 MSFT 嗎？")
+
+        set_language("zh_CN")
+        self.assertEqual(t("showing_holdings", shown=3, total=10), "显示 3 / 10 只持仓股票")
+        self.assertEqual(t("confirm_delete_holding", sym="MSFT"), "确定要从投资组合中移除 MSFT 吗？")
+
+    def test_fallback_behavior(self):
+        from i18n import t, set_language
+
+        set_language("zh_TW")
+        # Nonexistent key returns the key itself
+        self.assertEqual(t("non_existent_key_xyz"), "non_existent_key_xyz")
+
+    def test_available_languages_list(self):
+        from i18n import get_available_languages
+        langs = get_available_languages()
+        codes = [c for c, _ in langs]
+        self.assertIn("en", codes)
+        self.assertIn("zh_TW", codes)
+        self.assertIn("zh_CN", codes)
+
+    def test_settings_persistence(self):
+        import json
+        from i18n import set_language, SETTINGS_FILE, load_settings
+
+        set_language("zh_TW")
+        settings = load_settings()
+        self.assertEqual(settings.get("language"), "zh_TW")
+
+        set_language("en")
+        settings = load_settings()
+        self.assertEqual(settings.get("language"), "en")
+
+
+class TestHoldingPastAndFutureCalculations(unittest.TestCase):
+    def test_parse_date_to_days_held(self):
+        from datetime import date, timedelta
+        today = date.today()
+        d_100_ago = (today - timedelta(days=100)).strftime("%Y-%m-%d")
+        days, years = parse_date_to_days_held(d_100_ago)
+        self.assertEqual(days, 100)
+        self.assertAlmostEqual(years, 100 / 365.25, places=3)
+
+        # Colloquial format
+        d_may = "7 May 2024"
+        days_may, _ = parse_date_to_days_held(d_may)
+        self.assertGreater(days_may, 0)
+
+        # None / invalid fallback to 365 days / 1 yr
+        d_fallback, y_fallback = parse_date_to_days_held(None)
+        self.assertEqual(d_fallback, 365)
+        self.assertEqual(y_fallback, 1.0)
+
+        d_invalid, y_invalid = parse_date_to_days_held("invalid-date")
+        self.assertEqual(d_invalid, 365)
+        self.assertEqual(y_invalid, 1.0)
+
+    def test_calc_holding_earned_already(self):
+        # 50 shares bought at $100, current price $150, held for 1 year, $2.00 annual div
+        from datetime import date, timedelta
+        d_1yr = (date.today() - timedelta(days=365)).strftime("%Y-%m-%d")
+        res = calc_holding_earned_already(
+            shares=50,
+            buy_price=100.0,
+            current_price=150.0,
+            purchase_date_str=d_1yr,
+            annual_div_per_share=2.0,
+        )
+        self.assertEqual(res["cost_basis"], 5000.0)
+        self.assertEqual(res["market_value"], 7500.0)
+        self.assertEqual(res["capital_gain"], 2500.0)
+        self.assertEqual(res["capital_gain_pct"], 50.0)
+        # Past dividends = 50 * 2.0 * (365/365.25) ~= 100.0
+        self.assertAlmostEqual(res["past_dividends"], 100.0, delta=1.0)
+        # Total earned already = 2500 + past_dividends ~= 2600.0
+        self.assertAlmostEqual(res["total_earned_already"], 2600.0, delta=1.0)
+        self.assertAlmostEqual(res["total_roi_pct"], 52.0, delta=0.5)
+        self.assertGreater(res["cagr_pct"], 45.0)
+
+    def test_calc_future_dividend_milestones(self):
+        # 100 shares @ $50, bought at $40, 4% yield, 5% div growth, 6% price growth
+        res = calc_future_dividend_milestones(
+            shares=100,
+            current_price=50.0,
+            buy_price=40.0,
+            div_yield_pct=4.0,
+            annual_div_per_share=2.0,
+            div_growth_pct=5.0,
+            price_growth_pct=6.0,
+            monthly_contribution=0.0,
+            horizons=[1, 3, 5, 10],
+        )
+        self.assertEqual(res["initial_cost_basis"], 4000.0)
+        self.assertEqual(res["initial_market_value"], 5000.0)
+        milestones = res["milestones"]
+        self.assertIn(1, milestones)
+        self.assertIn(3, milestones)
+        self.assertIn(5, milestones)
+        self.assertIn(10, milestones)
+
+        # Portfolio value grows with compounding DRIP
+        self.assertGreater(milestones[1]["portfolio_value"], 5000.0)
+        self.assertGreater(milestones[3]["portfolio_value"], milestones[1]["portfolio_value"])
+        self.assertGreater(milestones[5]["portfolio_value"], milestones[3]["portfolio_value"])
+        self.assertGreater(milestones[10]["portfolio_value"], milestones[5]["portfolio_value"])
+
+        # Total profit from start and new profit from today
+        self.assertGreater(milestones[5]["new_profit_from_today"], 0.0)
+        self.assertGreater(milestones[5]["total_profit_from_start"], milestones[5]["new_profit_from_today"])
+        self.assertGreater(milestones[5]["cumulative_dividends"], 0.0)
+
+    def test_calc_split_future_projections(self):
+        # 100 shares bought at $80, current price $120, 2:1 split
+        res = calc_split_future_projections(
+            shares=100,
+            buy_price=80.0,
+            current_price=120.0,
+            ratio_from=1.0,
+            ratio_to=2.0,
+            target_price=80.0,
+        )
+        # Earned already
+        self.assertEqual(res["cost_basis"], 8000.0)
+        self.assertEqual(res["market_value"], 12000.0)
+        self.assertEqual(res["earned_already"], 4000.0)
+        self.assertEqual(res["earned_already_pct"], 50.0)
+
+        # Post-split adjustments
+        self.assertEqual(res["multiplier"], 2.0)
+        self.assertEqual(res["new_shares"], 200.0)
+        self.assertEqual(res["new_buy_price"], 40.0)
+        self.assertEqual(res["new_current_price"], 60.0)
+        self.assertEqual(res["new_cost_basis"], 8000.0)
+        self.assertEqual(res["new_market_value"], 12000.0)
+
+        # Scenarios
+        scenarios = res["scenarios"]
+        self.assertEqual(len(scenarios), 4)  # +10%, +25%, +50%, +100%
+        self.assertEqual(scenarios[0]["growth_pct"], 10.0)
+        self.assertEqual(scenarios[0]["future_price"], 66.0)
+        self.assertEqual(scenarios[0]["future_value"], 13200.0)
+        self.assertEqual(scenarios[0]["new_profit_from_today"], 1200.0)
+        self.assertEqual(scenarios[0]["total_profit_from_start"], 5200.0)
+
+        # Pre-split recovery (reaching $120 again)
+        recov = res["pre_split_recovery"]
+        self.assertEqual(recov["target_price"], 120.0)
+        self.assertEqual(recov["future_value"], 24000.0)
+        self.assertEqual(recov["total_profit_from_start"], 16000.0)
+        self.assertEqual(recov["new_profit_from_today"], 12000.0)
+
+        # Custom target price ($80)
+        custom = res["custom_target"]
+        self.assertIsNotNone(custom)
+        self.assertEqual(custom["target_price"], 80.0)
+        self.assertEqual(custom["future_value"], 16000.0)
+        self.assertEqual(custom["total_profit_from_start"], 8000.0)
+        self.assertEqual(custom["new_profit_from_today"], 4000.0)
+
+
 if __name__ == "__main__":
     unittest.main()
+
+

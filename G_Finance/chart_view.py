@@ -59,6 +59,7 @@ class GoogleFinanceChartView(ttk.Frame):
 
         self.chart_data: Optional[Dict[str, Any]] = None
         self.is_loading = False
+        self.is_running = True
         self.use_matplotlib = MATPLOTLIB_AVAILABLE
 
         self._build_ui()
@@ -270,23 +271,40 @@ class GoogleFinanceChartView(ttk.Frame):
     def _populate_scope_dropdown(self):
         holdings = self.get_holdings(self.current_portfolio_name)
         values = [f"📁 Portfolio: {self.current_portfolio_name}"]
+        seen_syms = set()
         for h in holdings:
-            sym = h.get("symbol", "")
+            sym = str(h.get("symbol", "")).strip()
+            if not sym:
+                continue
+            sym_key = sym.upper()
+            if sym_key in seen_syms:
+                continue
+            seen_syms.add(sym_key)
             name = h.get("name", "")
             display = f"{sym} - {name}" if name else sym
             values.append(display)
 
         self.scope_combo.config(values=values)
-        if self.current_scope == "portfolio" or not any(v.startswith(self.current_scope) for v in values):
-            self.scope_combo.current(0)
-            self.current_scope = "portfolio"
-        else:
+        matched_idx = None
+        if self.current_scope != "portfolio":
             for idx, v in enumerate(values):
-                if v.startswith(self.current_scope):
-                    self.scope_combo.current(idx)
+                if v == self.current_scope or v.startswith(f"{self.current_scope} - "):
+                    matched_idx = idx
                     break
 
+        if matched_idx is not None:
+            self.scope_combo.current(matched_idx)
+        else:
+            self.scope_combo.current(0)
+            self.current_scope = "portfolio"
+
+    def cleanup(self):
+        self.is_running = False
+        self.is_loading = False
+
     def refresh_chart(self):
+        if not getattr(self, "is_running", True):
+            return
         if self.is_loading:
             return
         self.is_loading = True
@@ -295,6 +313,8 @@ class GoogleFinanceChartView(ttk.Frame):
         threading.Thread(target=self._fetch_and_render_thread, daemon=True).start()
 
     def _fetch_and_render_thread(self):
+        if not getattr(self, "is_running", True):
+            return
         fetcher = get_chart_fetcher()
         converter = self.get_converter()
 
@@ -311,6 +331,8 @@ class GoogleFinanceChartView(ttk.Frame):
         else:
             data = fetcher.fetch_symbol_history(self.current_scope, self.current_timeframe)
 
+        if not getattr(self, "is_running", True):
+            return
         self.chart_data = data
         self.is_loading = False
         try:
