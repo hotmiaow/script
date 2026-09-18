@@ -2986,7 +2986,7 @@ if HAS_TKINTER:
             self.search_entry.focus_set()
             self.search_entry.icursor(tk.END)
             self._perform_search()
-            self._set_action_status("success", f"🎯 Filtered search to file: '{fname}'")
+            self._set_action_status("success", f"🎯 Filtered search to file: '{display_fname}'")
 
         def _clear_search(self):
             self.search_var.set("")

@@ -273,5 +273,99 @@ class TestMultiPortfolio(unittest.TestCase):
         self.assertEqual(len(all_left), 2)
 
 
+from financial_calc import calc_portfolio_metrics
+from report_generator import generate_html_report
+from chart_canvas import draw_donut_chart, draw_drip_growth_chart
+
+
+class TestPortfolioMetrics(unittest.TestCase):
+    def test_metrics_calculation(self):
+        holdings = [
+            {
+                "symbol": "AAPL",
+                "name": "Apple Inc",
+                "shares": 10.0,
+                "buy_price": 150.0,
+                "current_price": 200.0,
+                "currency": "USD",
+                "annual_dividend": 25.0,
+                "change": 2.50,
+                "unrealized_gain_pct": 33.33,
+            },
+            {
+                "symbol": "600519",
+                "name": "Kweichow Moutai",
+                "shares": 100.0,
+                "buy_price": 1600.0,
+                "current_price": 1800.0,
+                "currency": "CNY",
+                "annual_dividend": 3000.0,
+                "change": 15.0,
+                "unrealized_gain_pct": 12.50,
+            },
+        ]
+        # 1 CNY = 0.14 USD
+        fx_rates = {"CNY": 0.14}
+        metrics = calc_portfolio_metrics(holdings, base_currency="USD", fx_rates=fx_rates)
+
+        self.assertEqual(metrics["base_currency"], "USD")
+        # AAPL val = 10 * 200 = 2000 USD
+        # Moutai val = 100 * 1800 * 0.14 = 25200 USD
+        # Total val = 27200 USD
+        self.assertEqual(metrics["total_value"], 27200.0)
+        # Cost: AAPL 1500 + Moutai 160000 * 0.14 = 22400 -> 23900 USD
+        self.assertEqual(metrics["total_cost"], 23900.0)
+        self.assertAlmostEqual(metrics["total_gain"], 3300.0, places=1)
+        self.assertGreater(metrics["top_concentration_pct"], 90.0)
+        self.assertEqual(metrics["best_performer"]["symbol"], "AAPL")
+        self.assertEqual(metrics["worst_performer"]["symbol"], "600519")
+
+
+class TestReportGenerator(unittest.TestCase):
+    def setUp(self):
+        self.report_file = "test_exec_report.html"
+
+    def tearDown(self):
+        if os.path.exists(self.report_file):
+            os.remove(self.report_file)
+
+    def test_html_report_generation(self):
+        holdings = [
+            {
+                "symbol": "MSFT",
+                "name": "Microsoft Corporation",
+                "shares": 15.0,
+                "buy_price": 350.0,
+                "current_price": 420.0,
+                "market_value": 6300.0,
+                "cost_basis": 5250.0,
+                "unrealized_gain": 1050.0,
+                "unrealized_gain_pct": 20.0,
+                "change": 3.20,
+                "change_percent": 0.77,
+                "dividend_yield": 0.8,
+                "annual_dividend": 45.0,
+                "currency": "USD",
+                "portfolio": "USD HSBC",
+            }
+        ]
+        metrics = calc_portfolio_metrics(holdings, base_currency="USD")
+        ok = generate_html_report(
+            holdings=holdings,
+            portfolio_metrics=metrics,
+            sales_history=[],
+            filepath=self.report_file,
+        )
+        self.assertTrue(ok)
+        self.assertTrue(os.path.exists(self.report_file))
+
+        with open(self.report_file, "r", encoding="utf-8") as f:
+            content = f.read()
+        self.assertIn("Microsoft Corporation", content)
+        self.assertIn("MSFT", content)
+        self.assertIn("Google Finance Portfolio Executive Report", content)
+        self.assertIn("$6,300.00", content)
+
+
 if __name__ == "__main__":
     unittest.main()

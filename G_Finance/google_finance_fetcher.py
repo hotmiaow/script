@@ -24,6 +24,56 @@ class GoogleFinanceFetcher:
         self.session = requests.Session()
         self.session.headers.update(self.DEFAULT_HEADERS)
         self.timeout = timeout
+        self.fx_cache: Dict[str, float] = {}
+
+    def fetch_fx_rate(self, from_curr: str, to_curr: str) -> float:
+        """
+        Fetches live currency conversion rate (e.g. from CNY to USD).
+        Uses memory cache and queries Google Finance FX pair (e.g. CNY-USD).
+        """
+        f = from_curr.strip().upper()
+        t = to_curr.strip().upper()
+        if f == t or not f or not t:
+            return 1.0
+
+        pair_key = f"{f}_{t}"
+        if pair_key in self.fx_cache:
+            return self.fx_cache[pair_key]
+
+        baselines = {
+            "CNY_USD": 0.14,
+            "USD_CNY": 7.15,
+            "EUR_USD": 1.08,
+            "USD_EUR": 0.92,
+            "GBP_USD": 1.30,
+            "USD_GBP": 0.77,
+            "CAD_USD": 0.74,
+            "USD_CAD": 1.36,
+            "JPY_USD": 0.0068,
+            "USD_JPY": 147.0,
+            "HKD_USD": 0.128,
+            "USD_HKD": 7.80,
+        }
+
+        quote_pair = f"{f}-{t}"
+        quote = self.fetch_quote(quote_pair)
+        if quote.get("success") and quote.get("price", 0.0) > 0:
+            rate = float(quote["price"])
+            self.fx_cache[pair_key] = rate
+            if rate > 0:
+                self.fx_cache[f"{t}_{f}"] = round(1.0 / rate, 6)
+            return rate
+
+        inv_pair = f"{t}-{f}"
+        inv_quote = self.fetch_quote(inv_pair)
+        if inv_quote.get("success") and inv_quote.get("price", 0.0) > 0:
+            rate = round(1.0 / float(inv_quote["price"]), 6)
+            self.fx_cache[pair_key] = rate
+            return rate
+
+        fallback = baselines.get(pair_key, 1.0)
+        self.fx_cache[pair_key] = fallback
+        return fallback
 
     def _clean_number(self, text: Optional[str]) -> Optional[float]:
         if not text:

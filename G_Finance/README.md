@@ -75,6 +75,36 @@ A Python desktop GUI application that auto-receives live stock and market inform
 - **`sales_history.csv`**: Automatically maintains a transaction log of all recorded sales with dates, proceeds, and realized profits.
 - **Import / Export**: Dedicated UI buttons to import custom portfolio CSV files or export timestamped CSV copies anytime.
 
+### 7. Visual Analytics & Allocation Charts
+- **Native Canvas Donut Chart**: Visualizes asset allocation by market value with color-coded slices, center total valuation, and interactive legend with portfolio weight percentages.
+- **Portfolio Health & Concentration**: Real-time concentration metrics including top position weight %, portfolio Yield on Cost (YoC), average dividend yield, and best/worst performers.
+- **Ranked Position Weights**: Tabular view of all assets sorted by capital allocation weight.
+
+### 8. Multi-Currency & Live FX Conversion
+- **Universal Multi-Currency Support**: Handles holdings denominated in `USD`, `EUR`, `GBP`, `CAD`, `CNY` (Shanghai/SSE stocks), `HKD`, `JPY`, or `Native`.
+- **Live Google Finance FX Rates**: Direct real-time scraping and caching of currency exchange pairs (e.g. `CNY-USD`, `EUR-USD`, `GBP-USD`, `CAD-USD`).
+- **Dynamic Valuation Conversion**: Instantly converts all cards, totals, and analytics into any chosen base currency while preserving native transaction prices.
+
+### 9. Real-Time Search, Filtering & Bi-Directional Sorting
+- **Instant Search Bar**: Filter holdings in real time across symbols, asset names, and portfolio tags.
+- **Performance Filter Pills**: One-click quick filters for `All`, `Gainers ▲`, and `Losers ▼` with active position count indicators.
+- **Bi-Directional Column Headers**: Click any column header to toggle ascending/descending sorting (`▲`/`▼`) across numeric and textual fields.
+
+### 10. Price Targets & Stop-Loss Visual Alerts
+- Configure optional target sell prices and stop-loss levels per holding.
+- Visual alerts appear directly on holdings:
+  - `🎯 Target Hit!`: Position price has met or exceeded target profit price.
+  - `⚠️ Stop Loss!`: Position price has fallen to or below risk threshold.
+
+### 11. Dark Mode / Light Mode Themes
+- Instant 1-click theme switching between clean **Modern Light** and eye-friendly charcoal **Dark Mode**.
+- Synchronizes all panels, cards, tables, charts, and status bars.
+
+### 12. Executive Summary HTML & PDF Reports
+- One-click export to a responsive, executive portfolio report (`portfolio_report.html`).
+- Features executive KPI summary cards, full active holdings table, day changes, and sales logs.
+- Integrated `🖨️ Print / Save as PDF` button formatted for physical print or digital PDF export.
+
 ---
 
 ## File Structure
@@ -82,12 +112,18 @@ A Python desktop GUI application that auto-receives live stock and market inform
 ```
 /home/keith/gemini/G_Finance/
 ├── app.py                      # Application launcher entrypoint
-├── main_gui.py                 # Main Tkinter desktop GUI (5 tabs, cards, auto-updater)
-├── google_finance_fetcher.py   # Google Finance live parser & exchange resolver
-├── financial_calc.py           # Financial calculation engine (dividends, splits, sales, DRIP)
-├── csv_manager.py              # CSV save/load/append manager
-├── test_suite.py               # Unit tests verifying calculations and CSV operations
-├── portfolio.csv               # Live portfolio holdings data
+├── main_gui.py                 # Main Tkinter desktop GUI (7 tabs, charts, dark mode)
+├── chart_canvas.py             # Native Tkinter Canvas chart engine (Donut & DRIP compounding)
+├── report_generator.py         # Executive HTML / PDF portfolio report generator
+├── chart_view.py               # Google Finance style interactive chart view
+├── chart_fetcher.py            # Historical chart data fetcher
+├── currency_converter.py       # Multi-currency manager with live FX thread
+├── google_finance_fetcher.py   # Google Finance live quote & FX pair scraper
+├── google_account_sync.py      # Google Finance account sync & Beta HTML parser
+├── financial_calc.py           # Financial calculation engine & portfolio metrics
+├── csv_manager.py              # Multi-portfolio CSV storage & sales history
+├── test_suite.py               # Automated unit test suite (17 tests)
+├── portfolio.csv               # Active holdings data
 └── sales_history.csv           # Sales & trade history log
 ```
 

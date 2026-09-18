@@ -15,6 +15,7 @@ from typing import Dict, Any, List, Optional
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
+import webbrowser
 from google_finance_fetcher import GoogleFinanceFetcher
 from google_account_sync import (
     GoogleAccountSync,
@@ -29,7 +30,10 @@ from financial_calc import (
     calc_selling_proceeds,
     calc_breakeven_sell_price,
     calc_target_profit_sell_price,
+    calc_portfolio_metrics,
 )
+from chart_canvas import draw_donut_chart, draw_drip_growth_chart, ChartTheme
+from report_generator import generate_html_report
 from currency_converter import get_currency_converter
 from chart_view import GoogleFinanceChartView
 from csv_manager import (
@@ -82,6 +86,13 @@ class ModernPortfolioApp:
         self.refresh_interval_sec: int = 30
         self.auto_refresh_enabled: bool = True
 
+        # Theme, Search & Filter state
+        self.dark_mode: bool = False
+        self.search_filter_var = tk.StringVar()
+        self.filter_performance: str = "All"
+        self.sort_col: Optional[str] = None
+        self.sort_reverse: bool = False
+
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
         # Configure style
@@ -102,6 +113,7 @@ class ModernPortfolioApp:
         self._refresh_sales_table()
         self._update_metric_cards()
         self._refresh_dropdowns()
+        self._refresh_analytics_tab()
         if hasattr(self, "chart_view"):
             self.chart_view.update_portfolio(self.current_portfolio, self.summary_currency)
 
@@ -119,15 +131,37 @@ class ModernPortfolioApp:
             self.style.theme_use("clam")
         except Exception:
             pass
+        self._apply_theme_colors()
 
-        # Color palette
-        self.bg_main = "#f4f6f9"
-        self.card_bg = "#ffffff"
-        self.primary_color = "#1a73e8"
-        self.text_dark = "#202124"
-        self.text_muted = "#5f6368"
-        self.green_color = "#0f9d58"
-        self.red_color = "#d93025"
+    def _apply_theme_colors(self):
+        if getattr(self, "dark_mode", False):
+            self.bg_main = "#1e222d"
+            self.card_bg = "#2a2e39"
+            self.primary_color = "#8ab4f8"
+            self.text_dark = "#e8eaed"
+            self.text_muted = "#9aa0a6"
+            self.green_color = "#81c995"
+            self.red_color = "#f28b82"
+            self.tab_inactive_bg = "#2d3342"
+            self.tree_bg = "#252a36"
+            self.tree_fg = "#e8eaed"
+            self.tree_heading_bg = "#1e222d"
+            self.tree_select_bg = "#3c4043"
+            self.tree_select_fg = "#8ab4f8"
+        else:
+            self.bg_main = "#f4f6f9"
+            self.card_bg = "#ffffff"
+            self.primary_color = "#1a73e8"
+            self.text_dark = "#202124"
+            self.text_muted = "#5f6368"
+            self.green_color = "#0f9d58"
+            self.red_color = "#d93025"
+            self.tab_inactive_bg = "#e0e4e9"
+            self.tree_bg = "#ffffff"
+            self.tree_fg = "#202124"
+            self.tree_heading_bg = "#e8eaed"
+            self.tree_select_bg = "#d2e3fc"
+            self.tree_select_fg = "#174ea6"
 
         self.root.configure(bg=self.bg_main)
         self.style.configure(".", background=self.bg_main, foreground=self.text_dark)
@@ -138,34 +172,83 @@ class ModernPortfolioApp:
         self.style.configure("TNotebook", background=self.bg_main, tabmargins=[6, 5, 2, 0])
         self.style.configure(
             "TNotebook.Tab",
-            background="#e0e4e9",
+            background=self.tab_inactive_bg,
             foreground=self.text_dark,
-            padding=[16, 8],
-            font=("Segoe UI", 10, "bold"),
+            padding=[14, 7],
+            font=("Segoe UI", 9, "bold"),
         )
         self.style.map(
             "TNotebook.Tab",
             background=[("selected", self.primary_color)],
-            foreground=[("selected", "#ffffff")],
+            foreground=[("selected", "#ffffff" if not self.dark_mode else "#1e222d")],
         )
 
         # Treeview styling
         self.style.configure(
             "Treeview",
-            background="#ffffff",
-            foreground=self.text_dark,
-            fieldbackground="#ffffff",
+            background=self.tree_bg,
+            foreground=self.tree_fg,
+            fieldbackground=self.tree_bg,
             rowheight=28,
             font=("Segoe UI", 9),
         )
         self.style.configure(
             "Treeview.Heading",
-            background="#e8eaed",
+            background=self.tree_heading_bg,
             foreground=self.text_dark,
             font=("Segoe UI", 9, "bold"),
             relief="flat",
         )
-        self.style.map("Treeview", background=[("selected", "#d2e3fc")], foreground=[("selected", "#174ea6")])
+        self.style.map("Treeview", background=[("selected", self.tree_select_bg)], foreground=[("selected", self.tree_select_fg)])
+
+    def _toggle_theme(self):
+        self.dark_mode = not self.dark_mode
+        self._apply_theme_colors()
+        if hasattr(self, "btn_theme_toggle"):
+            self.btn_theme_toggle.config(
+                text="☀️ Light" if self.dark_mode else "🌙 Dark",
+                bg="#3c4043" if self.dark_mode else "#ffffff",
+                fg="#fbbc04" if self.dark_mode else "#202124",
+            )
+        if hasattr(self, "lbl_title"):
+            self.lbl_title.config(bg=self.bg_main, fg=self.primary_color)
+        if hasattr(self, "status_frame"):
+            self.status_frame.config(bg=self.card_bg)
+        if hasattr(self, "lbl_status"):
+            self.lbl_status.config(bg=self.card_bg, fg=self.text_muted)
+        if hasattr(self, "lbl_time"):
+            self.lbl_time.config(bg=self.card_bg, fg=self.text_muted)
+        if hasattr(self, "card_frames"):
+            for cf in self.card_frames:
+                cf.config(bg=self.card_bg)
+        if hasattr(self, "card_titles"):
+            for lbl in self.card_titles.values():
+                lbl.config(bg=self.card_bg, fg=self.text_muted)
+        if hasattr(self, "cards"):
+            for k, lbl in self.cards.items():
+                lbl.config(bg=self.card_bg)
+        if hasattr(self, "analytics_left_box"):
+            self.analytics_left_box.config(bg=self.card_bg, fg=self.primary_color)
+        if hasattr(self, "analytics_right_box"):
+            self.analytics_right_box.config(bg=self.card_bg, fg=self.primary_color)
+        if hasattr(self, "analytics_kpis"):
+            for cell, lbl_t, lbl_v in self.analytics_kpis.values():
+                cell.config(bg=self.card_bg)
+                lbl_t.config(bg=self.card_bg, fg=self.text_muted)
+                lbl_v.config(bg=self.card_bg)
+        for tree in [getattr(self, "holdings_tree", None), getattr(self, "history_tree", None), getattr(self, "alloc_tree", None), getattr(self, "drip_tree", None)]:
+            if tree:
+                tree.tag_configure("positive", foreground=self.green_color)
+                tree.tag_configure("negative", foreground=self.red_color)
+                tree.tag_configure("neutral", foreground=self.tree_fg)
+        self._update_filter_button_styles()
+        self._refresh_holdings_table()
+        self._refresh_analytics_tab()
+        if hasattr(self, "drip_canvas"):
+            self._calc_drip_results()
+        if hasattr(self, "chart_view"):
+            self.chart_view.update_portfolio(self.current_portfolio, self.summary_currency)
+        self._set_status(f"Switched to {'Dark' if self.dark_mode else 'Light'} theme.")
 
     # -------------------------------------------------------------
     # Top Bar with Google Sync, Add/Remove, and Auto-Refresh
@@ -177,14 +260,14 @@ class ModernPortfolioApp:
         # Title
         title_box = ttk.Frame(top_frame)
         title_box.pack(side=tk.LEFT)
-        lbl_title = tk.Label(
+        self.lbl_title = tk.Label(
             title_box,
             text="📈 Google Finance Portfolio Tracker",
             font=("Segoe UI", 14, "bold"),
             bg=self.bg_main,
             fg=self.primary_color,
         )
-        lbl_title.pack(anchor="w")
+        self.lbl_title.pack(anchor="w")
 
         # Action and control buttons on right
         ctrl_box = ttk.Frame(top_frame)
@@ -203,7 +286,7 @@ class ModernPortfolioApp:
             pady=3,
             command=self._open_sync_dialog,
         )
-        btn_sync.pack(side=tk.LEFT, padx=(0, 10))
+        btn_sync.pack(side=tk.LEFT, padx=(0, 8))
 
         # Add Stock button
         btn_add = tk.Button(
@@ -214,7 +297,7 @@ class ModernPortfolioApp:
             fg="#ffffff",
             activebackground="#1557b0",
             relief="flat",
-            padx=10,
+            padx=8,
             pady=3,
             command=self._open_add_dialog,
         )
@@ -234,27 +317,12 @@ class ModernPortfolioApp:
             pady=3,
             command=self._delete_selected_holding,
         )
-        btn_remove.pack(side=tk.LEFT, padx=(0, 10))
+        btn_remove.pack(side=tk.LEFT, padx=(0, 8))
 
-        # Auto-Refresh controls
-        tk.Label(ctrl_box, text="Auto-Receive:", font=("Segoe UI", 9, "bold"), bg=self.bg_main).pack(
-            side=tk.LEFT, padx=(0, 4)
-        )
-
-        self.interval_var = tk.StringVar(value="30s")
-        interval_menu = ttk.Combobox(
+        # Export Executive HTML Report
+        btn_report = tk.Button(
             ctrl_box,
-            textvariable=self.interval_var,
-            values=["Off", "15s", "30s", "1 min", "2 min", "5 min"],
-            width=7,
-            state="readonly",
-        )
-        interval_menu.pack(side=tk.LEFT, padx=(0, 6))
-        interval_menu.bind("<<ComboboxSelected>>", self._on_interval_changed)
-
-        btn_refresh = tk.Button(
-            ctrl_box,
-            text="🔄 Refresh Now",
+            text="📄 Report",
             font=("Segoe UI", 9, "bold"),
             bg="#ffffff",
             fg=self.primary_color,
@@ -263,31 +331,77 @@ class ModernPortfolioApp:
             bd=1,
             padx=8,
             pady=3,
-            command=self.fetch_all_quotes,
+            command=self._export_html_report_dialog,
         )
-        btn_refresh.pack(side=tk.LEFT, padx=(0, 6))
+        btn_report.pack(side=tk.LEFT, padx=(0, 6))
 
-        btn_import = tk.Button(
+        # Theme toggle button
+        self.btn_theme_toggle = tk.Button(
             ctrl_box,
-            text="📂 Import CSV",
-            font=("Segoe UI", 9),
+            text="🌙 Dark",
+            font=("Segoe UI", 9, "bold"),
             bg="#ffffff",
+            fg="#202124",
             relief="solid",
             bd=1,
             padx=6,
             pady=3,
-            command=self._import_csv_dialog,
+            command=self._toggle_theme,
         )
-        btn_import.pack(side=tk.LEFT, padx=(0, 4))
+        self.btn_theme_toggle.pack(side=tk.LEFT, padx=(0, 8))
 
-        btn_export = tk.Button(
+        # Auto-Refresh controls
+        tk.Label(ctrl_box, text="Auto:", font=("Segoe UI", 9, "bold"), bg=self.bg_main).pack(
+            side=tk.LEFT, padx=(0, 4)
+        )
+
+        self.interval_var = tk.StringVar(value="30s")
+        interval_menu = ttk.Combobox(
             ctrl_box,
-            text="💾 Export CSV",
-            font=("Segoe UI", 9),
+            textvariable=self.interval_var,
+            values=["Off", "15s", "30s", "1 min", "2 min", "5 min"],
+            width=6,
+            state="readonly",
+        )
+        interval_menu.pack(side=tk.LEFT, padx=(0, 6))
+        interval_menu.bind("<<ComboboxSelected>>", self._on_interval_changed)
+
+        btn_refresh = tk.Button(
+            ctrl_box,
+            text="🔄 Refresh",
+            font=("Segoe UI", 9, "bold"),
             bg="#ffffff",
+            fg=self.primary_color,
+            activebackground="#e8f0fe",
             relief="solid",
             bd=1,
             padx=6,
+            pady=3,
+            command=self.fetch_all_quotes,
+        )
+        btn_refresh.pack(side=tk.LEFT, padx=(0, 4))
+
+        btn_import = tk.Button(
+            ctrl_box,
+            text="📂 CSV",
+            font=("Segoe UI", 8),
+            bg="#ffffff",
+            relief="solid",
+            bd=1,
+            padx=4,
+            pady=3,
+            command=self._import_csv_dialog,
+        )
+        btn_import.pack(side=tk.LEFT, padx=(0, 2))
+
+        btn_export = tk.Button(
+            ctrl_box,
+            text="💾 CSV",
+            font=("Segoe UI", 8),
+            bg="#ffffff",
+            relief="solid",
+            bd=1,
+            padx=4,
             pady=3,
             command=self._export_csv_dialog,
         )
@@ -365,7 +479,7 @@ class ModernPortfolioApp:
         self.curr_combo = ttk.Combobox(
             curr_box,
             textvariable=self.summary_curr_var,
-            values=["USD", "CAD", "HKD", "Native"],
+            values=["USD", "EUR", "GBP", "CAD", "CNY", "HKD", "JPY", "Native"],
             width=8,
             state="readonly",
             font=("Segoe UI", 9, "bold")
@@ -427,6 +541,7 @@ class ModernPortfolioApp:
         self._refresh_sales_table()
         self._update_metric_cards()
         self._refresh_dropdowns()
+        self._refresh_analytics_tab()
         if hasattr(self, "chart_view"):
             self.chart_view.update_portfolio(sel, self.summary_currency)
         self._set_status(f"Switched to {sel} ({len(self.holdings)} holdings, {len(self.sales_history)} sales).")
@@ -451,6 +566,7 @@ class ModernPortfolioApp:
         self._refresh_holdings_table()
         self._update_metric_cards()
         self._refresh_dropdowns()
+        self._refresh_analytics_tab()
         self._set_status(f"Created new empty portfolio: {name}")
 
     def _rename_current_portfolio(self):
@@ -489,6 +605,7 @@ class ModernPortfolioApp:
         self.summary_currency = self.summary_curr_var.get()
         self._update_metric_cards()
         self._refresh_sales_table()
+        self._refresh_analytics_tab()
         if hasattr(self, "chart_view"):
             self.chart_view.update_portfolio(self.current_portfolio, self.summary_currency)
         self.lbl_fx_badge.config(text=self.converter.get_rates_summary(self.summary_currency))
@@ -502,6 +619,7 @@ class ModernPortfolioApp:
         self.lbl_fx_badge.config(text=self.converter.get_rates_summary(self.summary_currency))
         self._update_metric_cards()
         self._refresh_sales_table()
+        self._refresh_analytics_tab()
         self._set_status(f"Updated live exchange rates.")
 
     def _build_metric_cards(self):
@@ -510,6 +628,7 @@ class ModernPortfolioApp:
 
         self.cards = {}
         self.card_titles = {}
+        self.card_frames = []
         metrics = [
             ("total_value", "Portfolio Value (USD)", "$0.00", self.text_dark),
             ("total_cost", "Total Cost Basis (USD)", "$0.00", self.text_muted),
@@ -519,14 +638,15 @@ class ModernPortfolioApp:
         ]
 
         for i, (key, title, default_val, default_color) in enumerate(metrics):
-            card = tk.Frame(cards_frame, bg="#ffffff", bd=1, relief="solid", padx=12, pady=8)
+            card = tk.Frame(cards_frame, bg=self.card_bg, bd=1, relief="solid", padx=12, pady=8)
             card.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=4 if i > 0 else (0, 4))
+            self.card_frames.append(card)
 
-            lbl_title = tk.Label(card, text=title, font=("Segoe UI", 8, "bold"), bg="#ffffff", fg=self.text_muted)
+            lbl_title = tk.Label(card, text=title, font=("Segoe UI", 8, "bold"), bg=self.card_bg, fg=self.text_muted)
             lbl_title.pack(anchor="w")
             self.card_titles[key] = lbl_title
 
-            lbl_val = tk.Label(card, text=default_val, font=("Segoe UI", 12, "bold"), bg="#ffffff", fg=default_color)
+            lbl_val = tk.Label(card, text=default_val, font=("Segoe UI", 12, "bold"), bg=self.card_bg, fg=default_color)
             lbl_val.pack(anchor="w", pady=(2, 0))
 
             self.cards[key] = lbl_val
@@ -537,33 +657,210 @@ class ModernPortfolioApp:
 
         # Tab 1: Portfolio Holdings
         self.tab_holdings = ttk.Frame(self.notebook)
-        self.notebook.add(self.tab_holdings, text=" 📊 Portfolio Holdings ")
+        self.notebook.add(self.tab_holdings, text=" 📋 Portfolio Holdings ")
         self._build_holdings_tab()
 
-        # Tab 2: Interactive Chart (Google Finance style)
+        # Tab 2: Allocation & Analytics
+        self.tab_analytics = ttk.Frame(self.notebook)
+        self.notebook.add(self.tab_analytics, text=" 📊 Allocation & Analytics ")
+        self._build_analytics_tab()
+
+        # Tab 3: Interactive Chart (Google Finance style)
         self.tab_chart = ttk.Frame(self.notebook)
         self.notebook.add(self.tab_chart, text=" 📈 Interactive Chart ")
         self._build_chart_tab()
 
-        # Tab 3: Dividend & DRIP Calculator
+        # Tab 4: Dividend & DRIP Calculator
         self.tab_dividend = ttk.Frame(self.notebook)
         self.notebook.add(self.tab_dividend, text=" 💵 Dividend & DRIP Calculator ")
         self._build_dividend_tab()
 
-        # Tab 4: Stock Division / Split
+        # Tab 5: Stock Division / Split
         self.tab_split = ttk.Frame(self.notebook)
         self.notebook.add(self.tab_split, text=" ✂️ Stock Division (Split) ")
         self._build_split_tab()
 
-        # Tab 5: Selling Calculator
+        # Tab 6: Selling Calculator
         self.tab_sell = ttk.Frame(self.notebook)
         self.notebook.add(self.tab_sell, text=" 🏷️ Selling & Profit Calculator ")
         self._build_selling_tab()
 
-        # Tab 6: Trade History
+        # Tab 7: Trade History
         self.tab_history = ttk.Frame(self.notebook)
         self.notebook.add(self.tab_history, text=" 📜 Sales History ")
         self._build_history_tab()
+
+        self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
+
+    def _on_tab_changed(self, event=None):
+        if not hasattr(self, "notebook"):
+            return
+        try:
+            sel_tab_id = self.notebook.select()
+            if hasattr(self, "tab_analytics") and sel_tab_id == str(self.tab_analytics):
+                self.root.after(10, self._refresh_analytics_tab)
+            elif hasattr(self, "tab_chart") and sel_tab_id == str(self.tab_chart):
+                if hasattr(self, "chart_view"):
+                    self.chart_view.update_portfolio(self.current_portfolio, self.summary_currency)
+        except Exception:
+            pass
+
+    def _build_analytics_tab(self):
+        tab = self.tab_analytics
+        container = ttk.Frame(tab, padding=10)
+        container.pack(fill=tk.BOTH, expand=True)
+
+        # Left: Donut Chart Canvas
+        left_box = tk.LabelFrame(
+            container,
+            text=" Asset Allocation (By Market Value) ",
+            font=("Segoe UI", 10, "bold"),
+            bg=self.card_bg,
+            fg=self.primary_color,
+            padx=8,
+            pady=8,
+        )
+        left_box.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 8))
+        self.analytics_left_box = left_box
+
+        self.donut_canvas = tk.Canvas(left_box, bg=self.card_bg, highlightthickness=0)
+        self.donut_canvas.pack(fill=tk.BOTH, expand=True)
+        self.donut_canvas.bind("<Configure>", lambda e: self._draw_donut())
+
+        # Right: KPI Cards and Concentration Weights
+        right_box = tk.LabelFrame(
+            container,
+            text=" Portfolio Health & Concentration ",
+            font=("Segoe UI", 10, "bold"),
+            bg=self.card_bg,
+            fg=self.primary_color,
+            padx=10,
+            pady=8,
+            width=420,
+        )
+        right_box.pack(side=tk.RIGHT, fill=tk.BOTH, expand=False)
+        self.analytics_right_box = right_box
+
+        # KPI mini cards in 2x3 grid
+        kpi_grid = ttk.Frame(right_box)
+        kpi_grid.pack(fill=tk.X, pady=(0, 10))
+
+        self.analytics_kpis = {}
+        items = [
+            ("top_asset", "Top Position:", "-", self.primary_color),
+            ("concentration", "Concentration:", "0.0%", self.text_dark),
+            ("portfolio_yoc", "Portfolio YoC:", "0.00%", self.green_color),
+            ("div_yield", "Overall Div Yield:", "0.00%", self.primary_color),
+            ("best_performer", "Best Performer:", "-", self.green_color),
+            ("worst_performer", "Worst Performer:", "-", self.red_color),
+        ]
+
+        for idx, (k, label, def_val, col) in enumerate(items):
+            r = idx // 2
+            c = idx % 2
+            cell = tk.Frame(kpi_grid, bg=self.card_bg, bd=1, relief="solid", padx=8, pady=6)
+            cell.grid(row=r, column=c, sticky="nsew", padx=3, pady=3)
+            kpi_grid.columnconfigure(c, weight=1)
+
+            lbl_t = tk.Label(cell, text=label, font=("Segoe UI", 8), bg=self.card_bg, fg=self.text_muted)
+            lbl_t.pack(anchor="w")
+            lbl_v = tk.Label(cell, text=def_val, font=("Segoe UI", 10, "bold"), bg=self.card_bg, fg=col)
+            lbl_v.pack(anchor="w")
+            self.analytics_kpis[k] = (cell, lbl_t, lbl_v)
+
+        # Ranked Position Weights Tree
+        tk.Label(
+            right_box,
+            text="Ranked Position Weights",
+            font=("Segoe UI", 9, "bold"),
+            bg=self.card_bg,
+            fg=self.text_dark,
+        ).pack(anchor="w", pady=(6, 4))
+
+        breakdown_frame = ttk.Frame(right_box)
+        breakdown_frame.pack(fill=tk.BOTH, expand=True)
+
+        cols = ("symbol", "name", "value", "weight")
+        self.alloc_tree = ttk.Treeview(breakdown_frame, columns=cols, show="headings", height=8)
+        self.alloc_tree.heading("symbol", text="Symbol")
+        self.alloc_tree.column("symbol", width=70, anchor="center")
+        self.alloc_tree.heading("name", text="Company / Asset")
+        self.alloc_tree.column("name", width=125, anchor="w")
+        self.alloc_tree.heading("value", text="Market Value")
+        self.alloc_tree.column("value", width=95, anchor="e")
+        self.alloc_tree.heading("weight", text="Weight")
+        self.alloc_tree.column("weight", width=70, anchor="e")
+
+        alloc_scroll = ttk.Scrollbar(breakdown_frame, orient=tk.VERTICAL, command=self.alloc_tree.yview)
+        self.alloc_tree.configure(yscrollcommand=alloc_scroll.set)
+        alloc_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.alloc_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+    def _draw_donut(self):
+        if not hasattr(self, "donut_canvas"):
+            return
+        base_curr = self.summary_currency if hasattr(self, "summary_currency") else "USD"
+        fx_rates = getattr(self.fetcher, "fx_cache", {})
+        metrics = calc_portfolio_metrics(self.holdings, base_curr, fx_rates)
+        allocs = metrics.get("allocations", [])
+
+        labels = [a["symbol"] for a in allocs]
+        values = [a["value_base"] for a in allocs]
+        tot = metrics.get("total_value", 0.0)
+        sym_char = self.converter.CURRENCY_SYMBOLS.get(base_curr, "$")
+        center_str = f"{sym_char}{tot:,.2f}"
+
+        port_title = f"Allocation ({base_curr}) - {self.current_portfolio}"
+        draw_donut_chart(
+            self.donut_canvas,
+            labels=labels,
+            values=values,
+            title=port_title,
+            center_text=center_str,
+            dark_mode=self.dark_mode,
+        )
+
+    def _refresh_analytics_tab(self):
+        if not hasattr(self, "donut_canvas") or not hasattr(self, "analytics_kpis"):
+            return
+        base_curr = self.summary_currency if hasattr(self, "summary_currency") else "USD"
+        fx_rates = getattr(self.fetcher, "fx_cache", {})
+        metrics = calc_portfolio_metrics(self.holdings, base_curr, fx_rates)
+
+        self._draw_donut()
+
+        allocs = metrics.get("allocations", [])
+        top = allocs[0] if allocs else None
+        top_str = f"{top['symbol']}" if top else "-"
+        conc_str = f"{metrics.get('top_concentration_pct', 0.0):.1f}%" if top else "0.0%"
+
+        best = metrics.get("best_performer")
+        worst = metrics.get("worst_performer")
+        best_str = f"{best['symbol']} ({float(best.get('unrealized_gain_pct', 0.0)):+.1f}%)" if best else "-"
+        worst_str = f"{worst['symbol']} ({float(worst.get('unrealized_gain_pct', 0.0)):+.1f}%)" if worst else "-"
+
+        self.analytics_kpis["top_asset"][2].config(text=top_str)
+        self.analytics_kpis["concentration"][2].config(text=conc_str)
+        self.analytics_kpis["portfolio_yoc"][2].config(text=f"{metrics.get('portfolio_yoc', 0.0):.2f}%")
+        self.analytics_kpis["div_yield"][2].config(text=f"{metrics.get('overall_div_yield', 0.0):.2f}%")
+        self.analytics_kpis["best_performer"][2].config(text=best_str)
+        self.analytics_kpis["worst_performer"][2].config(text=worst_str)
+
+        for item in self.alloc_tree.get_children():
+            self.alloc_tree.delete(item)
+
+        sym_char = self.converter.CURRENCY_SYMBOLS.get(base_curr, "$")
+        for a in allocs:
+            self.alloc_tree.insert(
+                "",
+                tk.END,
+                values=(
+                    a["symbol"],
+                    a["name"],
+                    f"{sym_char}{a['value_base']:,.2f}",
+                    f"{a['weight_pct']:.1f}%",
+                ),
+            )
 
     def _build_chart_tab(self):
         self.chart_view = GoogleFinanceChartView(
@@ -655,8 +952,57 @@ class ModernPortfolioApp:
     # -------------------------------------------------------------
     # Tab 1: Portfolio Holdings & Live Watchlist
     # -------------------------------------------------------------
+    def _clear_search(self):
+        self.search_filter_var.set("")
+        self._refresh_holdings_table()
+
+    def _set_performance_filter(self, mode: str):
+        self.filter_performance = mode
+        self._update_filter_button_styles()
+        self._refresh_holdings_table()
+
+    def _update_filter_button_styles(self):
+        if not hasattr(self, "filter_buttons"):
+            return
+        for mode, btn in self.filter_buttons.items():
+            if mode == self.filter_performance:
+                btn.config(bg=self.primary_color, fg="#ffffff")
+            else:
+                btn.config(bg="#ffffff" if not self.dark_mode else "#2d3342", fg=self.text_dark)
+
     def _build_holdings_tab(self):
         tab = self.tab_holdings
+
+        # Search & Filter Toolbar
+        sf_bar = ttk.Frame(tab, padding="8 6 8 2")
+        sf_bar.pack(fill=tk.X)
+
+        tk.Label(sf_bar, text="🔍 Search:", font=("Segoe UI", 9, "bold"), bg=self.bg_main, fg=self.text_dark).pack(side=tk.LEFT, padx=(0, 4))
+        self.search_entry = tk.Entry(sf_bar, textvariable=self.search_filter_var, font=("Segoe UI", 9), width=22, bd=1, relief="solid")
+        self.search_entry.pack(side=tk.LEFT, padx=(0, 4))
+        self.search_entry.bind("<KeyRelease>", lambda e: self._refresh_holdings_table())
+
+        btn_clear = tk.Button(sf_bar, text="✕", font=("Segoe UI", 8), bg="#ffffff", relief="solid", bd=1, padx=4, pady=1, command=self._clear_search)
+        btn_clear.pack(side=tk.LEFT, padx=(0, 12))
+
+        tk.Label(sf_bar, text="Filter:", font=("Segoe UI", 9, "bold"), bg=self.bg_main, fg=self.text_dark).pack(side=tk.LEFT, padx=(0, 4))
+        self.filter_buttons = {}
+        for f_mode, f_lbl in [("All", "All"), ("Gainers", "Gainers ▲"), ("Losers", "Losers ▼")]:
+            btn = tk.Button(
+                sf_bar,
+                text=f_lbl,
+                font=("Segoe UI", 8, "bold"),
+                relief="flat",
+                padx=8,
+                pady=1,
+                command=lambda m=f_mode: self._set_performance_filter(m),
+            )
+            btn.pack(side=tk.LEFT, padx=2)
+            self.filter_buttons[f_mode] = btn
+        self._update_filter_button_styles()
+
+        self.lbl_holdings_count = tk.Label(sf_bar, text="", font=("Segoe UI", 8), bg=self.bg_main, fg=self.text_muted)
+        self.lbl_holdings_count.pack(side=tk.RIGHT, padx=4)
 
         tree_frame = ttk.Frame(tab)
         tree_frame.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
@@ -906,11 +1252,14 @@ class ModernPortfolioApp:
             val_lbl.grid(row=r * 2 + 1, column=c, sticky="w", padx=6, pady=(0, 4))
             self.div_results[k] = val_lbl
 
-        drip_box = tk.LabelFrame(right_frame, text=" Dividend Reinvestment Plan (DRIP) Compounding Projection ", font=("Segoe UI", 10, "bold"), bg="#ffffff", padx=8, pady=8)
+        drip_box = tk.LabelFrame(right_frame, text=" Dividend Reinvestment Plan (DRIP) Compounding Projection ", font=("Segoe UI", 10, "bold"), bg=self.card_bg, fg=self.primary_color, padx=8, pady=8)
         drip_box.pack(fill=tk.BOTH, expand=True)
 
+        tree_container = ttk.Frame(drip_box)
+        tree_container.pack(fill=tk.BOTH, expand=True)
+
         cols = ("year", "shares", "price", "annual_div", "portfolio_val", "invested", "profit")
-        self.drip_tree = ttk.Treeview(drip_box, columns=cols, show="headings")
+        self.drip_tree = ttk.Treeview(tree_container, columns=cols, show="headings", height=5)
         drip_headers = [
             ("year", "Year", 50),
             ("shares", "Shares Owned", 90),
@@ -924,10 +1273,13 @@ class ModernPortfolioApp:
             self.drip_tree.heading(col, text=h)
             self.drip_tree.column(col, width=w, anchor="e" if col != "year" else "center")
 
-        drip_scroll = ttk.Scrollbar(drip_box, orient=tk.VERTICAL, command=self.drip_tree.yview)
+        drip_scroll = ttk.Scrollbar(tree_container, orient=tk.VERTICAL, command=self.drip_tree.yview)
         self.drip_tree.configure(yscrollcommand=drip_scroll.set)
         drip_scroll.pack(side=tk.RIGHT, fill=tk.Y)
         self.drip_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        self.drip_canvas = tk.Canvas(drip_box, height=190, bg=self.card_bg, highlightthickness=0)
+        self.drip_canvas.pack(fill=tk.X, expand=False, pady=(6, 0))
 
     # -------------------------------------------------------------
     # Tab 3: Stock Division (Split) Calculator
@@ -1603,7 +1955,7 @@ class ModernPortfolioApp:
     def _open_add_dialog(self):
         dlg = tk.Toplevel(self.root)
         dlg.title("Add New Stock / Asset")
-        dlg.geometry("460x490")
+        dlg.geometry("460x540")
         dlg.resizable(False, False)
         dlg.transient(self.root)
         dlg.grab_set()
@@ -1726,7 +2078,23 @@ class ModernPortfolioApp:
 
         price_entry = tk.Entry(frame, font=("Segoe UI", 9), bd=1, relief="solid")
         price_entry.insert(0, "100.00")
-        price_entry.pack(fill=tk.X, pady=(0, 14))
+        price_entry.pack(fill=tk.X, pady=(0, 8))
+
+        # Optional Price Alerts: Target Price and Stop Loss
+        add_alert_row = ttk.Frame(frame)
+        add_alert_row.pack(fill=tk.X, pady=(0, 12))
+
+        t_sub = ttk.Frame(add_alert_row)
+        t_sub.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+        tk.Label(t_sub, text="🎯 Target Sell ($):", font=("Segoe UI", 8)).pack(anchor="w")
+        target_add_entry = tk.Entry(t_sub, font=("Segoe UI", 9), bd=1, relief="solid")
+        target_add_entry.pack(fill=tk.X, pady=(2, 0))
+
+        s_sub = ttk.Frame(add_alert_row)
+        s_sub.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        tk.Label(s_sub, text="⚠️ Stop Loss ($):", font=("Segoe UI", 8)).pack(anchor="w")
+        stop_add_entry = tk.Entry(s_sub, font=("Segoe UI", 9), bd=1, relief="solid")
+        stop_add_entry.pack(fill=tk.X, pady=(2, 0))
 
         def on_save():
             sym = sym_entry.get().strip().upper()
@@ -1761,6 +2129,17 @@ class ModernPortfolioApp:
                     if q.get("currency") and curr == "USD":
                         curr = q["currency"]
 
+            t_val = target_add_entry.get().strip()
+            s_val = stop_add_entry.get().strip()
+            try:
+                t_price = float(t_val) if t_val else 0.0
+            except ValueError:
+                t_price = 0.0
+            try:
+                s_price = float(s_val) if s_val else 0.0
+            except ValueError:
+                s_price = 0.0
+
             summary = calc_holding_summary(shares, buy_price, cur_price, div_yield, ann_div)
             holding_record = {
                 "portfolio": target_port,
@@ -1772,6 +2151,8 @@ class ModernPortfolioApp:
                 "dividend_yield": div_yield,
                 "annual_div_per_share": ann_div,
                 "currency": curr,
+                "target_sell_price": t_price,
+                "stop_loss_price": s_price,
                 "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             }
             holding_record.update(summary)
@@ -1839,7 +2220,7 @@ class ModernPortfolioApp:
 
         dlg = tk.Toplevel(self.root)
         dlg.title(f"Edit Holding: {sym}")
-        dlg.geometry("420x370")
+        dlg.geometry("420x450")
         dlg.resizable(False, False)
         dlg.transient(self.root)
         dlg.grab_set()
@@ -1874,7 +2255,25 @@ class ModernPortfolioApp:
         tk.Label(frame, text="Buy Price / Cost Basis ($):", font=("Segoe UI", 9, "bold")).pack(anchor="w")
         price_entry = tk.Entry(frame, font=("Segoe UI", 10), bd=1, relief="solid")
         price_entry.insert(0, str(holding["buy_price"]))
-        price_entry.pack(fill=tk.X, pady=(2, 14))
+        price_entry.pack(fill=tk.X, pady=(2, 10))
+
+        # Alert thresholds: Target Price and Stop Loss
+        alert_row = ttk.Frame(frame)
+        alert_row.pack(fill=tk.X, pady=(0, 12))
+
+        target_sub = ttk.Frame(alert_row)
+        target_sub.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+        tk.Label(target_sub, text="🎯 Target Sell ($):", font=("Segoe UI", 8, "bold")).pack(anchor="w")
+        target_entry = tk.Entry(target_sub, font=("Segoe UI", 9), bd=1, relief="solid")
+        target_entry.insert(0, str(holding.get("target_sell_price") or ""))
+        target_entry.pack(fill=tk.X, pady=(2, 0))
+
+        stop_sub = ttk.Frame(alert_row)
+        stop_sub.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        tk.Label(stop_sub, text="⚠️ Stop Loss ($):", font=("Segoe UI", 8, "bold")).pack(anchor="w")
+        stop_entry = tk.Entry(stop_sub, font=("Segoe UI", 9), bd=1, relief="solid")
+        stop_entry.insert(0, str(holding.get("stop_loss_price") or ""))
+        stop_entry.pack(fill=tk.X, pady=(2, 0))
 
         def on_save_edit():
             try:
@@ -1888,6 +2287,17 @@ class ModernPortfolioApp:
 
             new_port = port_edit_cb.get().strip() or cur_port
             new_curr = curr_edit_cb.get().strip().upper() or cur_curr
+
+            t_str = target_entry.get().strip()
+            s_str = stop_entry.get().strip()
+            try:
+                holding["target_sell_price"] = float(t_str) if t_str else 0.0
+            except ValueError:
+                holding["target_sell_price"] = 0.0
+            try:
+                holding["stop_loss_price"] = float(s_str) if s_str else 0.0
+            except ValueError:
+                holding["stop_loss_price"] = 0.0
 
             holding["portfolio"] = new_port
             holding["currency"] = new_curr
@@ -2167,6 +2577,9 @@ class ModernPortfolioApp:
                     f"${row['total_profit']:+,.2f}",
                 ),
             )
+
+        if hasattr(self, "drip_canvas"):
+            draw_drip_growth_chart(self.drip_canvas, history, dark_mode=self.dark_mode)
 
     # -------------------------------------------------------------
     # Stock Split Logic
@@ -2575,11 +2988,13 @@ class ModernPortfolioApp:
         for item in self.holdings_tree.get_children():
             self.holdings_tree.delete(item)
 
-        self.holding_map = {}
-        for idx, h in enumerate(self.holdings):
-            item_id = f"holding_item_{idx}"
-            self.holding_map[item_id] = h
+        search_query = self.search_filter_var.get().strip().lower() if hasattr(self, "search_filter_var") else ""
+        perf_filter = getattr(self, "filter_performance", "All")
 
+        self.holding_map = {}
+        displayed_count = 0
+
+        for idx, h in enumerate(self.holdings):
             shares = float(h.get("shares", 0.0))
             buy_price = float(h.get("buy_price", 0.0))
             current_price = float(h.get("current_price", buy_price))
@@ -2604,6 +3019,24 @@ class ModernPortfolioApp:
                 unrealized_pct = round((unrealized / cost_basis * 100), 2)
                 h["unrealized_gain_pct"] = unrealized_pct
 
+            # Apply performance filter
+            if perf_filter == "Gainers" and unrealized < 0:
+                continue
+            elif perf_filter == "Losers" and unrealized > 0:
+                continue
+
+            # Apply search filter
+            sym = str(h.get("symbol", ""))
+            name = str(h.get("name", ""))
+            port = str(h.get("portfolio", self.current_portfolio))
+            if search_query:
+                if search_query not in sym.lower() and search_query not in name.lower() and search_query not in port.lower():
+                    continue
+
+            item_id = f"holding_item_{idx}"
+            self.holding_map[item_id] = h
+            displayed_count += 1
+
             tag = "positive" if unrealized > 0 else ("negative" if unrealized < 0 else "neutral")
 
             chg = h.get("change")
@@ -2615,10 +3048,18 @@ class ModernPortfolioApp:
             else:
                 chg_str = "-"
 
-            port = h.get("portfolio", self.current_portfolio)
             curr = h.get("currency", "USD").strip().upper() or "USD"
             sym_char = self.converter.CURRENCY_SYMBOLS.get(curr, "$")
             unreal_sign = "+" if unrealized >= 0 else "-"
+
+            # Target alert indicators
+            target_p = float(h.get("target_sell_price") or 0.0)
+            stop_loss = float(h.get("stop_loss_price") or 0.0)
+            alert_prefix = ""
+            if target_p > 0 and current_price >= target_p:
+                alert_prefix = "🎯 "
+            elif stop_loss > 0 and current_price <= stop_loss:
+                alert_prefix = "⚠️ "
 
             self.holdings_tree.insert(
                 "",
@@ -2626,8 +3067,8 @@ class ModernPortfolioApp:
                 iid=item_id,
                 values=(
                     port,
-                    str(h.get("symbol", "")),
-                    h.get("name", h.get("symbol", "")),
+                    alert_prefix + sym,
+                    name,
                     curr,
                     f"{shares:.4g}",
                     f"{sym_char}{buy_price:.2f}",
@@ -2642,6 +3083,11 @@ class ModernPortfolioApp:
                     h.get("last_updated", ""),
                 ),
                 tags=(tag,),
+            )
+
+        if hasattr(self, "lbl_holdings_count"):
+            self.lbl_holdings_count.config(
+                text=f"Showing {displayed_count} of {len(self.holdings)} holdings"
             )
 
     def _refresh_sales_table(self):
@@ -2810,10 +3256,88 @@ class ModernPortfolioApp:
         self.sell_holding_cb["values"] = syms
 
     def _sort_holdings_by(self, col: str):
-        def key_func(h):
-            return h.get(col, 0)
-        self.holdings.sort(key=key_func, reverse=True)
+        if self.sort_col == col:
+            self.sort_reverse = not self.sort_reverse
+        else:
+            self.sort_col = col
+            self.sort_reverse = False
+
+        numeric_cols = {
+            "shares", "buy_price", "current_price", "change",
+            "market_value", "cost_basis", "unrealized_gain",
+            "unrealized_gain_pct", "div_yield", "annual_div"
+        }
+
+        def get_sort_val(h):
+            val = h.get(col)
+            if col in numeric_cols:
+                try:
+                    return float(val if val is not None else 0.0)
+                except (ValueError, TypeError):
+                    return 0.0
+            return str(val or "").lower()
+
+        self.holdings.sort(key=get_sort_val, reverse=self.sort_reverse)
+
+        headers_def = [
+            ("portfolio", "Portfolio"),
+            ("symbol", "Symbol"),
+            ("name", "Company Name"),
+            ("currency", "Curr"),
+            ("shares", "Shares"),
+            ("buy_price", "Buy Price"),
+            ("current_price", "Live Price"),
+            ("change", "Day Change"),
+            ("market_value", "Market Value"),
+            ("cost_basis", "Cost Basis"),
+            ("unrealized_gain", "Profit/Loss"),
+            ("unrealized_gain_pct", "P/L (%)"),
+            ("div_yield", "Div Yield"),
+            ("annual_div", "Est. Ann Div"),
+            ("updated", "Last Updated"),
+        ]
+        arrow = " ▼" if self.sort_reverse else " ▲"
+        for c, heading in headers_def:
+            disp_text = heading + (arrow if c == col else "")
+            self.holdings_tree.heading(c, text=disp_text)
+
         self._refresh_holdings_table()
+
+    def _export_html_report_dialog(self):
+        default_name = f"portfolio_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.html"
+        filename = filedialog.asksaveasfilename(
+            title="Export Executive Portfolio Report",
+            initialfile=default_name,
+            defaultextension=".html",
+            filetypes=[("HTML files", "*.html"), ("All files", "*.*")],
+        )
+        if not filename:
+            return
+
+        base_curr = self.summary_currency if hasattr(self, "summary_currency") else "USD"
+        fx_rates = getattr(self.fetcher, "fx_cache", {})
+        metrics = calc_portfolio_metrics(self.holdings, base_curr, fx_rates)
+
+        ok = generate_html_report(
+            holdings=self.holdings,
+            portfolio_metrics=metrics,
+            sales_history=self.sales_history,
+            filepath=filename,
+        )
+        if ok:
+            ans = messagebox.askyesno(
+                "Report Generated",
+                f"Executive report successfully generated:\n{filename}\n\nWould you like to open it in your web browser now?",
+                parent=self.root,
+            )
+            if ans:
+                try:
+                    webbrowser.open(f"file://{os.path.abspath(filename)}")
+                except Exception as e:
+                    messagebox.showinfo("Report Ready", f"Report saved at:\n{filename}\n\nOpen this file in your browser to view.", parent=self.root)
+            self._set_status(f"Exported HTML report: {os.path.basename(filename)}")
+        else:
+            messagebox.showerror("Error", "Failed to generate report.", parent=self.root)
 
     # -------------------------------------------------------------
     # CSV Import / Export

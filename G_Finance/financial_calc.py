@@ -310,3 +310,90 @@ def calc_target_profit_sell_price(
         "target_sell_price": round(target_sell_price, 4),
         "gross_proceeds_at_target": round(shares * target_sell_price, 2),
     }
+
+
+def calc_portfolio_metrics(
+    holdings: List[Dict[str, Any]],
+    base_currency: str = "USD",
+    fx_rates: Optional[Dict[str, float]] = None,
+) -> Dict[str, Any]:
+    """
+    Computes portfolio-wide analytics, concentration weights, and multi-currency metrics.
+    fx_rates maps currency code e.g. 'CNY' to conversion rate into base_currency (e.g. 1 CNY = 0.14 USD).
+    """
+    if fx_rates is None:
+        fx_rates = {}
+
+    total_value = 0.0
+    total_cost = 0.0
+    total_annual_div = 0.0
+    total_day_change = 0.0
+
+    allocations = []
+    best_holding = None
+    worst_holding = None
+
+    for h in holdings:
+        shares = float(h.get("shares", 0.0))
+        cur_p = float(h.get("current_price", 0.0))
+        buy_p = float(h.get("buy_price", 0.0))
+        chg = float(h.get("change") or 0.0)
+        curr = str(h.get("currency", base_currency)).upper()
+
+        rate = 1.0 if curr == base_currency.upper() else fx_rates.get(curr, 1.0)
+
+        mkt_val = shares * cur_p * rate
+        basis = shares * buy_p * rate
+        ann_div = float(h.get("annual_dividend", 0.0)) * rate
+        day_chg = shares * chg * rate
+
+        total_value += mkt_val
+        total_cost += basis
+        total_annual_div += ann_div
+        total_day_change += day_chg
+
+        unrealized_pct = float(h.get("unrealized_gain_pct", 0.0))
+        if best_holding is None or unrealized_pct > float(best_holding.get("unrealized_gain_pct", -999999)):
+            best_holding = h
+        if worst_holding is None or unrealized_pct < float(worst_holding.get("unrealized_gain_pct", 999999)):
+            worst_holding = h
+
+        allocations.append({
+            "symbol": str(h.get("symbol", "")),
+            "name": str(h.get("name", "")),
+            "value_base": round(mkt_val, 2),
+            "currency": curr,
+            "rate_used": rate,
+        })
+
+    for a in allocations:
+        a["weight_pct"] = round((a["value_base"] / total_value * 100), 2) if total_value > 0 else 0.0
+
+    allocations.sort(key=lambda x: x["value_base"], reverse=True)
+
+    total_gain = total_value - total_cost
+    total_gain_pct = (total_gain / total_cost * 100) if total_cost > 0 else 0.0
+    portfolio_yoc = (total_annual_div / total_cost * 100) if total_cost > 0 else 0.0
+    overall_div_yield = (total_annual_div / total_value * 100) if total_value > 0 else 0.0
+
+    prev_day_val = total_value - total_day_change
+    total_day_change_pct = (total_day_change / prev_day_val * 100) if prev_day_val > 0 else 0.0
+    top_concentration = allocations[0]["weight_pct"] if allocations else 0.0
+
+    return {
+        "base_currency": base_currency,
+        "total_value": round(total_value, 2),
+        "total_cost": round(total_cost, 2),
+        "total_gain": round(total_gain, 2),
+        "total_gain_pct": round(total_gain_pct, 2),
+        "total_annual_div": round(total_annual_div, 2),
+        "total_monthly_div": round(total_annual_div / 12.0, 2),
+        "portfolio_yoc": round(portfolio_yoc, 2),
+        "overall_div_yield": round(overall_div_yield, 2),
+        "total_day_change": round(total_day_change, 2),
+        "total_day_change_pct": round(total_day_change_pct, 2),
+        "best_performer": best_holding,
+        "worst_performer": worst_holding,
+        "allocations": allocations,
+        "top_concentration_pct": top_concentration,
+    }

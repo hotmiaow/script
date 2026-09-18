@@ -121,7 +121,14 @@ class CurrencyConverter:
 
         def worker():
             try:
-                pairs = [("USD-CAD", "CAD"), ("USD-HKD", "HKD"), ("EUR-USD", "EUR"), ("GBP-USD", "GBP")]
+                pairs = [
+                    ("USD-CAD", "CAD"),
+                    ("USD-HKD", "HKD"),
+                    ("EUR-USD", "EUR"),
+                    ("GBP-USD", "GBP"),
+                    ("USD-CNY", "CNY"),
+                    ("USD-JPY", "JPY"),
+                ]
                 new_rates = {}
                 for pair, curr in pairs:
                     quote = self.fetcher.fetch_quote(pair)
