@@ -83,9 +83,6 @@ class CiscoTracerouteMapper:
         self.wan_keyword: str = "wanr"
         # Addon subnets: list of (network_obj, behind_device_str, info_str)
         self.addon_subnets: List[Tuple[ipaddress.IPv4Network, str, str]] = []
-        # Additional interface info (same columns as inventory + 'info')
-        self.extra_info_by_ip: Dict[str, List[str]] = {}
-        self.extra_info_by_iface: Dict[Tuple[str, str], List[str]] = {}
 
     # ───── CSV loader ────────────────────────────────────────────────────────
     def load_csv_data(self) -> bool:
@@ -170,76 +167,6 @@ class CiscoTracerouteMapper:
         except ValueError:
             pass
         return []
-
-    # ───── additional interface info ──────────────────────────────────────────
-    def load_additional_int_info(self, filename: Optional[str] = None) -> None:
-        """
-        Loads an optional CSV with the same columns as network_interfaces.csv
-        plus an extra 'info' column. Rows are matched to inventory interfaces
-        by IP address, or by (device_name, interface_name) when no IP is given.
-        """
-        if filename:
-            candidates = [filename]
-        else:
-            base = os.path.dirname(os.path.abspath(self.csv_file))
-            names = ["additional_int_info.csv", "additiaon_int_info.csv"]
-            candidates = names + [os.path.join(base, n) for n in names]
-        path = next((c for c in candidates if os.path.exists(c)), None)
-        if not path:
-            if filename:
-                print(f"⚠️  Additional info file '{filename}' not found")
-            return
-
-        print(f"Loading additional interface info from {path}…")
-        count = 0
-        try:
-            with open(path, encoding="utf-8-sig") as fh:
-                reader = csv.DictReader(fh)
-                # case-insensitive column lookup
-                for raw in reader:
-                    row = {(k or "").strip().lower(): (v or "").strip() for k, v in raw.items()}
-                    info = row.get("info", "")
-                    if not info:
-                        continue
-                    device = row.get("device_name", "")
-                    iface = row.get("interface_name", "")
-                    ip = row.get("ip_address", "").split("/")[0]
-
-                    matched = False
-                    try:
-                        ipaddress.ip_address(ip)
-                        self.extra_info_by_ip.setdefault(ip, []).append(info)
-                        matched = True
-                    except ValueError:
-                        pass
-                    if device and iface:
-                        key = (device.lower(), iface.lower())
-                        self.extra_info_by_iface.setdefault(key, []).append(info)
-                        matched = True
-                    count += matched
-            print(f"✓ Loaded {count} additional interface info rows")
-        except Exception as exc:
-            print(f"⚠️  Error loading {path}: {exc}")
-
-    def get_extra_info(
-        self, ip: Optional[str], device: Optional[str] = None, iface: Optional[str] = None
-    ) -> str:
-        """
-        Returns the 'info' text for an interface that matched the inventory.
-        Lookup order: IP address, then (device, interface). Empty string if none.
-        """
-        if not ip and not (device and iface):
-            return ""
-        if ip and (device is None or iface is None):
-            inv = self.ip_to_device_map.get(ip)
-            if not inv:
-                return ""           # only enrich interfaces found in inventory
-            device, iface = inv[0], inv[1]
-        infos = self.extra_info_by_ip.get(ip or "", [])
-        if not infos and device and iface:
-            infos = self.extra_info_by_iface.get((device.lower(), iface.lower()), [])
-        # de-duplicate while preserving order
-        return "; ".join(dict.fromkeys(infos))
 
     # ───── low-level traceroute helpers ──────────────────────────────────────
     def _test_connectivity(self, ip: str) -> bool:
@@ -362,9 +289,6 @@ class CiscoTracerouteMapper:
                  dev_str = ", ".join(devs)
                  extra = f" [Sub: {dev_str}]"
                  
-            info = self.get_extra_info(ip, device, iface)
-            if info:
-                extra += f" [Info: {info}]"
             print(
                 f"{hop_no:>2}   {show_ip:<40}  {device:<20} {iface:<20} {zone:<15} {vrf:<15} {description}{extra}"
             )
@@ -460,11 +384,10 @@ class CiscoTracerouteMapper:
             print("-" * 60)
             for dev in sorted(zones[zone]):
                 print(f"\n📍 {dev}")
-                print(f"{'Interface':<25} {'IP Address':<16} {'Zone':<15} {'VRF':<15} {'Description':<30} {'Info'}")
-                print("-" * 130)
+                print(f"{'Interface':<25} {'IP Address':<16} {'Zone':<15} {'VRF':<15} {'Description'}")
+                print("-" * 100)
                 for iface, ip, z, v, d in self.device_inventory[dev]:
-                    info = self.get_extra_info(ip, dev, iface)
-                    print(f"{iface:<25} {ip:<16} {z:<15} {v:<15} {d:<30} {info}")
+                    print(f"{iface:<25} {ip:<16} {z:<15} {v:<15} {d}")
 
     # ───── comparison features ───────────────────────────────────────────────
     def collect_trace(
@@ -509,8 +432,6 @@ class CiscoTracerouteMapper:
         print(header)
         print("-" * len(header))
 
-        info_legend: Dict[str, Tuple[str, str, str]] = {}  # hop_ip -> (dev, iface, info)
-
         for h in range(1, max_hop + 1):
             row_str = f"{h:<4}"
 
@@ -543,10 +464,6 @@ class CiscoTracerouteMapper:
 
                     if device:
                         cell_text = f"{hop_ip} [{device} - {iface}]"
-                        info = self.get_extra_info(hop_ip, device, iface)
-                        if info:
-                            cell_text = f"{hop_ip} ℹ [{device} - {iface}]"
-                            info_legend.setdefault(hop_ip, (device, iface, info))
                     else:
                         # Check addon
                         addons = self.check_addon_subnet(hop_ip)
@@ -575,11 +492,6 @@ class CiscoTracerouteMapper:
                  row_str += " (MATCH)"
 
             print(row_str)
-
-        if info_legend:
-            print("\nℹ  Additional interface info:")
-            for hop_ip, (device, iface, info) in info_legend.items():
-                print(f"   {hop_ip:<16} {device} - {iface}: {info}")
 
     def compare_traces(self, targets: List[str]) -> None:
         """
@@ -937,9 +849,7 @@ class CiscoTracerouteMapper:
             if matches:
                 print(f"  ✓ VERIFIED: Found {len(matches)} monitored hop(s):")
                 for h, ip_str, dev, mtype in matches:
-                    info = self.get_extra_info(ip_str)
-                    info_s = f"  [Info: {info}]" if info else ""
-                    print(f"    - Hop {h:<2}: {dev:<20} ({ip_str}){info_s}")
+                    print(f"    - Hop {h:<2}: {dev:<20} ({ip_str})")
             else:
                 if monitored_devices or manual_ips or manual_subnets:
                     print(f"  ❌ FAILURE: Did NOT pass through expected devices.")
@@ -953,9 +863,7 @@ class CiscoTracerouteMapper:
                 for h, ip_str, dev in sightings:
                     # Mark if this was one of the verified ones
                     is_ver = " (Verified)" if any(m[1] == ip_str for m in matches) else ""
-                    info = self.get_extra_info(ip_str)
-                    info_s = f"  [Info: {info}]" if info else ""
-                    print(f"    - Hop {h:<2}: {dev:<20} ({ip_str}){is_ver}{info_s}")
+                    print(f"    - Hop {h:<2}: {dev:<20} ({ip_str}){is_ver}")
 
     # ───── source ↔ destination (WAN aware) ──────────────────────────────────
     def _hop_device(self, ip: Optional[str]) -> Optional[str]:
@@ -1031,9 +939,6 @@ class CiscoTracerouteMapper:
             dev, iface, zone = self._hop_info(ip)
             if self._is_wan_router(self._hop_device(ip)):
                 note = (note + " " if note else "") + "🌐 WAN router"
-            info = self.get_extra_info(ip)
-            if info:
-                note = (note + " " if note else "") + f"[Info: {info}]"
             print(f"{n:>3}  {seg:<10} {ip:<16} {dev[:25]:<25} {iface[:22]:<22} "
                   f"{zone[:15]:<15} {note}")
         print("-" * 120)
@@ -1289,12 +1194,6 @@ def main() -> None:
         default="wanr",
         help="Device-name keyword identifying WAN routers (default: %(default)s)",
     )
-    parser.add_argument(
-        "--extra-info",
-        default=None,
-        help="Additional interface info CSV (inventory columns + 'info'). "
-             "Default: additional_int_info.csv / additiaon_int_info.csv if present",
-    )
     args = parser.parse_args()
 
     if bool(args.source) != bool(args.destination):
@@ -1305,7 +1204,6 @@ def main() -> None:
     if not mapper.load_csv_data():
         sys.exit(1)
     mapper.load_addon_subnets()
-    mapper.load_additional_int_info(args.extra_info)
 
     # 2. Check Arguments
     mapper.resolve_dns = args.resolve_dns  # Apply argument
