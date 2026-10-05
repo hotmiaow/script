@@ -71,9 +71,24 @@ DEFAULT_ACCOUNT_MAPPINGS_FILE = Path(__file__).parent / "account_mappings.csv"
 
 # Default account mapping rules: (BankPattern, MoneyProAccount)
 DEFAULT_ACCOUNT_RULES: List[Tuple[str, str]] = [
+    ("4505********4799", "CIBC Visa (...4799)"),
     ("4500********1234", "CIBC Visa (...1234)"),
     ("00012345678", "CIBC Chequing (...5678)"),
-    ("40-00-00 12345678", "HSBC Premier (...5678)"),
+    ("4966-0405-2117-2569", "HSBC HK Card (...2569)"),
+    ("Acccount_569", "HSBC HK Card (...2569)"),
+    ("047-3-055531", "HSBC Account (...5531)"),
+    ("Acount_531", "HSBC Account (...5531)"),
+    ("507-3-031683", "HSBC Account (...1683)"),
+    ("661-141333-833", "HSBC Account (...3833)"),
+    ("813-545845-833", "HSBC Securities (...5833)"),
+    ("Account_833", "HSBC Securities (...5833)"),
+    ("549-723914-001", "HSBC Account (...4001)"),
+    ("*cibc*saving*", "CIBC Debit Saving"),
+    ("*cibc*cheq*", "CIBC Debit Chequing"),
+    ("*cibc*credit*", "CIBC Credit"),
+    ("*hsbc*credit*", "HSBC Credit"),
+    ("*adv*saving*", "HSBC HK Adv-Saving"),
+    ("*currcy*", "HSBC HK Saving"),
     ("cibc_visa", "CIBC Visa"),
     ("cibc_chequing", "CIBC Chequing"),
     ("cibc_dividend", "CIBC Visa Dividend"),
@@ -110,50 +125,63 @@ CATEGORY_RULES: Dict[str, List[str]] = {
         "walmart", "costco", "loblaws", "metro", "no frills", "safeway", "sobeys",
         "superstore", "freshco", "food basics", "whole foods", "trader joe", "tesco",
         "sainsbury", "asda", "morrisons", "waitrose", "aldi", "lidl", "parknshop",
-        "wellcome", "citysuper", "supermarket", "grocery"
+        "wellcome", "citysuper", "supermarket", "grocery", "freshway", "carma farms",
+        "the beer store", "bao dim"
     ],
     "Dining": [
         "restaurant", "cafe", "coffee", "starbucks", "tim hortons", "mcdonalds",
         "mcdonald's", "mcdonald", "burger king", "wendy", "wendys", "subway",
         "kfc", "pizza", "sushi", "pub", "bar", "uber eats", "doordash",
-        "skip the dishes", "deliveroo", "just eat", "bistro", "bakery", "diner"
+        "skip the dishes", "deliveroo", "just eat", "bistro", "bakery", "diner",
+        "hai tang cafe", "sugar sweet caf", "the royal chine", "fu kee", "daldongnae",
+        "matsuya", "pepper meet pep", "louie's diner", "koho food", "saint germain",
+        "happy fishman", "qing shu malata", "morefish", "square noodle", "shake shack",
+        "pho anh vu", "ming cuisine"
     ],
     "Utilities": [
         "hydro", "electric", "power", "gas company", "british gas", "natural gas",
         "gas electric", "water", "enbridge", "toronto hydro",
         "bchydro", "telus", "bell", "rogers", "shaw", "fido", "koodo", "virgin",
-        "vodafone", "o2", "ee", "three", "internet", "telecom"
+        "vodafone", "o2", "ee", "three", "telecom", "ebox", "alectra", "public mobile",
+        "home internet", "internet service"
     ],
     "Transportation": [
         "gas station", "fuel", "petrol", "gasoline", "esso", "shell", "petro", "petro-canada",
         "chevron", "bp", "mobil", "exxon", "uber", "lyft", "taxi", "transit", "ttc",
         "translink", "presto", "tfl", "mtr", "parking", "impark", "green p", "train",
-        "amtrak", "via rail"
+        "amtrak", "via rail", "mount joy", "octopus", "hopp"
     ],
     "Shopping": [
         "amazon", "ebay", "apple", "best buy", "ikea", "zara", "h&m", "uniqlo",
         "winners", "marshalls", "homesense", "canadian tire", "home depot", "lowes",
-        "sephora", "indigobooks", "clothing", "department store"
+        "sephora", "indigobooks", "clothing", "department store", "the best shop",
+        "dollarama"
     ],
     "Entertainment": [
         "netflix", "spotify", "youtube", "disney", "apple tv", "crave", "prime video",
-        "cinema", "cineplex", "theatre", "steam", "playstation", "nintendo", "xbox"
+        "cinema", "cineplex", "theatre", "steam", "playstation", "nintendo", "xbox",
+        "african lion safari", "playplex game"
     ],
     "Healthcare": [
-        "pharmacy", "shoppers drug mart", "rexall", "boots", "watsons", "mannings",
-        "dental", "dentist", "optometry", "clinic", "hospital", "doctor", "medical"
+        "pharmacy", "shoppers drug mart", "shoppers drug m", "rexall", "boots", "watsons", "mannings",
+        "dental", "dentist", "optometry", "clinic", "hospital", "doctor", "medical",
+        "deer run wellne"
     ],
     "Financial & Fees": [
         "monthly fee", "account fee", "service fee", "wire transfer", "overdraft",
-        "atm fee", "interest charge", "annual fee"
+        "atm fee", "interest charge", "annual fee", "custodian fee", "paper stmt",
+        "service charge capped"
     ],
     "Income": [
         "payroll", "salary", "direct deposit", "e-transfer received", "etransfer received",
-        "dividend", "interest paid", "tax refund", "canada rits", "cra refund"
+        "dividend", "interest paid", "tax refund", "canada rits", "cra refund",
+        "cash rebate", "credit interest", "bonus interest", "smart interest",
+        "service charge discount", "sale payt", "corp evt payment"
     ],
     "Transfer": [
         "internet transfer", "online transfer", "account transfer", "bank transfer",
-        "internal transfer", "transfer to", "transfer from"
+        "internal transfer", "transfer to", "transfer from", "isi inv edge", "investor's edge",
+        "cibc-disar", "cibc-disatf", "to card", "credit card payment", "e-transfer", "interact"
     ]
 }
 
@@ -371,17 +399,20 @@ def resolve_account_name(
     account_info: str = "",
     filename: str = "",
     mappings: Optional[List[Tuple[str, str]]] = None,
-    default_account: str = ""
+    default_account: str = "",
+    description: str = ""
 ) -> str:
     """
     Resolves the final Money Pro account name using account mapping rules.
-    Matches bank card/account numbers, suffixes, preamble text, or file names.
+    Matches bank card/account numbers, suffixes, preamble text, file names,
+    or specific account identifiers present in transaction descriptions.
     
     Order of preference:
     1. If default_account is passed and matches a rule pattern, return mapped name.
-    2. Pass 1: Exact, substring, or wildcard match on candidates (account_info, raw_account, filename).
-    3. Pass 2: Card / account number digit suffix match (minimum 3 digits).
-    4. Fallback: default_account if provided, otherwise raw_account, otherwise 'Bank Account'.
+    2. Description match for specific card/account identifiers (e.g. 4966-0405-2117-2569, Acccount_569).
+    3. Pass 1: Exact, substring, or wildcard match on candidates (account_info, raw_account, filename).
+    4. Pass 2: Card / account number digit suffix match (minimum 3 digits).
+    5. Fallback: default_account if provided, otherwise raw_account, otherwise 'Bank Account'.
     """
     if mappings is None:
         mappings = load_account_mappings()
@@ -392,6 +423,18 @@ def resolve_account_name(
             if pat.strip().lower() == norm_def:
                 return tgt
         return default_account
+
+    # Check description for specific account/card identifiers
+    if description:
+        norm_desc = description.strip().lower()
+        norm_desc_nodash = norm_desc.replace("-", "").replace(" ", "")
+        for pat, tgt in mappings:
+            norm_pat = pat.strip().lower()
+            is_acc_ident = any(ch.isdigit() for ch in norm_pat) or "account" in norm_pat or "acccount" in norm_pat or "acount" in norm_pat
+            if is_acc_ident and len(norm_pat) >= 4:
+                norm_pat_nodash = norm_pat.replace("-", "").replace(" ", "")
+                if norm_pat in norm_desc or norm_pat_nodash in norm_desc_nodash:
+                    return tgt
 
     candidates = [c.strip() for c in [account_info, raw_account, filename] if c and c.strip()]
 
@@ -427,12 +470,39 @@ def resolve_account_name(
 # Helper Functions: Parsing & Normalization
 # ==============================================================================
 
+def sanitize_csv_line(line: str) -> str:
+    """
+    Sanitizes malformed CSV lines, particularly from online banking exports
+    (such as HSBC HK, Hang Seng) that produce broken triple-quoted numbers or
+    split comma formatting.
+    Examples:
+      '\"\"\"-4\",\"715.00\"\"\t\"' -> '\"-4715.00\"'
+      '\"\"\"110\",\"000.00\"\"\t\"' -> '\"110000.00\"'
+      '\"\"\"5.28\"\"\t\"' -> '\"5.28\"'
+    """
+    if not line:
+        return ""
+
+    pattern = r'\"\"\"([+-]?\d+(?:(?:\",\"\d+)+)?(?:\.\d+)?)\"\"(?:\t)?\"'
+    def repl(m):
+        raw = m.group(1)
+        num_str = raw.replace('\",\"', '')
+        return f'\"{num_str}\"'
+
+    fixed = re.sub(pattern, repl, line)
+    fixed = re.sub(r'\"\"\"([+-]?\d+(?:\.\d+)?)\"\"(?:\t)?\"', r'\"\1\"', fixed)
+    fixed = fixed.replace("\t", "")
+    return fixed
+
+
 def clean_amount(val: Any) -> Optional[float]:
     """
     Cleans string representation of monetary amounts:
     - Removes currency symbols: $, £, €, HK$, CAD, USD, ¥
-    - Handles commas: 1,234.56 -> 1234.56
+    - Handles quotes, tabs, spaces
+    - Handles commas: 1,234.56 -> 1234.56 or multiple commas 1,234,567.89
     - Handles accounting parentheses: (50.00) -> -50.00
+    - Handles trailing minus signs: 50.00- -> -50.00
     - Returns None if empty or invalid.
     """
     if val is None:
@@ -441,28 +511,37 @@ def clean_amount(val: Any) -> Optional[float]:
     if not s:
         return None
 
+    s = s.strip("\"' \t\r\n")
+
     # Handle parenthesized negative numbers e.g. (100.50)
     is_negative = False
     if s.startswith("(") and s.endswith(")"):
         is_negative = True
         s = s[1:-1].strip()
 
-    # Strip currency symbols and whitespace
-    s = re.sub(r"[^\d.,\-+]", "", s)
-    if not s or s in ("-", "+", "."):
+    if s.endswith("-"):
+        is_negative = True
+        s = s[:-1].strip()
+    elif s.startswith("-"):
+        is_negative = True
+        s = s[1:].strip()
+
+    # Strip currency codes/symbols and non-digit/comma/dot
+    s = re.sub(r"[^\d.,+]", "", s)
+    if not s or s in ("+", "."):
         return None
 
     # Handle commas
     if "," in s and "." in s:
-        # Check standard 1,234.56 vs European 1.234,56
         if s.rfind(",") > s.rfind("."):
-            # European format
+            # European format: 1.234,56
             s = s.replace(".", "").replace(",", ".")
         else:
+            # Standard format: 1,234.56 or 1,234,567.89
             s = s.replace(",", "")
     elif "," in s and "." not in s:
-        # e.g. 1000,50 or 1,000
-        if len(s.split(",")[-1]) == 2:
+        parts = s.split(",")
+        if len(parts) == 2 and len(parts[-1]) == 2:
             s = s.replace(",", ".")
         else:
             s = s.replace(",", "")
@@ -551,7 +630,8 @@ def clean_description(desc: str) -> str:
 def extract_payee_and_check(description: str) -> Tuple[str, str]:
     """
     Extracts a clean merchant/payee name and optional check number from description.
-    Strips noise like location tags (e.g. TORONTO ON, VANCOUVER BC), POS transaction prefixes, etc.
+    Strips noise like location tags (e.g. MARKHAM, ON, TORONTO ON, VANCOUVER BC),
+    POS transaction prefixes, banking channels, reference IDs, etc.
     """
     if not description:
         return "", ""
@@ -564,12 +644,39 @@ def extract_payee_and_check(description: str) -> Tuple[str, str]:
     if chk_match:
         check_no = chk_match.group(1)
 
-    # Detect credit card payment boilerplate
-    if re.search(r"PAYMENT\s+-\s+THANK\s+YOU|PAIEMENT\s+MERCI", desc, re.IGNORECASE):
+    # Detect credit card payment boilerplate (with or without hyphen, spaced words)
+    if re.search(r"PAYMENT\s*(?:-\s*)?THANK\s+YOU|PAIEMEN\s*T\s+MERCI", desc, re.IGNORECASE):
         return "Credit Card Payment", check_no
+
+    # Pre-match specific HK / Canadian bank boilerplate
+    if re.search(r"\bCASH\s+REBATE\b", desc, re.IGNORECASE):
+        return "HSBC Cash Rebate", check_no
+    if re.search(r"\bCUSTODIAN\s+FEE\b", desc, re.IGNORECASE):
+        return "HSBC Securities Custodian Fee", check_no
+    if re.search(r"\bPAPER\s+STMT\s+ANNUAL\s+FEE\b", desc, re.IGNORECASE):
+        return "HSBC Paper Statement Fee", check_no
+    if re.search(r"\bSERVICE\s+CHARGE\s+CAPPED\s+MONTHLY\s+FEE\b", desc, re.IGNORECASE):
+        return "CIBC Monthly Service Charge", check_no
+    if re.search(r"\bSERVICE\s+CHARGE\s+DISCOUNT\b", desc, re.IGNORECASE):
+        return "CIBC Service Charge Discount", check_no
+    if re.search(r"\b(?:BONUS\s+|SMART\s+|CREDIT\s+)?INTEREST\b", desc, re.IGNORECASE) and any(k in desc.upper() for k in ["BRANCH", "CREDIT"]):
+        return "Interest", check_no
+    m_corp = re.search(r"CORP\s+EVT\s+PAYMENT\s+SEC\s+\d+([A-Za-z0-9\- ]+)", desc, re.IGNORECASE)
+    if m_corp:
+        return f"Dividend: {m_corp.group(1).strip()}", check_no
+
+    # Presto
+    if re.search(r"PRESTO\s+(?:APPL/[A-Z0-9]+|WEB)", desc, re.IGNORECASE):
+        return "Presto", check_no
 
     # Remove common prefix noise from bank descriptions
     prefixes_to_strip = [
+        r"^Point of Sale - Interac (?:MDSE RETURN|RETAIL PURCHASE)\s+(?:\d{8,}\s+)?",
+        r"^Point of Sale - Visa Debit VISA DEBIT (?:RETAIL PURCHASE|PURCHASE)\s+",
+        r"^Point of Sale - Interac\s+",
+        r"^Point of Sale - Visa Debit\s+",
+        r"^Point of Sale -\s+",
+        r"^POS\s+(?:PURCHASE|RETURN)\s*-\s*",
         r"^POS\s+(?:PURCHASE|RETURN)\s+",
         r"^DEBIT\s+(?:PURCHASE|MEMO)\s+",
         r"^CREDIT\s+(?:PURCHASE|MEMO)\s+",
@@ -578,11 +685,24 @@ def extract_payee_and_check(description: str) -> Tuple[str, str]:
         r"^MASTERCARD\s+(?:PURCHASE|DEBIT)\s+",
         r"^PRE-AUTHORIZED\s+PAYMENT\s+",
         r"^ONLINE\s+BANKING\s+(?:PAYMENT|TRANSFER)\s+",
+        r"^Internet Banking E-TRANSFER\s+(?:\d{10,}\s+)?",
+        r"^Internet Banking TRANSFER\s*-\s*INVESTMENT\s+(?:\d{10,}\s+)?",
+        r"^Internet Banking INTERNET TRANSFER\s+(?:\d{10,}\s+)?",
+        r"^Internet Banking INTERNET DEPOSIT\s+(?:\d{10,}\s+)?",
+        r"^Internet Banking INTERNET BILL PAY\s+(?:\d{10,}\s+)?",
+        r"^Internet Banking\s+",
+        r"^Branch Transaction\s+",
+        r"^Electronic Funds Transfer PREAUTHORIZED DEBIT\s+(?:Pre-authorized\s+)?",
+        r"^Electronic Funds Transfer DEPOSIT\s+",
+        r"^Electronic Funds Transfer\s+",
         r"^E-TRANSFER\s+(?:SENT|RECEIVED)\s+",
         r"^AUTOMATIC\s+PAYMENT\s+",
         r"^DIRECT\s+DEBIT\s+",
         r"^BILL\s+PAYMENT\s+",
         r"^ATM\s+WITHDRAWAL\s+",
+        r"^POS MDC\s+(?:\([A-Z0-9]+\)P\s+)?",
+        r"^MDC P\s+",
+        r"^SQ\s*\*\s*",
         # HSBC / UK banking transaction type codes
         r"^(?:VIS|DD|SO|CR|BP|CHQ|TFR|FPI|BGC)\s+",
     ]
@@ -593,17 +713,63 @@ def extract_payee_and_check(description: str) -> Tuple[str, str]:
     # Strip leftover leading hyphens, dashes, colons, slashes
     cleaned = re.sub(r"^[\s\-–—:/\\]+", "", cleaned).strip()
 
-    # Strip trailing location codes (e.g. 'TORONTO ON', 'VANCOUVER BC CA', 'NEW YORK NY', etc.)
+    # Strip foreign currency conversions e.g. CAD235.99 5.61210RT
+    cleaned = re.sub(r"\s+[A-Z]{3}\s*[\d,.]+\s+[\d.]+RT\b", "", cleaned, flags=re.IGNORECASE)
+
+    # Strip FPS / HK reference codes e.g. HC124A0405968699 04OCT or N92523518992(25SEP26)
+    cleaned = re.sub(r"\bHC[A-Z0-9]{10,}\s+\d{1,2}[A-Z]{3}\b", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\b[A-Z0-9]{10,}\(\d{1,2}[A-Z]{3}\d{2}\)", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\(\d{1,2}[A-Z]{3}\d{2}\)", "", cleaned, flags=re.IGNORECASE)
+
+    # Strip store IDs with optional #, e.g. #1234, # 670, STORE 4321
+    cleaned = re.sub(r"\s+#\s*\d+", "", cleaned)
+    cleaned = re.sub(r"\s+STORE\s+#?\d+", "", cleaned, flags=re.IGNORECASE)
+
+    # Strip Canadian location suffix (e.g. 'MARKHAM, ON', 'TORONTO ON', 'RICHMOND HILL, ON')
+    known_multi_word_cities = r"(?:RICHMOND\s+HILL|NORTH\s+YORK|ST\s+CATHARINES|NIAGARA\s+FALLS)"
+    provs = r"(?:ON|BC|AB|QC|MB|SK|NS|NB|NL|PE|NT|YT|NU)"
+    cleaned = re.sub(rf",?\s+(?:{known_multi_word_cities}|[A-Za-z]+)\s*,?\s+{provs}(?:\s+(?:CA|CAN|CANADA))?$", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"\s+[A-Z]{2,}\s+(?:ON|BC|AB|QC|MB|SK|NS|NB|NL|PE|NT|YT|NU)(?:\s+CA|\s+CAN)?$", "", cleaned, flags=re.IGNORECASE)
-    # Strip terminal / store IDs (e.g. #1234, STORE 4321)
-    cleaned = re.sub(r"\s+#\d+", "", cleaned)
-    cleaned = re.sub(r"\s+STORE\s+\d+", "", cleaned, flags=re.IGNORECASE)
-    # Strip trailing numbers/timestamps
+
+    # Strip standalone 3-4 digit store numbers or phone numbers at end
+    cleaned = re.sub(r"\b\d{10,}\b$", "", cleaned).strip()
+    cleaned = re.sub(r"\b\d{3,4}\b$", "", cleaned).strip()
     cleaned = re.sub(r"\s+\d{6,}$", "", cleaned)
 
-    payee = " ".join(cleaned.split())
+    payee = " ".join(cleaned.split()).strip()
     if not payee:
         payee = desc
+
+    # Specific truncated / bank abbreviated name repairs
+    replacements = {
+        "COSTCO WHOLESA": "Costco Wholesale",
+        "FRESHWAY FOODM": "Freshway Foodmart",
+        "HAI TANG CAFE I": "Hai Tang Cafe",
+        "SUGAR SWEET CAF": "Sugar Sweet Cafe",
+        "THE ROYAL CHINE": "The Royal Chinese",
+        "FU KEE BAO DIM": "Fu Kee Bao Dim",
+        "SHOPPERS DRUG M": "Shoppers Drug Mart",
+        "SAINT GERMAIN B": "Saint Germain Bakery",
+        "DEER RUN WELLNE": "Deer Run Wellness",
+        "HAPPY FISHMAN C": "Happy Fishman",
+        "HAPPY FISHMAN CHINESE SE": "Happy Fishman",
+        "T T SUPERMARKET": "T&T Supermarket",
+        "PHO ANH VU (SCA": "Pho Anh Vu",
+        "SHACK EGLINTON": "Shake Shack",
+        "ISI INV EDGE": "CIBC Investor's Edge",
+        "PUBLIC MOBILE SELF-SER": "Public Mobile",
+        "TELUS MOBILITY": "Telus Mobility",
+        "ALECTRA UTILITIES": "Alectra Utilities",
+        "AFRICAN LION SAFARI": "African Lion Safari",
+        "LOUIE'S DINER": "Louie's Diner",
+        "ASHLEY S NO FRILLS": "Ashley's No Frills",
+        "ASHLEY S NO FRILLS 334": "Ashley's No Frills",
+        "EBOX/LMC37": "Ebox",
+        "YYZ TIM HORTONS DOM AR": "Tim Hortons",
+    }
+    payee_upper = payee.upper()
+    if payee_upper in replacements:
+        payee = replacements[payee_upper]
 
     return payee, check_no
 
@@ -612,13 +778,10 @@ def infer_category(description: str, payee: str, mappings: Optional[Dict[str, Li
     """
     Infers Money Pro category based on keyword matching from category mappings.
     Evaluates longer, specific multi-word merchant phrases before generic single words.
-    Normalizes words (e.g. 'McDonalds', "McDonald's", 'mcdonalds' all match).
+    Evaluates clean payee name first, then cleaned description without bank channel boilerplate.
     """
     if mappings is None:
         mappings = load_category_mappings()
-
-    raw_text = f"{description} {payee}"
-    clean_text = normalize_match_text(raw_text)
 
     # Flatten rules and sort by keyword length descending so specific rules match first
     all_rules = []
@@ -632,17 +795,42 @@ def infer_category(description: str, payee: str, mappings: Optional[Dict[str, Li
 
     all_rules.sort(key=lambda item: len(item[0]), reverse=True)
 
-    for clean_kw, cat in all_rules:
-        # Check exact word boundary with optional plural/possessive 's'
-        pattern = r"\b" + re.escape(clean_kw) + r"(?:s)?\b"
-        if re.search(pattern, clean_text):
-            return cat
+    def _match(text: str) -> str:
+        if not text:
+            return ""
+        clean_t = normalize_match_text(text)
+        for clean_kw, cat in all_rules:
+            pattern = r"\b" + re.escape(clean_kw) + r"(?:s)?\b"
+            if re.search(pattern, clean_t):
+                return cat
+            if (" " in clean_kw or "&" in clean_kw or "+" in clean_kw or "." in clean_kw) and clean_kw in clean_t:
+                return cat
+        return ""
 
-        # Multi-word or symbol substring match (e.g. "uber eats", "a&w", "m&s")
-        if (" " in clean_kw or "&" in clean_kw or "+" in clean_kw or "." in clean_kw) and clean_kw in clean_text:
-            return cat
+    # 1. Match against clean payee first (most specific and accurate)
+    cat = _match(payee)
+    if cat:
+        return cat
 
-    return ""
+    # 2. Strip banking channel prefixes from description before matching
+    cleaned_desc = description
+    channel_prefixes = [
+        r"^Point of Sale\s*-\s*(?:Interac\s+|Visa Debit\s+)?(?:MDSE RETURN|RETAIL PURCHASE)?\s*(?:\d+\s+)?",
+        r"^Internet Banking\s+(?:TRANSFER\s*-\s*INVESTMENT|E-TRANSFER|INTERNET TRANSFER|INTERNET DEPOSIT|INTERNET BILL PAY)?\s*(?:\d+\s+)?",
+        r"^Branch Transaction\s+",
+        r"^Electronic Funds Transfer\s+(?:PREAUTHORIZED DEBIT|DEPOSIT)?\s*(?:Pre-authorized\s+)?",
+        r"^POS MDC\s+(?:\([A-Z0-9]+\)P\s+)?",
+        r"^MDC P\s+",
+    ]
+    for cp in channel_prefixes:
+        cleaned_desc = re.sub(cp, "", cleaned_desc, flags=re.IGNORECASE).strip()
+
+    cat = _match(cleaned_desc)
+    if cat:
+        return cat
+
+    # 3. Fallback: match raw combined text
+    return _match(f"{description} {payee}")
 
 
 # ==============================================================================
@@ -747,7 +935,7 @@ class CIBCParser(BaseParser):
                 amt3 = clean_amount(row[3]) if len(row) > 3 and row[3].strip() else None
                 # In CIBC debit/credit layout, one is populated and the other is empty
                 is_debit_credit_pair = (amt2 is not None and amt3 is None) or (amt2 is None and amt3 is not None)
-                has_card_col = len(row) > 4 and bool(re.search(r"(\*{3,}|\d{8,})", row[4]))
+                has_card_col = len(row) > 4 and bool(re.search(r"(\*{3,}|\d{8,}|x{4,})", row[4], re.IGNORECASE))
                 if is_debit_credit_pair or has_card_col:
                     valid_cibc_rows += 1
 
@@ -763,7 +951,7 @@ class CIBCParser(BaseParser):
     ) -> List[Transaction]:
         transactions = []
         with open(filepath, "r", encoding="utf-8-sig", errors="replace") as f:
-            lines = [line.strip() for line in f if line.strip()]
+            lines = [sanitize_csv_line(line.strip()) for line in f if line.strip()]
 
         if not lines:
             return []
@@ -793,8 +981,20 @@ class CIBCParser(BaseParser):
         start_idx = 1 if has_header else 0
         reader = csv.reader(lines[start_idx:])
 
-        # Detected account suffix from card number column if available
+        # Detected account suffix from card number column (5th column) if present
         detected_account_suffix = ""
+        for scan_line in lines[start_idx:start_idx + 20]:
+            try:
+                scan_row = next(csv.reader([scan_line]))
+                if len(scan_row) > 4:
+                    c4 = scan_row[4].strip()
+                    if c4 and c4.lower() != "xxxxxxx":
+                        digits = re.findall(r"\d+", c4)
+                        if digits and len(digits[-1]) >= 4:
+                            detected_account_suffix = digits[-1][-4:]
+                            break
+            except Exception:
+                pass
 
         for row in reader:
             if not row or len(row) < 3:
@@ -817,9 +1017,8 @@ class CIBCParser(BaseParser):
                 card_col = row[4].strip() if len(row) > 4 else ""
 
             if card_col and not detected_account_suffix:
-                # e.g. 4500********1234 -> Visa ...1234
                 digits = re.findall(r"\d+", card_col)
-                if digits:
+                if digits and len(digits[-1]) >= 4:
                     detected_account_suffix = digits[-1][-4:]
 
             parsed_date = parse_date_string(date_str)
@@ -841,10 +1040,17 @@ class CIBCParser(BaseParser):
             category = infer_category(clean_desc, payee, mappings=category_mappings) if auto_categorize else ""
 
             # Determine Account name using account mapping
-            raw_acc = f"CIBC (...{detected_account_suffix})" if detected_account_suffix else "CIBC Account"
+            is_credit_card = bool(card_col) or (len(row) > 4 and bool(row[4].strip()))
+            if is_credit_card:
+                raw_acc = f"CIBC Visa (...{detected_account_suffix})" if detected_account_suffix else "CIBC Visa"
+                acc_info = card_col or (f"cibc_visa {detected_account_suffix}" if detected_account_suffix else "cibc_visa")
+            else:
+                raw_acc = f"CIBC Chequing (...{detected_account_suffix})" if detected_account_suffix else "CIBC Chequing"
+                acc_info = detected_account_suffix or "cibc_chequing"
+
             account = resolve_account_name(
                 raw_account=raw_acc,
-                account_info=card_col or detected_account_suffix,
+                account_info=acc_info,
                 filename=Path(filepath).stem if filepath else "",
                 mappings=account_mappings,
                 default_account=default_account
@@ -888,9 +1094,9 @@ class HSBCParser(BaseParser):
                 return True
             if "payment type" in l_lower and "details" in l_lower:
                 return True
-            if "withdrawal(hkd)" in l_lower or "deposit(hkd)" in l_lower:
+            if "withdrawal(hkd)" in l_lower or "deposit(hkd)" in l_lower or "billing amount" in l_lower:
                 return True
-            if "balance" in l_lower and ("amount" in l_lower or "details" in l_lower or "paid out" in l_lower or "paid in" in l_lower):
+            if "balance" in l_lower and ("amount" in l_lower or "details" in l_lower or "paid out" in l_lower or "paid in" in l_lower or "billing" in l_lower):
                 return True
 
         return False
@@ -905,7 +1111,7 @@ class HSBCParser(BaseParser):
     ) -> List[Transaction]:
         transactions = []
         with open(filepath, "r", encoding="utf-8-sig", errors="replace") as f:
-            lines = [line.strip() for line in f if line.strip()]
+            lines = [sanitize_csv_line(line.strip()) for line in f if line.strip()]
 
         if not lines:
             return []
@@ -917,12 +1123,15 @@ class HSBCParser(BaseParser):
             cols = next(csv.reader([line]))
             cols_l = [c.lower().strip() for c in cols]
             if any("date" in c for c in cols_l) and (
-                any(k in c for c in cols_l for k in ["paid out", "paid in", "amount", "details", "description", "debit", "credit", "withdrawal"])
+                any(k in c for c in cols_l for k in ["paid out", "paid in", "amount", "details", "description", "debit", "credit", "withdrawal", "billing"])
             ):
                 header_idx = idx
                 for c_idx, c_name in enumerate(cols_l):
                     if "date" in c_name:
                         header_map["date"] = c_idx
+                    elif "currency" in c_name:
+                        if "currency" not in header_map:
+                            header_map["currency"] = c_idx
                     elif "type" in c_name:
                         header_map["type"] = c_idx
                     elif "details" in c_name or "desc" in c_name:
@@ -931,10 +1140,10 @@ class HSBCParser(BaseParser):
                         header_map["paid_out"] = c_idx
                     elif "paid in" in c_name or "deposit" in c_name or "credit" in c_name:
                         header_map["paid_in"] = c_idx
-                    elif "amount" in c_name:
-                        header_map["amount"] = c_idx
                     elif "balance" in c_name:
                         header_map["balance"] = c_idx
+                    elif "amount" in c_name or "billing" in c_name:
+                        header_map["amount"] = c_idx
                 break
 
         if header_idx == -1:
@@ -942,10 +1151,14 @@ class HSBCParser(BaseParser):
             header_idx = 0
             header_map = {"date": 0, "desc": 1, "paid_out": 2, "paid_in": 3}
 
-        # Check preamble for account number / currency
+        # Check preamble or headers for account number / currency / region
         detected_account_info = ""
-        for line in lines[:header_idx]:
-            if "account" in line.lower() or "iban" in line.lower() or "currency" in line.lower():
+        is_hk = False
+        for line in lines[:header_idx + 1]:
+            line_l = line.lower()
+            if "hkd" in line_l or "hong kong" in line_l or "billing amount" in line_l:
+                is_hk = True
+            if "account" in line_l or "iban" in line_l or "currency" in line_l or "card" in line_l:
                 cleaned_meta = re.sub(r"[,;\"']", " ", line)
                 digits = re.findall(r"\b\d{3,}[-\d]*\b", cleaned_meta)
                 if digits:
@@ -981,7 +1194,14 @@ class HSBCParser(BaseParser):
                     amount = abs(p_in)
 
             if amount is None and "amount" in header_map:
-                amount = clean_amount(row[header_map["amount"]])
+                amt_idx = header_map["amount"]
+                curr_idx = header_map.get("currency", None)
+                # If amount was split across columns before currency column (e.g. HKD)
+                if curr_idx is not None and curr_idx > amt_idx + 1 and len(row) > curr_idx:
+                    joined_amt_str = "".join(row[amt_idx:curr_idx])
+                    amount = clean_amount(joined_amt_str)
+                if amount is None and len(row) > amt_idx:
+                    amount = clean_amount(row[amt_idx])
 
             if amount is None:
                 continue
@@ -989,13 +1209,18 @@ class HSBCParser(BaseParser):
             payee, check_no = extract_payee_and_check(clean_desc)
             category = infer_category(clean_desc, payee, mappings=category_mappings) if auto_categorize else ""
 
-            raw_acc = f"HSBC (...{detected_account_info})" if detected_account_info else "HSBC Account"
+            if is_hk:
+                raw_acc = f"HSBC HK (...{detected_account_info})" if detected_account_info else "HSBC HK"
+            else:
+                raw_acc = f"HSBC (...{detected_account_info})" if detected_account_info else "HSBC Account"
+
             account = resolve_account_name(
                 raw_account=raw_acc,
-                account_info=detected_account_info,
+                account_info=detected_account_info or ("hsbc_hk" if is_hk else ""),
                 filename=Path(filepath).stem if filepath else "",
                 mappings=account_mappings,
-                default_account=default_account
+                default_account=default_account,
+                description=clean_desc
             )
 
             transactions.append(Transaction(
@@ -1032,7 +1257,7 @@ class GenericParser(BaseParser):
     ) -> List[Transaction]:
         transactions = []
         with open(filepath, "r", encoding="utf-8-sig", errors="replace") as f:
-            lines = [line.strip() for line in f if line.strip()]
+            lines = [sanitize_csv_line(line.strip()) for line in f if line.strip()]
 
         if not lines:
             return []
@@ -1135,7 +1360,7 @@ def detect_parser(filepath: str) -> BaseParser:
     try:
         with open(filepath, "r", encoding="utf-8-sig", errors="replace") as f:
             sample_lines = [f.readline().strip() for _ in range(15)]
-            sample_lines = [l for l in sample_lines if l]
+            sample_lines = [sanitize_csv_line(l) for l in sample_lines if l]
     except Exception:
         return GenericParser()
 
@@ -1160,7 +1385,13 @@ def export_to_moneypro_csv(
     Exports normalized transactions into the official Money Pro iOS CSV format.
     Returns the count of exported transactions.
     """
+    out_file = Path(output_path)
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+
     if not transactions:
+        with open(out_file, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.DictWriter(f, fieldnames=MONEYPRO_HEADERS)
+            writer.writeheader()
         return 0
 
     # Deduplicate if requested
@@ -1180,10 +1411,6 @@ def export_to_moneypro_csv(
         transactions.sort(key=lambda t: (t.date, t.amount))
     else:
         transactions.sort(key=lambda t: (t.date, t.amount), reverse=True)
-
-    # Ensure parent output directory exists
-    out_file = Path(output_path)
-    out_file.parent.mkdir(parents=True, exist_ok=True)
 
     with open(out_file, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(f, fieldnames=MONEYPRO_HEADERS)

@@ -1,3 +1,30 @@
 {
-  "language": "zh_TW"
+  "language": "zh_TW",
+  "tab_order": [
+    "holdings",
+    "watchlist",
+    "analytics",
+    "chart",
+    "dividend",
+    "split",
+    "sell",
+    "history",
+    "report",
+    "fire"
+  ],
+  "fire_params": {
+    "current_age": "43",
+    "retire_age": "60",
+    "life_expectancy": "90",
+    "target_safe_years": "25.0",
+    "delay_pension_to_70": true,
+    "target_monthly_expense": "3500.0",
+    "essential_monthly_expense": "2450.0",
+    "discretionary_monthly_expense": "1050.0",
+    "guaranteed_annual_pension": "15000.0",
+    "monthly_savings": "500.0",
+    "expected_div_growth": "5.0",
+    "current_cape": "34.0",
+    "outside_safe_assets": "120000.0"
+  }
 }

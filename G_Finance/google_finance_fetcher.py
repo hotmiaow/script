@@ -6,13 +6,16 @@ Supports automatic exchange detection (NASDAQ, NYSE, NYSEARCA, etc.).
 
 import re
 import urllib.parse
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, Tuple
 import requests
 from bs4 import BeautifulSoup
+import time
+import json
+from datetime import datetime
 
 
 class GoogleFinanceFetcher:
-    COMMON_EXCHANGES = ["NASDAQ", "NYSE", "NYSEARCA", "TSE", "TSX", "HKG", "BATS", "INDEXDJX", "INDEXSP"]
+    COMMON_EXCHANGES = ["NASDAQ", "NYSE", "NYSEARCA", "BATS", "TSX", "TSE", "HKG", "INDEXDJX", "INDEXSP"]
     
     DEFAULT_HEADERS = {
         "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
@@ -139,6 +142,29 @@ class GoogleFinanceFetcher:
         if ":" in sym:
             return self._fetch_url(f"https://www.google.com/finance/quote/{sym}", sym)
 
+        # Handle Yahoo / Canadian / Hong Kong style suffixes
+        if sym.endswith(".HK") or sym.endswith(".HKG"):
+            prefix = sym.split(".")[0].strip()
+            if prefix.isdigit():
+                prefix = f"{int(prefix):04d}"
+            hk_sym = f"{prefix}:HKG"
+            res = self._fetch_url(f"https://www.google.com/finance/quote/{hk_sym}", hk_sym)
+            if res.get("success"):
+                return res
+
+        if sym.endswith(".TO") or sym.endswith(".TSE"):
+            prefix = sym.split(".")[0].strip()
+            to_sym = f"{prefix}:TSE"
+            res = self._fetch_url(f"https://www.google.com/finance/quote/{to_sym}", to_sym)
+            if res.get("success"):
+                return res
+
+        if sym.isdigit() and len(sym) in (4, 5):
+            hk_sym = f"{int(sym):04d}:HKG"
+            res = self._fetch_url(f"https://www.google.com/finance/quote/{hk_sym}", hk_sym)
+            if res.get("success"):
+                return res
+
         # Try direct symbol first
         res = self._fetch_url(f"https://www.google.com/finance/quote/{sym}", sym)
         if res.get("success"):
@@ -234,51 +260,93 @@ class GoogleFinanceFetcher:
         pct_change_text = None
         change_val = None
         pct_change_val = None
+        direction = 1.0
 
-        # Look in aria-labels first (Google Finance uses accessibility labels with exact values, e.g. "Down by 0.26 (1.45%) today")
-        for el in soup.find_all(attrs={"aria-label": True}):
-            aria = self._normalize_text(el.get("aria-label", ""))
-            m_aria = re.search(r"(Up|Down|Increased|Decreased|dropped|gained)\s*(?:by\s*)?([$€£¥]?\s*[\d,]+\.?\d+)\s*(?:\((?:by\s*)?([$€£¥]?\s*[\d,]+\.?\d+)\s*%\))?", aria, re.I)
-            if m_aria:
-                direction = -1.0 if m_aria.group(1).lower() in ("down", "decreased", "dropped") else 1.0
-                if m_aria.group(2) and change_val is None:
-                    try:
-                        raw_c = float(re.sub(r"[$€£¥\s,]", "", m_aria.group(2)))
-                        if raw_c < current_price:
-                            change_val = round(direction * raw_c, 2)
-                    except ValueError:
-                        pass
-                if m_aria.group(3) and pct_change_val is None:
-                    try:
-                        raw_p = float(re.sub(r"[$€£¥\s,]", "", m_aria.group(3)))
-                        pct_change_val = round(direction * raw_p, 2)
-                    except ValueError:
-                        pass
-                if change_val is not None:
-                    break
+        # Scope search to the price container / hero first to avoid catching the top market indices carousel
+        hero = None
+        if price_el:
+            hero = price_el.parent
+        if not hero:
+            hero = soup.find("div", class_="JZvoCc") or soup.find("c-wiz")
 
-        pct_el = (
-            soup.find("span", class_="ymyBi")
-            or soup.find("div", class_=re.compile(r"JwB6zf"))
-            or soup.find("span", class_=re.compile(r"JwB6zf"))
-            or soup.find(class_=re.compile(r"(NydbP|V55Du|BAA5Fd)"))
-        )
-        if pct_el and pct_change_val is None:
-            pct_change_text = self._normalize_text(pct_el.get_text(strip=True))
-            pct_change_val = self._clean_percent(pct_change_text)
-
-        hero = soup.find("div", class_="JZvoCc")
         if hero:
-            for span in hero.find_all(["span", "div"]):
-                t = self._normalize_text(span.get_text(strip=True))
-                if "%" in t and pct_change_val is None:
-                    pct_change_val = self._clean_percent(t)
-                    pct_change_text = t
-                elif (t.startswith("+") or t.startswith("-") or (t.startswith("(") and t.endswith(")"))) and change_val is None:
-                    c = self._clean_number(t)
-                    if c is not None and abs(c) < current_price:
-                        change_val = c
-                        change_text = t
+            # Check arrow direction (arrow_upward vs arrow_downward)
+            arrow_node = hero.find("i", class_=re.compile(r"google-material-icons"))
+            if arrow_node:
+                arr_text = arrow_node.get_text(strip=True).lower()
+                if "down" in arr_text:
+                    direction = -1.0
+                elif "up" in arr_text:
+                    direction = 1.0
+
+            # 1. Percent node: jsname="vY9t3b" (Standard Google Finance percentage change)
+            pct_node = hero.find(attrs={"jsname": "vY9t3b"})
+            if pct_node:
+                raw_p_text = self._normalize_text(pct_node.get_text(strip=True))
+                raw_p = self._clean_percent(raw_p_text)
+                if raw_p is not None:
+                    if raw_p_text.startswith("-"):
+                        pct_change_val = -abs(raw_p)
+                    elif raw_p_text.startswith("+"):
+                        pct_change_val = abs(raw_p)
+                    else:
+                        pct_change_val = round(direction * abs(raw_p), 2)
+
+            # 2. Currency change node: jsname="xnruHf" (Standard Google Finance amount change)
+            chg_node = hero.find(attrs={"jsname": "xnruHf"})
+            if chg_node:
+                raw_c_text = self._normalize_text(chg_node.get_text(strip=True))
+                raw_c = self._clean_number(raw_c_text)
+                if raw_c is not None and abs(raw_c) < current_price:
+                    if raw_c_text.startswith("-"):
+                        change_val = -abs(raw_c)
+                    elif raw_c_text.startswith("+"):
+                        change_val = abs(raw_c)
+                    else:
+                        change_val = round(direction * abs(raw_c), 2)
+
+            # 3. Check aria-labels scoped ONLY within hero/price container
+            if change_val is None or pct_change_val is None:
+                for el in hero.find_all(attrs={"aria-label": True}):
+                    aria = self._normalize_text(el.get("aria-label", ""))
+                    m_aria = re.search(r"(Up|Down|Increased|Decreased|dropped|gained)\s*(?:by\s*)?([$€£¥]?\s*[\d,]+\.?\d+)\s*(?:\((?:by\s*)?([$€£¥]?\s*[\d,]+\.?\d+)\s*%\))?", aria, re.I)
+                    if m_aria:
+                        d = -1.0 if m_aria.group(1).lower() in ("down", "decreased", "dropped") else 1.0
+                        if m_aria.group(2) and change_val is None:
+                            try:
+                                raw_c = float(re.sub(r"[$€£¥\s,]", "", m_aria.group(2)))
+                                if raw_c < current_price:
+                                    change_val = round(d * raw_c, 2)
+                            except ValueError:
+                                pass
+                        if m_aria.group(3) and pct_change_val is None:
+                            try:
+                                raw_p = float(re.sub(r"[$€£¥\s,]", "", m_aria.group(3)))
+                                pct_change_val = round(d * raw_p, 2)
+                            except ValueError:
+                                pass
+
+            # 4. Check JwB6zf or other change elements inside hero
+            if pct_change_val is None or change_val is None:
+                for jw in hero.find_all(class_=re.compile(r"JwB6zf")):
+                    t = self._normalize_text(jw.get_text(strip=True))
+                    if "%" in t and pct_change_val is None:
+                        pct_change_val = self._clean_percent(t)
+                    elif any(t.startswith(x) for x in ["+", "-", "("]) and change_val is None:
+                        c = self._clean_number(t)
+                        if c is not None and abs(c) < current_price:
+                            change_val = c
+
+        # Fallback to JwB6zf across soup (excluding ymyBi market index chips)
+        if pct_change_val is None:
+            pct_el = (
+                soup.find("div", class_=re.compile(r"JwB6zf"))
+                or soup.find("span", class_=re.compile(r"JwB6zf"))
+                or soup.find(class_=re.compile(r"(NydbP|V55Du|BAA5Fd)"))
+            )
+            if pct_el:
+                pct_change_text = self._normalize_text(pct_el.get_text(strip=True))
+                pct_change_val = self._clean_percent(pct_change_text)
 
         # Cross-calculate if one is found and the other is missing
         if change_val is not None and pct_change_val is None and current_price > 0 and (current_price - change_val) > 0:
@@ -325,7 +393,17 @@ class GoogleFinanceFetcher:
                     pct_change_val = round((change_val / prev_close) * 100, 2)
 
         # 6. Parse Dividend Info
-        div_yield_text = stats.get("Dividend") or stats.get("Dividend yield") or "0.00%"
+        div_yield_text = (
+            stats.get("Dividend")
+            or stats.get("Dividend yield")
+            or stats.get("Yield")
+            or stats.get("Trailing 12-month dividend yield")
+            or stats.get("Trailing 12-month distribution yield")
+            or stats.get("Distribution yield")
+            or stats.get("30-day SEC yield")
+            or stats.get("SEC yield")
+            or "0.00%"
+        )
         div_yield = self._clean_percent(div_yield_text) or 0.0
 
         quarterly_div_text = stats.get("Quarterly dividend")
@@ -341,6 +419,13 @@ class GoogleFinanceFetcher:
         else:
             annual_div_per_share = 0.0
             quarterly_div = 0.0
+
+        # Automatic fallback for ETFs and dividend payers if Google Finance omitted yield
+        if (div_yield <= 0.0 or annual_div_per_share <= 0.0) and current_price > 0:
+            fb = self._fetch_dividend_fallback(symbol, current_price)
+            if fb:
+                div_yield, annual_div_per_share = fb
+                quarterly_div = round(annual_div_per_share / 4.0, 4)
 
         ex_div_date = stats.get("Ex-dividend date", "N/A")
         pe_ratio = self._clean_number(stats.get("P/E ratio"))
@@ -359,6 +444,7 @@ class GoogleFinanceFetcher:
             "change_percent": pct_change_val,
             "currency": currency,
             "timestamp": timestamp,
+            "last_updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "dividend_yield": div_yield,
             "quarterly_dividend": quarterly_div,
             "annual_dividend_per_share": annual_div_per_share,
@@ -371,3 +457,35 @@ class GoogleFinanceFetcher:
             "url": url,
             "raw_stats": stats,
         }
+
+    def _fetch_dividend_fallback(self, raw_symbol: str, current_price: float) -> Optional[Tuple[float, float]]:
+        """
+        Lightweight fallback to query Yahoo Finance dividend events when Google Finance omits dividend yield (common for ETFs).
+        """
+        try:
+            import urllib.request
+            from chart_fetcher import to_yfinance_symbol
+            yf_sym = to_yfinance_symbol(raw_symbol)
+            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{yf_sym}?range=1y&interval=1mo&events=div"
+            req = urllib.request.Request(
+                url,
+                headers={"User-Agent": "Mozilla/5.0"}
+            )
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                data = json.loads(resp.read().decode())
+                res = data.get("chart", {}).get("result", [])
+                if res:
+                    events = res[0].get("events", {}).get("dividends", {})
+                    if events:
+                        now = time.time()
+                        one_year_ago = now - 365 * 86400
+                        recent_divs = [float(v["amount"]) for v in events.values() if v.get("date", 0) >= one_year_ago]
+                        if not recent_divs:
+                            recent_divs = [float(v["amount"]) for v in events.values()]
+                        total_annual_div = round(sum(recent_divs), 4)
+                        if total_annual_div > 0 and current_price > 0:
+                            div_yield = round((total_annual_div / current_price) * 100, 2)
+                            return div_yield, total_annual_div
+        except Exception:
+            pass
+        return None

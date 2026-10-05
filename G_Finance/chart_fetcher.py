@@ -58,6 +58,13 @@ def to_yfinance_symbol(symbol: str) -> str:
         elif exchange in ("LON", "LSE"):
             return f"{ticker}.L"
         return ticker
+    if s.endswith(".HK") or s.endswith(".HKG"):
+        prefix = s.split(".")[0].strip()
+        if prefix.isdigit():
+            return f"{int(prefix):04d}.HK"
+        return f"{prefix}.HK"
+    if s.isdigit() and len(s) in (4, 5):
+        return f"{int(s):04d}.HK"
     if s in ("VFV", "VGRO", "ZAG", "XEF"):
         return f"{s}.TO"
     return s
@@ -130,6 +137,23 @@ class ChartFetcher:
         change = curr_price - prev_close
         change_pct = (change / prev_close * 100) if prev_close > 0 else 0.0
 
+        div_events = []
+        try:
+            divs = ticker.dividends
+            if divs is not None and not divs.empty:
+                for dt, amt in divs.items():
+                    if float(amt) > 0:
+                        div_events.append((dt.to_pydatetime().astimezone(timezone.utc), float(amt)))
+        except Exception:
+            pass
+        div_events.sort(key=lambda x: x[0])
+        start_ts_val = timestamps[0].timestamp() if timestamps else 0.0
+        end_ts_val = timestamps[-1].timestamp() if timestamps else time.time()
+        period_div = sum(amt for dt, amt in div_events if start_ts_val <= dt.timestamp() <= end_ts_val)
+        now_ts = time.time()
+        one_yr_divs = [amt for dt, amt in div_events if dt.timestamp() >= (now_ts - 365 * 86400)]
+        annual_div = sum(one_yr_divs) if one_yr_divs else (period_div if div_events else 0.0)
+
         return {
             "label": raw_symbol,
             "symbol": yf_sym,
@@ -141,6 +165,9 @@ class ChartFetcher:
             "change": float(change),
             "change_pct": float(change_pct),
             "currency": "USD" if not yf_sym.endswith(".TO") else "CAD",
+            "dividend_events": div_events,
+            "period_div_per_share": period_div,
+            "annual_dividend_per_share": annual_div,
             "source": "yfinance",
         }
 
@@ -148,7 +175,7 @@ class ChartFetcher:
         yf_sym = to_yfinance_symbol(raw_symbol)
         rng = cfg["period"]
         interval = cfg["interval"]
-        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{yf_sym}?range={rng}&interval={interval}"
+        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{yf_sym}?range={rng}&interval={interval}&events=div%7Csplit"
         req = urllib.request.Request(
             url,
             headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
@@ -180,6 +207,22 @@ class ChartFetcher:
                 change = curr_price - prev_close
                 change_pct = (change / prev_close * 100) if prev_close > 0 else 0.0
 
+                div_events = []
+                events = res0.get("events", {}).get("dividends", {})
+                if events:
+                    for d_info in events.values():
+                        d_amount = float(d_info.get("amount", 0.0) or 0.0)
+                        d_ts = d_info.get("date")
+                        if d_amount > 0 and d_ts:
+                            div_events.append((datetime.fromtimestamp(d_ts, tz=timezone.utc), d_amount))
+                div_events.sort(key=lambda x: x[0])
+                start_ts_val = timestamps[0].timestamp() if timestamps else 0.0
+                end_ts_val = timestamps[-1].timestamp() if timestamps else time.time()
+                period_div = sum(amt for dt, amt in div_events if start_ts_val <= dt.timestamp() <= end_ts_val)
+                now_ts = time.time()
+                one_yr_divs = [amt for dt, amt in div_events if dt.timestamp() >= (now_ts - 365 * 86400)]
+                annual_div = sum(one_yr_divs) if one_yr_divs else (period_div if div_events else 0.0)
+
                 return {
                     "label": raw_symbol,
                     "symbol": yf_sym,
@@ -191,6 +234,9 @@ class ChartFetcher:
                     "change": float(change),
                     "change_pct": float(change_pct),
                     "currency": meta.get("currency", "USD" if not yf_sym.endswith(".TO") else "CAD"),
+                    "dividend_events": div_events,
+                    "period_div_per_share": period_div,
+                    "annual_dividend_per_share": annual_div,
                     "source": "urllib_fallback",
                 }
         except Exception as e:

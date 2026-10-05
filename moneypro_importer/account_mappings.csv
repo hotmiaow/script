@@ -1,7 +1,22 @@
 BankPattern,MoneyProAccount
+4505********4799,CIBC Visa (...4799)
 4500********1234,CIBC Visa (...1234)
 00012345678,CIBC Chequing (...5678)
-40-00-00 12345678,HSBC Premier (...5678)
+4966-0405-2117-2569,HSBC HK Card (...2569)
+Acccount_569,HSBC HK Card (...2569)
+047-3-055531,HSBC Account (...5531)
+Acount_531,HSBC Account (...5531)
+507-3-031683,HSBC Account (...1683)
+661-141333-833,HSBC Account (...3833)
+813-545845-833,HSBC Securities (...5833)
+Account_833,HSBC Securities (...5833)
+549-723914-001,HSBC Account (...4001)
+*cibc*saving*,CIBC Debit Saving
+*cibc*cheq*,CIBC Debit Chequing
+*cibc*credit*,CIBC Credit
+*hsbc*credit*,HSBC Credit
+*adv*saving*,HSBC HK Adv-Saving
+*currcy*,HSBC HK Saving
 cibc_visa,CIBC Visa
 cibc_chequing,CIBC Chequing
 cibc_dividend,CIBC Visa Dividend

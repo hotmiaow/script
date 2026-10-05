@@ -8,6 +8,10 @@ class TestChartFetcher(unittest.TestCase):
         self.assertEqual(to_yfinance_symbol("VGRO:TSX"), "VGRO.TO")
         self.assertEqual(to_yfinance_symbol("9988:HKG"), "9988.HK")
         self.assertEqual(to_yfinance_symbol("700:HKG"), "0700.HK")
+        self.assertEqual(to_yfinance_symbol("0005"), "0005.HK")
+        self.assertEqual(to_yfinance_symbol("0005.HK"), "0005.HK")
+        self.assertEqual(to_yfinance_symbol("1137"), "1137.HK")
+        self.assertEqual(to_yfinance_symbol("1137.HK"), "1137.HK")
         self.assertEqual(to_yfinance_symbol("VOO"), "VOO")
         self.assertEqual(to_yfinance_symbol("INTC"), "INTC")
         self.assertEqual(to_yfinance_symbol("VFV"), "VFV.TO")
@@ -19,7 +23,20 @@ class TestChartFetcher(unittest.TestCase):
             self.assertIn("interval", TIMEFRAME_CONFIGS[tf])
 
     def test_fetch_symbol_caching(self):
+        from datetime import datetime
         fetcher = get_chart_fetcher()
+        mock_data = {
+            "symbol": "VOO",
+            "timeframe": "1D",
+            "prices": [450.0, 452.0],
+            "timestamps": [datetime.now(), datetime.now()],
+            "prev_close": 448.0,
+            "currency": "USD",
+            "current_price": 452.0,
+            "change": 4.0,
+            "change_pct": 0.89,
+        }
+        fetcher._set_cache("sym:VOO:1D", mock_data)
         res1 = fetcher.fetch_symbol_history("VOO", "1D")
         self.assertIsNotNone(res1)
         self.assertIn("prices", res1)

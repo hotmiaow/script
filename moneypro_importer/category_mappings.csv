@@ -413,7 +413,8 @@ transit,Transportation
 electric,Utilities
 power,Utilities
 natural gas,Utilities
-internet,Utilities
+home internet,Utilities
+internet service,Utilities
 telecom,Utilities
 wifi,Utilities
 clothing,Shopping
@@ -430,3 +431,79 @@ bank transfer,Transfer
 internal transfer,Transfer
 transfer to,Transfer
 transfer from,Transfer
+Branch Transaction SERVICE CHARGE DISCOUNT,Refund
+Branch Transaction DEPOSIT,Refund
+PAYMENT THANK YOU/PAIEMEN T MERCI,Transfer
+Branch Transaction INTEREST,Refund
+Branch Transaction BONUS INTEREST,Refund
+Branch Transaction SMART INTEREST,Refund
+CASH REBATE 9102 CREDIT AS ADVISED,Income
+CREDIT INTEREST,Income
+LEE CHUN MAN N41046788496(10APR26),Transfer
+SEC S883095001 SALE PAYT,Income
+CORP EVT PAYMENT SEC 813545845380GET NICE,Dividend income
+LEE CHUN MAN N90198855434(01SEP25),Transfer
+CORP EVT PAYMENT SEC 813545845380ABC-H SHS,Income
+MISS LI CHOI YIN HC12571901396428 19JUL,Income
+CORP EVT PAYMENT SEC 813545845380HSBC HOLDING,Income
+CORP EVT PAYMENT SEC 813545845380UNTRADE-GET,Income
+LEE CHUN MAN N40167837374(01APR25),Transfer
+LEE CHUN MAN N30582776972(05MAR25),Transfer
+LEE CHUN MAN NB0271763850(02NOV24),Transfer
+MR CHAN HO TAK HC124A0405968699 04OCT,Income
+LEE CHUN MAN NA0272973839(02OCT24),Transfer
+MISS LI CHOI YIN HC12492988322925 29SEP,Income
+the royal chine,Dining: Lunch
+royal chinese,Dining: Lunch
+hai tang cafe,Dining: Lunch
+sugar sweet caf,Dining: Sweet soup
+sugar sweet cafe,Dining: Sweet soup
+fu kee bao dim,Dining: Lunch
+fu kee,Dining: Lunch
+matsuya korean,Dining: Dinner
+matsuya,Dining: Dinner
+pepper meet pep,Dining: Lunch
+daldongnae,Dining: Dinner
+louie's diner,Dining: Lunch
+louies diner,Dining: Lunch
+koho food,Dining: Lunch
+saint germain b,Dining: Breakfast
+saint germain,Dining: Breakfast
+happy fishman,Dining: Lunch
+qing shu malata,Dining: Lunch
+morefish,Dining: Lunch
+square noodle,Dining: Lunch
+the best shop,Shopping
+dollarama,Shopping
+african lion safari,Entertain: Admission fee
+playplex game,Entertain: Game
+carma farms,Groceries: Groceries
+freshway,Groceries: Groceries
+mount joy,Transport: Transport
+hopp,Transport: Taxi
+deer run wellne,Healthcare
+deer run wellness,Healthcare
+isi inv edge,Transfer
+investor's edge,Transfer
+cibc-disar,Transfer
+cibc-disatf,Transfer
+alectra utilities,Utilities: PowerStream water supply
+alectra,Utilities: PowerStream water supply
+rembours. d'impôt,Refund
+tax refund,Refund
+pay to: cra,Taxes
+cash rebate,Income
+custodian fee,Financial & Fees
+paper stmt,Misc: Bank service Fee
+bonus interest,Income
+smart interest,Income
+service charge capped,Financial & Fees
+service charge discount,Income
+credit card payment,Transfer
+Keith,Transfer
+chun man lee,Transfer
+CHUN MAN LEE,Transfer
+landlordAngela,Interact
+Internet Banking INTERNET DEPOSIT 000000216170,Transfer
+SEC S883328001 SALE PAYT,Income
+SEC S537881001 SALE PAYT,Income

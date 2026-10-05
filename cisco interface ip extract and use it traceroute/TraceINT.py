@@ -8,10 +8,16 @@ Enhanced Cisco Network Traceroute Mapper
 • Falls back to the interactive menu when no target is supplied
 • Performs forward (A) and reverse (PTR) DNS look-ups
 • Groups inventory by security zone
+• Source ↔ Destination mode (WAN aware)
+  $ python3 TraceINT.py -s 10.1.1.10 -d 10.2.2.20
+  Traces to both endpoints; if both paths contain a WAN router (device name
+  contains 'wanr', configurable via --wan-keyword) the two traces are
+  stitched together into one end-to-end path across the WAN.
 """
 
 import argparse
 import csv
+import functools
 import ipaddress
 import os
 import platform
@@ -47,6 +53,7 @@ def resolve_target(target: str) -> str:
         raise ValueError(f"DNS resolution failed for '{target}': {exc}") from None
 
 
+@functools.lru_cache(maxsize=4096)
 def get_reverse_dns(ip: str) -> Optional[str]:
     """Best-effort PTR lookup – returns hostname or None."""
     try:
@@ -72,6 +79,8 @@ class CiscoTracerouteMapper:
         self.max_hops: int = 20         # Default limited to 20 for speed
         self.timeout_base: int = 3
         self.max_retries: int = 2
+        # Device-name keyword identifying WAN routers (case-insensitive)
+        self.wan_keyword: str = "wanr"
         # Addon subnets: list of (network_obj, behind_device_str, info_str)
         self.addon_subnets: List[Tuple[ipaddress.IPv4Network, str, str]] = []
 
@@ -856,6 +865,211 @@ class CiscoTracerouteMapper:
                     is_ver = " (Verified)" if any(m[1] == ip_str for m in matches) else ""
                     print(f"    - Hop {h:<2}: {dev:<20} ({ip_str}){is_ver}")
 
+    # ───── source ↔ destination (WAN aware) ──────────────────────────────────
+    def _hop_device(self, ip: Optional[str]) -> Optional[str]:
+        """Device name for a hop IP (inventory first, PTR short-name fallback)."""
+        if not ip:
+            return None
+        dev = self.ip_to_device_map.get(ip, (None, None, None, None, None))[0]
+        if dev:
+            return dev
+        if self.resolve_dns:
+            ptr = get_reverse_dns(ip)
+            if ptr:
+                return ptr.split(".")[0]
+        return None
+
+    def _is_wan_router(self, device: Optional[str]) -> bool:
+        return bool(device) and self.wan_keyword.lower() in device.lower()
+
+    def _last_wan_index(self, hops: List[Tuple[int, Optional[str]]]) -> Optional[int]:
+        """Index of the WAN router closest to the traced endpoint (last one seen)."""
+        for i in range(len(hops) - 1, -1, -1):
+            if self._is_wan_router(self._hop_device(hops[i][1])):
+                return i
+        return None
+
+    @staticmethod
+    def _trim_trace(
+        hops: List[Tuple[int, Optional[str]]], target_ip: str
+    ) -> List[Tuple[int, Optional[str]]]:
+        """Cut the trace at the target and drop trailing timeouts."""
+        out: List[Tuple[int, Optional[str]]] = []
+        for h, ip in hops:
+            out.append((h, ip))
+            if ip == target_ip:
+                break
+        while out and out[-1][1] is None:
+            out.pop()
+        return out
+
+    def _hop_info(self, ip: str) -> Tuple[str, str, str]:
+        """Returns (device_label, interface, zone) for display."""
+        device, iface, zone, _vrf, _desc = self.ip_to_device_map.get(
+            ip, (None, None, None, None, None)
+        )
+        if device:
+            return device, iface or "", zone or ""
+        addons = self.check_addon_subnet(ip)
+        if addons:
+            devs = ", ".join(sorted({d for _, d, _ in addons}))
+            return f"[Sub: {devs}]", "", ""
+        ptr_dev = self._hop_device(ip)
+        if ptr_dev:
+            return f"({ptr_dev})", "", ""
+        return "External/Unknown", "", ""
+
+    def _print_combined_path(
+        self, path: List[Tuple[str, Optional[str], str]]
+    ) -> None:
+        """Prints stitched path rows: (segment, ip_or_None, note)."""
+        print("-" * 120)
+        print(f"{'#':>3}  {'Segment':<10} {'IP Address':<16} {'Device Name':<25} "
+              f"{'Interface':<22} {'Zone':<15} Note")
+        print("-" * 120)
+        n = 0
+        for seg, ip, note in path:
+            if seg == "WAN":
+                print(f"{'':>3}  {'':<10} {'≈' * 18}  {note}  {'≈' * 18}")
+                continue
+            n += 1
+            if ip is None:
+                print(f"{n:>3}  {seg:<10} {'*':<16} {'(timeout)':<25}")
+                continue
+            dev, iface, zone = self._hop_info(ip)
+            if self._is_wan_router(self._hop_device(ip)):
+                note = (note + " " if note else "") + "🌐 WAN router"
+            print(f"{n:>3}  {seg:<10} {ip:<16} {dev[:25]:<25} {iface[:22]:<22} "
+                  f"{zone[:15]:<15} {note}")
+        print("-" * 120)
+
+    def trace_source_destination(self, source: str, destination: str) -> None:
+        """
+        Traces from this host to SOURCE and to DESTINATION. If both traces pass
+        through a WAN router (device name contains self.wan_keyword) the two
+        sites are considered connected over the WAN and the paths are stitched:
+
+            SOURCE → … → src-site WANR ≈≈ WAN ≈≈ dst-site WANR → … → DESTINATION
+
+        The source-side segment is the reverse of the trace to SOURCE, so it is
+        an inferred path (actual return routing may differ).
+        """
+        print("\n" + "=" * 80)
+        print(f"SOURCE ↔ DESTINATION PATH   ({source}  →  {destination})")
+        print(f"WAN router keyword: '{self.wan_keyword}'")
+        print("=" * 80)
+
+        try:
+            src_ip = resolve_target(source)
+            dst_ip = resolve_target(destination)
+        except ValueError as err:
+            print(err)
+            return
+        if src_ip == dst_ip:
+            print("Source and destination resolve to the same IP – nothing to do.")
+            return
+
+        for label, orig, ip in (("Source", source, src_ip), ("Destination", destination, dst_ip)):
+            for _net, dev, info in self.check_addon_subnet(ip):
+                print(f"ℹ️  ADDON INFO for {label} {orig} ({ip}): Matches {_net} (Behind {dev}) [{info}]")
+            if not self._test_connectivity(ip):
+                print(f"⚠️  {label} {orig} ({ip}) might be unreachable (ping failed).")
+
+        print("\nCollecting traces to source and destination in parallel…")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
+            f_src = ex.submit(self.collect_trace, src_ip, True)
+            f_dst = ex.submit(self.collect_trace, dst_ip, True)
+            src_hops = self._trim_trace(f_src.result(), src_ip)
+            dst_hops = self._trim_trace(f_dst.result(), dst_ip)
+
+        # Side-by-side view of the raw traces
+        resolved = [(f"SRC: {source}", src_ip), (f"DST: {destination}", dst_ip)]
+        results = {
+            src_ip: {h: ip for h, ip in src_hops if ip},
+            dst_ip: {h: ip for h, ip in dst_hops if ip},
+        }
+        max_hop = max([h for h, _ in src_hops + dst_hops] or [0])
+        self._display_comparison_grid(resolved, results, max_hop)
+
+        def seg(ip: Optional[str], default: str) -> str:
+            if ip == src_ip:
+                return "SOURCE"
+            if ip == dst_ip:
+                return "DEST"
+            return default
+
+        src_reached = bool(src_hops) and src_hops[-1][1] == src_ip
+        dst_reached = bool(dst_hops) and dst_hops[-1][1] == dst_ip
+
+        ia = self._last_wan_index(src_hops)
+        ib = self._last_wan_index(dst_hops)
+        path: List[Tuple[str, Optional[str], str]] = []
+
+        print("\n" + "=" * 80)
+        print("COMBINED END-TO-END PATH")
+        print("=" * 80)
+
+        if ia is not None and ib is not None:
+            wan_a_ip, wan_b_ip = src_hops[ia][1], dst_hops[ib][1]
+            dev_a, dev_b = self._hop_device(wan_a_ip), self._hop_device(wan_b_ip)
+
+            if not src_reached:
+                path.append(("SOURCE", src_ip, "not reached by traceroute"))
+            for _, ip in reversed(src_hops[ia + 1:]):
+                path.append((seg(ip, "SRC-SITE"), ip, ""))
+
+            if dev_a == dev_b:
+                print(f"✓ Both paths converge at WAN router {dev_a} (same site / hub).")
+                path.append(("WAN-RTR", wan_a_ip, ""))
+                if wan_b_ip != wan_a_ip:
+                    path.append(("WAN-RTR", wan_b_ip, ""))
+            else:
+                print(f"✓ Sites are connected via WAN: {dev_a}  ≈≈ WAN ≈≈  {dev_b}")
+                path.append(("SRC-WAN", wan_a_ip, ""))
+                path.append(("WAN", None, f"WAN  {dev_a} ⇄ {dev_b}"))
+                path.append(("DST-WAN", wan_b_ip, ""))
+
+            for _, ip in dst_hops[ib + 1:]:
+                path.append((seg(ip, "DST-SITE"), ip, ""))
+            if not dst_reached:
+                path.append(("DEST", dst_ip, "not reached by traceroute"))
+
+            self._print_combined_path(path)
+            print("ℹ️  Source-side segment is the reverse of the trace to the source (inferred).")
+        else:
+            missing = []
+            if ia is None:
+                missing.append("source")
+            if ib is None:
+                missing.append("destination")
+            print(f"⚠️  No '{self.wan_keyword}' WAN router found in the trace to the "
+                  f"{' and '.join(missing)} – sites are not linked via WAN.")
+
+            # Fallback: pivot on the last hop common to both traces (same site)
+            common = -1
+            for i in range(min(len(src_hops), len(dst_hops))):
+                a_ip, b_ip = src_hops[i][1], dst_hops[i][1]
+                if a_ip and a_ip == b_ip:
+                    common = i
+                elif a_ip != b_ip:
+                    break
+            if common < 0:
+                print("   No common hop either – unable to build a combined path.")
+                return
+
+            pivot_ip = src_hops[common][1]
+            print(f"   Building local path via last common hop {pivot_ip}.")
+            if not src_reached:
+                path.append(("SOURCE", src_ip, "not reached by traceroute"))
+            for _, ip in reversed(src_hops[common + 1:]):
+                path.append((seg(ip, "SRC-SIDE"), ip, ""))
+            path.append(("PIVOT", pivot_ip, "last common hop"))
+            for _, ip in dst_hops[common + 1:]:
+                path.append((seg(ip, "DST-SIDE"), ip, ""))
+            if not dst_reached:
+                path.append(("DEST", dst_ip, "not reached by traceroute"))
+            self._print_combined_path(path)
+
     # ───── interactive menu ──────────────────────────────────────────────────
     def _configure_settings(self) -> None:
         """Change max_hops / timeout_base / max_retries interactively."""
@@ -874,12 +1088,17 @@ class CiscoTracerouteMapper:
             new_retry = input(f"Max retries (unused) [{self.max_retries}]: ").strip()
             if new_retry:
                 self.max_retries = max(0, min(5, int(new_retry)))
+
+            new_kw = input(f"WAN router keyword [{self.wan_keyword}]: ").strip()
+            if new_kw:
+                self.wan_keyword = new_kw
         except ValueError:
             print("Invalid entry – settings unchanged.")
         print("Settings now:")
         print(f"  max_hops = {self.max_hops}")
         print(f"  timeout  = {self.timeout_base}s")
         print(f"  retries  = {self.max_retries}")
+        print(f"  wan kw   = {self.wan_keyword}")
 
     def interactive_menu(self) -> None:
         while True:
@@ -891,11 +1110,12 @@ class CiscoTracerouteMapper:
             print("2. Trace to Single Destination")
             print("3. Trace & Compare Multiple Destinations")
             print("4. Troubleshooting Mode (Verify Path)")
-            print("5. Configure Traceroute Settings")
-            print(f"6. Toggle DNS Resolution (Current: {dns_state})")
-            print("7. Exit")
+            print("5. Trace Source ↔ Destination (WAN-aware combined path)")
+            print("6. Configure Traceroute Settings")
+            print(f"7. Toggle DNS Resolution (Current: {dns_state})")
+            print("8. Exit")
             print("-" * 80)
-            choice = input("Select option (1-7): ").strip()
+            choice = input("Select option (1-8): ").strip()
 
             if choice == "1":
                 self.display_device_inventory()
@@ -911,11 +1131,18 @@ class CiscoTracerouteMapper:
             elif choice == "4":
                 self.troubleshooting_mode()
             elif choice == "5":
-                self._configure_settings()
+                src = input("Enter SOURCE IP or hostname: ").strip()
+                dst = input("Enter DESTINATION IP or hostname: ").strip()
+                if src and dst:
+                    self.trace_source_destination(src, dst)
+                else:
+                    print("Both source and destination are required.")
             elif choice == "6":
+                self._configure_settings()
+            elif choice == "7":
                 self.resolve_dns = not self.resolve_dns
                 print(f"DNS Resolution is now { 'ON' if self.resolve_dns else 'OFF' }")
-            elif choice == "7":
+            elif choice == "8":
                 print("Good-bye!")
                 break
             else:
@@ -952,7 +1179,25 @@ def main() -> None:
         action="store_true",
         help="Enable DNS resolution for hops (default: False)",
     )
+    parser.add_argument(
+        "-s",
+        "--source",
+        help="Source IP/hostname for Source ↔ Destination WAN-aware path (use with -d)",
+    )
+    parser.add_argument(
+        "-d",
+        "--destination",
+        help="Destination IP/hostname for Source ↔ Destination WAN-aware path (use with -s)",
+    )
+    parser.add_argument(
+        "--wan-keyword",
+        default="wanr",
+        help="Device-name keyword identifying WAN routers (default: %(default)s)",
+    )
     args = parser.parse_args()
+
+    if bool(args.source) != bool(args.destination):
+        parser.error("--source and --destination must be used together")
 
     # 1. Instantiate & Load Data
     mapper = CiscoTracerouteMapper(csv_file=args.csv)
@@ -962,8 +1207,11 @@ def main() -> None:
 
     # 2. Check Arguments
     mapper.resolve_dns = args.resolve_dns  # Apply argument
+    mapper.wan_keyword = args.wan_keyword
 
-    if args.targets:  # non-interactive
+    if args.source and args.destination:
+        mapper.trace_source_destination(args.source, args.destination)
+    elif args.targets:  # non-interactive
 
         if args.compare and len(args.targets) > 1:
             mapper.compare_traces(args.targets)

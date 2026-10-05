@@ -463,6 +463,140 @@ class TestIncomingAndTransferReview(unittest.TestCase):
         self.assertIn("Groceries", suggestions)
 
 
+class TestRealTransactionsSuite(unittest.TestCase):
+    """Tests real-world statement formats attached by user:
+    1. CIBC 4-col chequing with Interac POS and E-Transfers
+    2. CIBC 5-col Visa card with masked card XXXXXXX and city/province noise
+    3. CIBC 4-col savings with interest and bill payments
+    4. HSBC HK statement with malformed triple quotes and thousands commas
+    """
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_cibc_real_chequing(self):
+        csv_path = Path(self.temp_dir) / "cibc_chequing_real.csv"
+        content = (
+            "2026-09-21,Point of Sale - Interac RETAIL PURCHASE 626315264650 MOUNT JOY STATI,29.81,\n"
+            "2026-09-21,Internet Banking E-TRANSFER 011710169038 MAN HIN WONG,,25.25\n"
+            "2026-09-17,Internet Banking TRANSFER - INVESTMENT 111103412251 ISI INV EDGE,9000.00,\n"
+            "2026-05-26,Internet Banking INTERNET BILL PAY 000000116100 ALECTRA UTILITIES,138.68,\n"
+        )
+        csv_path.write_text(content, encoding="utf-8")
+        parser = mpi.detect_parser(str(csv_path))
+        self.assertIsInstance(parser, mpi.CIBCParser)
+        txs = parser.parse(str(csv_path), auto_categorize=True)
+        self.assertEqual(len(txs), 4)
+
+        # 1. MOUNT JOY STATI
+        self.assertEqual(txs[0].date, "2026-09-21")
+        self.assertEqual(txs[0].amount, -29.81)
+        self.assertEqual(txs[0].payee, "MOUNT JOY STATI")
+        self.assertEqual(txs[0].account, "CIBC Debit Chequing")
+
+        # 2. MAN HIN WONG
+        self.assertEqual(txs[1].date, "2026-09-21")
+        self.assertEqual(txs[1].amount, 25.25)
+        self.assertEqual(txs[1].payee, "MAN HIN WONG")
+
+        # 3. ISI INV EDGE -> Investment Transfer, NOT Utilities!
+        self.assertEqual(txs[2].amount, -9000.00)
+        self.assertEqual(txs[2].payee, "CIBC Investor's Edge")
+        self.assertEqual(txs[2].category, "Transfer")
+
+        # 4. Alectra Utilities -> Utilities
+        self.assertEqual(txs[3].amount, -138.68)
+        self.assertEqual(txs[3].payee, "Alectra Utilities")
+        self.assertEqual(txs[3].category, "Utilities: PowerStream water supply")
+
+    def test_cibc_real_visa_5col(self):
+        csv_path = Path(self.temp_dir) / "cibc_visa_real.csv"
+        content = (
+            '2026-09-23,"PUBLIC MOBILE SELF-SER EDMONTON, AB",22.6,,XXXXXXX\n'
+            '2026-09-21,"THE BEST SHOP MARKHAM, ON",30.49,,XXXXXXX\n'
+            '2026-09-08,"DALDONGNAE #5 SCARBOROUGH, ON",156.62,,XXXXXXX\n'
+            '2026-09-08,"AFRICAN LION SAFARI CAMBRIDGE, ON",223.5,,XXXXXXX\n'
+            '2026-09-11,PAYMENT THANK YOU/PAIEMEN T MERCI,,2026.93,XXXXXXX\n'
+        )
+        csv_path.write_text(content, encoding="utf-8")
+        parser = mpi.detect_parser(str(csv_path))
+        self.assertIsInstance(parser, mpi.CIBCParser)
+        txs = parser.parse(str(csv_path), auto_categorize=True)
+        self.assertEqual(len(txs), 5)
+
+        # Public Mobile
+        self.assertEqual(txs[0].payee, "Public Mobile")
+        self.assertEqual(txs[0].amount, -22.60)
+        self.assertEqual(txs[0].account, "CIBC Visa")
+        self.assertEqual(txs[0].category, "Subscription: Mobile phone")
+
+        # The Best Shop Markham
+        self.assertEqual(txs[1].payee, "THE BEST SHOP")
+        self.assertEqual(txs[1].amount, -30.49)
+
+        # Daldongnae BBQ
+        self.assertEqual(txs[2].payee, "DALDONGNAE")
+        self.assertEqual(txs[2].amount, -156.62)
+        self.assertEqual(txs[2].category, "Dining: Dinner")
+
+        # African Lion Safari
+        self.assertEqual(txs[3].payee, "African Lion Safari")
+        self.assertEqual(txs[3].amount, -223.50)
+        self.assertEqual(txs[3].category, "Entertain: Admission fee")
+
+        # Credit card payment
+        self.assertEqual(txs[4].amount, 2026.93)
+        self.assertEqual(txs[4].category, "Transfer")
+
+    def test_hsbc_hk_malformed_quotes_and_commas(self):
+        csv_path = Path(self.temp_dir) / "hsbc_hk_real.csv"
+        content = (
+            "Date,Description,Billing amount,Billing currency,Balance,Balance currency,,\n"
+            '25/09/2026,4966-0405-2117-2569      N92523518992(25SEP26),"""-4","715.00""\t",HKD,"""64","441.83""\t",HKD\n'
+            '23/09/2026,CASH REBATE 9102         CREDIT AS ADVISED,"""5.28""\t",HKD,"""69","156.83""\t",HKD,\n'
+            '23/09/2026,MDC P COSTCO WHOLESA     CAD235.99      5.61210RT,"""-1","324.40""\t",HKD,"""69","151.55""\t",HKD\n'
+            '01/09/2026,CUSTODIAN FEE    SEC     813545845380,"""-25.00""\t",HKD,"""70","475.95""\t",HKD,\n'
+            '28/08/2026,CREDIT INTEREST,"""0.12""\t",HKD,"""70","739.42""\t",HKD,\n'
+            '10/04/2026,Keith             N41046788496(10APR26),"""60","000.00""\t",HKD,"""157","938.54""\t",HKD\n'
+        )
+        csv_path.write_text(content, encoding="utf-8")
+        parser = mpi.detect_parser(str(csv_path))
+        self.assertIsInstance(parser, mpi.HSBCParser)
+        txs = parser.parse(str(csv_path), auto_categorize=True)
+        self.assertEqual(len(txs), 6)
+
+        # 1. -4,715.00 with card 4966-0405-2117-2569
+        self.assertEqual(txs[0].date, "2026-09-25")
+        self.assertEqual(txs[0].amount, -4715.00)
+        self.assertEqual(txs[0].account, "HSBC HK Card (...2569)")
+
+        # 2. CASH REBATE -> +5.28
+        self.assertEqual(txs[1].amount, 5.28)
+        self.assertEqual(txs[1].category, "Income")
+
+        # 3. Costco with foreign currency info CAD235.99 stripped -> -1324.40
+        self.assertEqual(txs[2].amount, -1324.40)
+        self.assertEqual(txs[2].payee, "Costco Wholesale")
+        self.assertEqual(txs[2].category, "Groceries")
+
+        # 4. Custodian Fee -> -25.00
+        self.assertEqual(txs[3].amount, -25.00)
+        self.assertEqual(txs[3].category, "Financial & Fees")
+
+        # 5. Credit interest -> +0.12
+        self.assertEqual(txs[4].amount, 0.12)
+        self.assertEqual(txs[4].category, "Income")
+
+        # 6. Keith +60,000.00
+        self.assertEqual(txs[5].amount, 60000.00)
+        self.assertEqual(txs[5].payee, "Keith")
+        self.assertEqual(txs[5].category, "Transfer")
+
+
 def run_all_tests():
     suite = unittest.defaultTestLoader.loadTestsFromModule(sys.modules[__name__])
     runner = unittest.TextTestRunner(verbosity=2)

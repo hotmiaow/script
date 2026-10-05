@@ -26,5 +26,9 @@ if __name__ == "__main__":
         launch_app()
     except (KeyboardInterrupt, SystemExit):
         pass
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        os._exit(1)
     finally:
         os._exit(0)

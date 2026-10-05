@@ -1,11 +1,11 @@
 # Software Requirements Document (SRD)
 ## Google Finance Portfolio Tracker & Financial Calculator Suite
 
-**Document Version:** 2.0.0  
+**Document Version:** 2.2.0  
 **Status:** Completed & Implemented  
-**Date:** 2026-09-18  
+**Date:** 2026-09-22  
 **System Type:** Desktop Financial Management & Analytics Application  
-**Runtime:** Python 3.10+ (Tkinter / Native Canvas / Requests / BeautifulSoup)  
+**Runtime:** Python 3.10+ (Tkinter / Native Canvas / Matplotlib / Requests / BeautifulSoup)  
 
 ---
 
@@ -16,12 +16,14 @@ The **Google Finance Portfolio Tracker & Financial Calculator Suite** is a high-
 The suite provides:
 1. Real-time quote streaming from international exchanges (US, SSE, TSE, etc.) and foreign exchange (FX) rates.
 2. Comprehensive multi-portfolio management and cross-account consolidated analytics.
-3. Interactive Google Finance-style visual charting and dynamic asset allocation donut charts.
-4. Mathematical financial modeling tools: Dividend & DRIP compounding simulators, stock split calculators, and capital gains selling simulators.
-5. Complete transaction history tracking for all BUY and SELL activities with multi-criteria filtering.
-6. Automatic rolling 5-version file backup and rotation engine.
-7. Tri-lingual Internationalization (i18n) supporting English, Traditional Chinese (`繁體中文`), and Simplified Chinese (`简体中文`) with real-time UI switching.
-8. Instant, cooperative termination lifecycle management.
+3. Interactive Google Finance-style visual charting with dual rendering engines (Matplotlib vector & pure Tkinter canvas fallback) and dynamic asset allocation / currency exposure donut charts.
+4. Mathematical financial modeling tools: Dividend & DRIP compounding simulators, stock split calculators, capital gains selling simulators, and period earnings performance reports.
+5. Configurable broker commission tariffs (HSBC, CIBC, IBKR, Zero-Commission) and safe custody / storage fee accounting.
+6. Complete transaction history tracking for all BUY, SELL, and FEE activities with multi-criteria filtering, real-time search, and bi-directional column sorting.
+7. Automatic rolling 5-version file backup and rotation engine.
+8. Tri-lingual Internationalization (i18n) supporting English, Traditional Chinese (`繁體中文`), and Simplified Chinese (`简体中文`) with real-time UI switching.
+9. One-click executive reporting in HTML and structured CSV formats.
+10. Instant, cooperative termination lifecycle management.
 
 ---
 
@@ -142,6 +144,77 @@ The suite provides:
 - **FR-12.3**: `on_close` must break Tkinter's `mainloop()` using `root.quit()` and release widget resources with `root.destroy()`.
 - **FR-12.4**: Background thread pools and unclosed HTTP connections must be explicitly unblocked, followed by `os._exit(0)` to prevent the Python interpreter from hanging in terminal sessions.
 
+### FR-13: Configurable Broker Commission Tariffs & Presets
+- **FR-13.1**: The system shall support customizable broker commission schedules per portfolio, persisted in `portfolio_fees.json`.
+- **FR-13.2 (Industry Presets)**: Provide standard tariff presets:
+  - **Zero-Commission / US Modern (Schwab, Robinhood, Fidelity)**: $0 flat, 0%, $0 min.
+  - **HSBC Hong Kong / Global Retail**: 0.25% commission (minimum $15.00 / HKD 100).
+  - **HSBC Trade25**: $0 trade commission, HKD 25 (~US$3.20) monthly flat fee.
+  - **CIBC Imperial Investor / Investor's Edge**: $6.95 flat per trade, quarterly administration fee.
+  - **Interactive Brokers (IBKR)**: $1.00 minimum / $0.005 per share.
+  - **Custom Tariff**: User-defined flat fee ($), percentage rate (%), and minimum commission threshold ($).
+- **FR-13.3 (Automatic Pre-population & Manual Override)**:
+  - When recording BUY transactions or calculating sales proceeds, the system shall automatically pre-populate estimated commission fees based on the selected portfolio's tariff.
+  - Commission fees must remain 100% editable by the user before committing the transaction.
+- **FR-13.4 (Fee Settings Dialog)**: Top toolbar button `⚙️ Fee Settings` opens a dedicated configuration modal allowing users to adjust presets, rates, and storage fee schedules per portfolio.
+
+### FR-14: Safe Custody & Account Storage Fee Tracking
+- **FR-14.1**: Supports recurring safe custody / account maintenance fees (e.g. HSBC monthly safe custody fees, CIBC quarterly administration charges) configurable by amount and frequency (`Monthly`, `Quarterly`, `Semi-Annually`, `Annually`, or `None`).
+- **FR-14.2 (1-Click Fee Logging)**: Transaction History toolbar shall feature a **📅 Log Custody / Storage Fee** button to immediately post a custody fee to the active portfolio's ledger.
+- **FR-14.3 (Period Deduction)**: Custody and storage charges shall be automatically accounted for and deducted from net realized profit in period earnings calculations.
+
+### FR-15: Period Earnings Performance Report Suite
+- **FR-15.1**: The application shall feature a dedicated `📊 Period Earnings Report` tab (Tab 8) tracking realized trading performance across user-defined time horizons.
+- **FR-15.2 (Period Timeframes)**: Supports standard interval modes:
+  - `This Month` (current calendar month to date).
+  - `This Week` (current week Monday to Sunday).
+  - `In Months` (chronological month-by-month earnings breakdown).
+  - `In Weeks` (chronological week-by-week earnings breakdown).
+  - `Custom Range` (arbitrary start and end dates with date validation).
+- **FR-15.3 (Executive KPI Cards)**: Displays key performance indicators:
+  - Total Realized Profit ($) with gain/loss color-coding.
+  - Period ROI (%).
+  - Total Sell Proceeds ($).
+  - Total Cost Basis Sold ($).
+  - Total Buy Volume ($).
+  - Trade Breakdown Counter (e.g. `X Buys / Y Sells / Z Dividends`).
+- **FR-15.4 (Dual Sub-Notebook Presentation)**:
+  - **📅 Period Intervals Breakdown Tree**: Aggregates trading volume, proceeds, cost, realized profit, and ROI per sub-period.
+  - **📜 Individual Transaction Records Tree**: Displays line-item audit logs of trades executed during the selected period.
+- **FR-15.5 (Multi-Format Exporting)**:
+  - **HTML Report**: Standalone, print-ready HTML document with embedded CSS and PDF print styling.
+  - **CSV Report**: Structured CSV export containing report metadata, summary KPIs, interval breakdowns, and transaction rows.
+
+### FR-16: Advanced Interactive Charting (Multi-Metric Modes, Per-Share Quotes & Dividend Profile)
+- **FR-16.1 (Dual Rendering Engine)**:
+  - **Matplotlib Vector Mode**: Anti-aliased high-DPI vector graphics with gradient fills, previous close baseline, and dynamic hover crosshairs.
+  - **Native Tkinter Canvas Mode**: Zero-dependency fallback ensuring 100% chart functionality even on minimal Python installations.
+- **FR-16.2 (Flexible Metric Modes)**:
+  - **Total Position Value** (`chart_metric_total`): $P(t) \times \text{shares}$ representing total holding worth.
+  - **Stock Price (Per Share)** (`chart_metric_price`): Raw per-share market price quote $P(t)$ with daily change and prior close.
+  - **Net Growth** (`chart_metric_growth`): Net profit/loss excluding invested principal ($P(t) \times \text{shares} - \text{Cost Basis}$).
+  - **Net Growth + Dividends** (`chart_metric_growth_div`): Total return combining capital appreciation and cumulative cash distributions.
+  - **Dividends Only** (`chart_metric_div_only`): Accrued cumulative dividend distributions over the selected timeframe.
+- **FR-16.3 (Live Dividend Profile & Frequency Classification)**:
+  - For dividend-paying stocks and ETFs (e.g. `ZAG:TSE`, `VOO`, `VFV:TSE`), the chart subtitle dynamically renders:
+    - Current Dividend Yield (%).
+    - Annual Dividend per Share ($/sh).
+    - Payout Frequency (`Monthly`, `Quarterly`, `Semi-Annually`, `Annually`).
+- **FR-16.4 (Native Currency Scoping)**: Single-stock chart views shall lock calculations to the holding's native trading currency (e.g. CAD for Canadian TSE assets, USD for US assets) to prevent foreign currency conversion distortions.
+- **FR-16.5 (ETF Dividend Fallback)**: Automatically queries dividend distribution events for funds and ETFs that omit dividend yield from standard Google Finance summary cards.
+
+### FR-17: Portfolio Multi-Currency Risk Exposure Analytics
+- **FR-17.1**: The `📊 Allocation & Analytics` tab shall provide an interactive View Mode switcher:
+  - `[Asset Allocation (Holdings)]`: Weighting and distribution by individual ticker symbols.
+  - `[Currency Exposure (% CAD / USD)]`: Aggregated risk exposure by native currency denomination (`USD`, `CAD`, `HKD`, etc.).
+- **FR-17.2 (Currency Donut & Weights)**: In Currency Exposure mode, the Donut Chart and ranked table dynamically display total market value and percentage weights for each currency relative to consolidated portfolio wealth.
+
+### FR-18: Enhanced Transaction History Ledger & UX
+- **FR-18.1 (Bi-Directional Column Sorting)**: Clicking any column header in the Transaction History table (`Date`, `Type`, `Portfolio`, `Symbol`, `Currency`, `Shares`, `Price`, `Total Amount`, `Commission`, `Tax`, `Net Profit`, `ROI`) toggles ascending/descending sorting (`▲`/`▼`) with automatic numeric vs text parsing.
+- **FR-18.2 (Live Instant Search Filter)**: A search entry in the Transaction History toolbar filters records dynamically as the user types, querying across Symbol, Transaction Type, Notes, Portfolio, and Currency.
+- **FR-18.3 (Interactive Transaction Editing)**: Double-clicking any transaction row opens an edit dialog allowing corrections to shares, prices, fees, taxes, or notes with immediate ledger recalculation.
+- **FR-18.4 (Portfolio Filter Dynamic Match)**: Provides **Show All** and **Match Active** shortcuts to quickly sync the transaction ledger filter with the active portfolio.
+
 ---
 
 ## 3. Non-Functional Requirements (NFR)
@@ -227,6 +300,25 @@ Google Finance live synchronization configuration.
 }
 ```
 
+### 4.5. `portfolio_fees.json`
+Per-portfolio commission tariffs and recurring custody/storage fee structures with 5-file rotating backups.
+```json
+{
+  "USD HSBC": {
+    "name": "USD HSBC",
+    "preset": "HSBC_STANDARD",
+    "commission_type": "percent_with_min",
+    "commission_flat": 0.0,
+    "commission_pct": 0.25,
+    "commission_min": 15.0,
+    "storage_fee_amount": 5.0,
+    "storage_fee_frequency": "monthly",
+    "default_tax_rate_pct": 0.0,
+    "notes": "Standard HSBC retail tariff"
+  }
+}
+```
+
 ---
 
 ## 5. Traceability Matrix & Implementation Verification
@@ -245,8 +337,15 @@ Google Finance live synchronization configuration.
 | **FR-8** | Transaction History (BUY/SELL) | `csv_manager.py`, `main_gui.py` | `TestTransactionHistory` | **Verified** |
 | **FR-9** | Google Sync & HTML Reports | `google_account_sync.py`, `report_generator.py` | `TestGoogleAccountSync` | **Verified** |
 | **FR-10** | 5-File Rolling Backups | `csv_manager.py`, `main_gui.py` | `TestRollingBackups` | **Verified** |
-| **FR-11** | Tri-Lingual i18n Engine | `i18n.py`, `main_gui.py` | `TestI18nSupport` | **Verified** |
+| **FR-11** | Tri-Lingual i18n Engine | `i18n.py`, `main_gui.py` | `TestI18nSupport`, `test_new_i18n_keys_parity` | **Verified** |
 | **FR-12** | Clean Process Termination | `app.py`, `main_gui.py`, `chart_view.py` | Process Exit Audit | **Verified** |
+| **FR-13** | Portfolio Fee Tariffs & Broker Presets | `fee_manager.py`, `main_gui.py` | `TestPortfolioFeeManagerAndCustody` | **Verified** |
+| **FR-14** | Safe Custody / Storage Fee Tracking | `fee_manager.py`, `financial_calc.py` | `test_safe_custody_fee_logging_and_period_earnings_deduction` | **Verified** |
+| **FR-15** | Period Earnings Performance Reports | `financial_calc.py`, `main_gui.py`, `csv_manager.py` | `test_calc_period_earnings`, `test_export_period_report_to_csv` | **Verified** |
+| **FR-16** | Interactive Chart (Per-Share, Metrics, Div Profile) | `chart_view.py`, `chart_fetcher.py` | `test_chart_view_price_metric_mode`, `test_dividend_frequency_classifier` | **Verified** |
+| **FR-17** | Currency Exposure Risk Analytics | `financial_calc.py`, `main_gui.py` | `test_currency_allocations_calculation` | **Verified** |
+| **FR-18** | Enhanced History Ledger (Sort, Filter, Edit) | `main_gui.py`, `csv_manager.py` | `TestTransactionHistory` | **Verified** |
 
 ---
 *End of Software Requirements Document.*
+

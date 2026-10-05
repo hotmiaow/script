@@ -338,3 +338,176 @@ def draw_drip_growth_chart(
     # Reinvested Dividends
     canvas.create_rectangle(leg_x + 75, leg_y - 4, leg_x + 85, leg_y + 4, fill=theme["bar_dividend"], outline="")
     canvas.create_text(leg_x + 89, leg_y, text="Reinvested Gains", font=("Segoe UI", 7), fill=theme["muted"], anchor="w")
+
+
+def draw_fee_tax_trajectory_chart(
+    canvas: tk.Canvas,
+    trajectory: List[Dict[str, Any]],
+    dark_mode: bool = False,
+) -> None:
+    """
+    Renders William J. Bernstein's 30-Year Compounding Wealth Trajectory Chart:
+    - Gross Wealth (0% Drag ideal baseline)
+    - Benchmark Wealth (0.04% TER low-cost index core)
+    - Portfolio Wealth (Actual net compounding with TER, WHT, and CGT drag)
+    - Shaded friction loss area between gross and portfolio wealth.
+    """
+    canvas.delete("all")
+    w = canvas.winfo_width()
+    h = canvas.winfo_height()
+    if w < 50:
+        try:
+            w = int(canvas.winfo_fpixels(canvas.cget("width")))
+        except Exception:
+            w = 700
+        if w < 50:
+            w = 700
+    if h < 50:
+        try:
+            h = int(canvas.winfo_fpixels(canvas.cget("height")))
+        except Exception:
+            h = 220
+        if h < 50:
+            h = 220
+
+    theme = ChartTheme.DARK if dark_mode else ChartTheme.LIGHT
+    canvas.configure(bg=theme["bg"])
+
+    if not trajectory:
+        canvas.create_text(
+            w / 2, h / 2,
+            text="No trajectory data available",
+            font=("Segoe UI", 10),
+            fill=theme["muted"],
+        )
+        return
+
+    pad_left = 75
+    pad_right = 35
+    pad_top = 34
+    pad_bottom = 26
+
+    plot_w = max(50, w - pad_left - pad_right)
+    plot_h = max(50, h - pad_top - pad_bottom)
+
+    max_val = max(
+        max(row.get("gross_wealth", 0.0), row.get("benchmark_wealth", 0.0), row.get("portfolio_wealth", 0.0))
+        for row in trajectory
+    )
+    max_val = max(max_val * 1.08, 1000.0)
+
+    # Title
+    canvas.create_text(
+        pad_left, 16,
+        text="📈 30-Year Compounding Trajectory (Gross vs Benchmark vs Actual Portfolio)",
+        font=("Segoe UI", 8, "bold"),
+        fill=theme["fg"],
+        anchor="w",
+    )
+
+    # Draw gridlines and Y-axis labels
+    for step in range(5):
+        y_frac = step / 4.0
+        val_at_line = max_val * (1.0 - y_frac)
+        y_pos = pad_top + y_frac * plot_h
+
+        # Grid line
+        canvas.create_line(
+            pad_left, y_pos,
+            w - pad_right, y_pos,
+            fill=theme["grid"],
+            dash=(2, 4),
+        )
+
+        # Label formatting (millions or thousands)
+        if val_at_line >= 1_000_000:
+            lbl_txt = f"${val_at_line / 1_000_000:.1f}M"
+        elif val_at_line >= 1_000:
+            lbl_txt = f"${val_at_line / 1_000:.0f}K"
+        else:
+            lbl_txt = f"${val_at_line:,.0f}"
+
+        canvas.create_text(
+            pad_left - 8, y_pos,
+            text=lbl_txt,
+            font=("Segoe UI", 7),
+            fill=theme["muted"],
+            anchor="e",
+        )
+
+    num_pts = len(trajectory)
+    if num_pts < 2:
+        return
+
+    gross_pts = []
+    bench_pts = []
+    port_pts = []
+
+    for i, row in enumerate(trajectory):
+        yr = row.get("year", i + 1)
+        x = pad_left + (i / (num_pts - 1)) * plot_w
+
+        g = row.get("gross_wealth", 0.0)
+        b = row.get("benchmark_wealth", 0.0)
+        p = row.get("portfolio_wealth", 0.0)
+
+        gy = pad_top + (1.0 - (g / max_val)) * plot_h
+        by = pad_top + (1.0 - (b / max_val)) * plot_h
+        py = pad_top + (1.0 - (p / max_val)) * plot_h
+
+        gross_pts.append((x, gy))
+        bench_pts.append((x, by))
+        port_pts.append((x, py))
+
+        # X-axis ticks at key intervals
+        if yr in (1, 5, 10, 15, 20, 25, 30):
+            canvas.create_line(x, pad_top + plot_h, x, pad_top + plot_h + 3, fill=theme["muted"])
+            canvas.create_text(
+                x, pad_top + plot_h + 10,
+                text=f"Y{yr}",
+                font=("Segoe UI", 7),
+                fill=theme["muted"],
+            )
+
+    # Shaded friction loss polygon between Gross and Portfolio
+    fill_poly = []
+    for x, y in gross_pts:
+        fill_poly.extend([x, y])
+    for x, y in reversed(port_pts):
+        fill_poly.extend([x, y])
+
+    drag_shade = "#fce8e6" if not dark_mode else "#3c2020"
+    if len(fill_poly) >= 6:
+        canvas.create_polygon(fill_poly, fill=drag_shade, outline="")
+
+    # Colors
+    c_gross = "#0f9d58" if not dark_mode else "#81c995"
+    c_bench = "#1a73e8" if not dark_mode else "#8ab4f8"
+    c_port = "#d93025" if not dark_mode else "#f28b82"
+
+    # Draw curves
+    for pts, col, width in [(gross_pts, c_gross, 2), (bench_pts, c_bench, 2), (port_pts, c_port, 2)]:
+        flat = []
+        for x, y in pts:
+            flat.extend([x, y])
+        canvas.create_line(flat, fill=col, width=width, smooth=True)
+
+    # Highlight terminal points at Yr 30
+    for pt, col in [(gross_pts[-1], c_gross), (bench_pts[-1], c_bench), (port_pts[-1], c_port)]:
+        canvas.create_oval(pt[0] - 3, pt[1] - 3, pt[0] + 3, pt[1] + 3, fill=col, outline="")
+
+    # Legend at top right
+    leg_x = max(pad_left + 150, w - pad_right - 350)
+    leg_y = 16
+
+    # Gross
+    canvas.create_rectangle(leg_x, leg_y - 4, leg_x + 10, leg_y + 4, fill=c_gross, outline="")
+    canvas.create_text(leg_x + 14, leg_y, text="Gross (0% Drag)", font=("Segoe UI", 7), fill=theme["muted"], anchor="w")
+
+    # Benchmark
+    canvas.create_rectangle(leg_x + 115, leg_y - 4, leg_x + 125, leg_y + 4, fill=c_bench, outline="")
+    canvas.create_text(leg_x + 129, leg_y, text="Benchmark (0.04%)", font=("Segoe UI", 7), fill=theme["muted"], anchor="w")
+
+    # Portfolio
+    canvas.create_rectangle(leg_x + 245, leg_y - 4, leg_x + 255, leg_y + 4, fill=c_port, outline="")
+    canvas.create_text(leg_x + 259, leg_y, text="Actual Portfolio", font=("Segoe UI", 7, "bold"), fill=c_port, anchor="w")
