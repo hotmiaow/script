@@ -25,6 +25,9 @@ class GoogleFinanceFetcher:
 
     def __init__(self, timeout: int = 10):
         self.session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(pool_connections=20, pool_maxsize=20)
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
         self.session.headers.update(self.DEFAULT_HEADERS)
         self.timeout = timeout
         self.fx_cache: Dict[str, float] = {}

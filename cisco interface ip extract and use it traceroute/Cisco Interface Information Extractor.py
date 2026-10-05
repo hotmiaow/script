@@ -764,11 +764,12 @@ class NetworkConfigParser:
             if vrf_match:
                 vrf = vrf_match.group(1).strip()
 
-            # Multiple IP address patterns
+            # Primary IP address patterns.
+            # (?!\d) stops the mask from backtracking (e.g. "255.255.255.252 secondary"
+            # being read as "255.255.255.25" + not-secondary).
             ip_patterns = [
-                r'ip\s+address\s+(\d+\.\d+\.\d+\.\d+)\s+(\d+\.\d+\.\d+\.\d+)(?!\s+secondary)',
-                r'ip\s+address\s+(\d+\.\d+\.\d+\.\d+)/(\d+)',
-                r'ip\s+address\s+(\d+\.\d+\.\d+\.\d+)\s+(\d+\.\d+\.\d+\.\d+)\s*$'
+                r'ip\s+address\s+(\d+\.\d+\.\d+\.\d+)\s+(\d+\.\d+\.\d+\.\d+)(?!\d)(?!\s+secondary)',
+                r'ip\s+address\s+(\d+\.\d+\.\d+\.\d+)/(\d+)(?!\d)',
             ]
 
             # Secondary IP pattern
@@ -776,6 +777,7 @@ class NetworkConfigParser:
 
             # Search for primary IP addresses
             found_ip = False
+            seen_primary = set()
             for pattern in ip_patterns:
                 matches = re.findall(pattern, full_block, re.MULTILINE | re.IGNORECASE)
                 for match in matches:
@@ -790,6 +792,10 @@ class NetworkConfigParser:
                     else:
                         cidr = self.netmask_to_cidr(mask_or_cidr)
                         ip_with_cidr = f"{ip}/{cidr}"
+
+                    if ip_with_cidr in seen_primary:
+                        continue
+                    seen_primary.add(ip_with_cidr)
 
                     interfaces.append({
                         'device_name': hostname,

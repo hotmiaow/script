@@ -7,9 +7,11 @@ division/split, and selling calculations, and saving data in CSV.
 
 import os
 import sys
+import re
 import time
 import threading
 import queue
+import concurrent.futures
 from datetime import datetime, date, timedelta
 from typing import Dict, Any, List, Optional
 import tkinter as tk
@@ -49,6 +51,15 @@ from financial_calc import (
     calc_fee_and_tax_drag_autopsy,
     calc_rebalancing_5_25_bands,
     calc_simplicity_index,
+    calc_retirement_spending_smile,
+    calc_sequence_of_returns_risk_simulation,
+    calc_guyton_klinger_guardrails,
+    calc_three_bucket_architecture,
+    calc_healthcare_ltc_contingency,
+    calc_actuarial_longevity_table,
+    calc_monte_carlo_distribution,
+    calc_stagflation_sensitivity_matrix,
+    calc_rising_equity_glidepath,
     KNOWN_ETF_TER,
     SUGGESTED_ALLOCATION_ETFS,
     ALLOCATION_PRESETS,
@@ -92,6 +103,7 @@ from csv_manager import (
     add_to_watchlist,
     remove_from_watchlist,
     update_watchlist_item,
+    bulk_update_watchlist_category,
     bulk_add_to_watchlist,
     import_watchlist_from_csv,
     parse_symbols_text,
@@ -139,6 +151,128 @@ POPULAR_TICKERS = [
 ]
 
 
+class ToolTip:
+    """
+    Lightweight, thread-safe, theme-aware hover tooltip widget for Tkinter and ttk widgets.
+    Dynamically re-evaluates text (supporting instant language switching) and respects screen boundaries.
+    """
+    def __init__(self, widget, text_provider, delay_ms: int = 350):
+        self.widget = widget
+        self.text_provider = text_provider
+        self.delay_ms = delay_ms
+        self.tip_window = None
+        self._after_id = None
+
+        try:
+            self.widget.bind("<Enter>", self._on_enter, add="+")
+            self.widget.bind("<Leave>", self._on_leave, add="+")
+            self.widget.bind("<ButtonPress>", self._on_leave, add="+")
+        except Exception:
+            pass
+
+    def _get_text(self) -> str:
+        if callable(self.text_provider):
+            try:
+                return str(self.text_provider() or "")
+            except Exception:
+                return ""
+        return str(self.text_provider or "")
+
+    def _on_enter(self, event=None):
+        self._cancel_timer()
+        try:
+            self._after_id = self.widget.after(self.delay_ms, self._show)
+        except Exception:
+            pass
+
+    def _on_leave(self, event=None):
+        self._cancel_timer()
+        self._hide()
+
+    def _cancel_timer(self):
+        if self._after_id:
+            try:
+                self.widget.after_cancel(self._after_id)
+            except Exception:
+                pass
+            self._after_id = None
+
+    def _show(self):
+        self._after_id = None
+        text = self._get_text().strip()
+        if not text:
+            return
+        try:
+            if not self.widget.winfo_exists():
+                return
+        except Exception:
+            return
+
+        try:
+            x = self.widget.winfo_rootx() + 8
+            y = self.widget.winfo_rooty() + self.widget.winfo_height() + 5
+
+            screen_w = self.widget.winfo_screenwidth()
+            screen_h = self.widget.winfo_screenheight()
+
+            self.tip_window = tw = tk.Toplevel(self.widget)
+            tw.wm_overrideredirect(True)
+            try:
+                tw.wm_attributes("-topmost", True)
+            except Exception:
+                pass
+
+            border_frame = tk.Frame(tw, bg="#5f6368", padx=1, pady=1)
+            border_frame.pack()
+
+            lbl = tk.Label(
+                border_frame,
+                text=text,
+                justify=tk.LEFT,
+                background="#202124",
+                foreground="#f1f3f4",
+                font=("Segoe UI", 9),
+                padx=8,
+                pady=5,
+                wraplength=380,
+            )
+            lbl.pack()
+
+            tw.update_idletasks()
+            w = tw.winfo_reqwidth()
+            h = tw.winfo_reqheight()
+
+            if x + w > screen_w - 12:
+                x = max(6, screen_w - w - 12)
+            if y + h > screen_h - 12:
+                y = max(6, self.widget.winfo_rooty() - h - 5)
+
+            tw.wm_geometry(f"+{max(0, x)}+{max(0, y)}")
+        except Exception:
+            self._hide()
+
+    def _hide(self):
+        tw = self.tip_window
+        self.tip_window = None
+        if tw:
+            try:
+                tw.destroy()
+            except Exception:
+                pass
+
+
+def attach_tooltip(widget, key_or_text_or_func, delay_ms: int = 350) -> ToolTip:
+    """Convenience helper to attach a dynamic tooltip to any widget."""
+    def provider():
+        if callable(key_or_text_or_func):
+            return key_or_text_or_func()
+        if isinstance(key_or_text_or_func, str):
+            val = t(key_or_text_or_func)
+            return val if val != key_or_text_or_func else key_or_text_or_func
+        return str(key_or_text_or_func)
+    return ToolTip(widget, provider, delay_ms=delay_ms)
+
+
 class ModernPortfolioApp:
     def __init__(self, root: tk.Tk):
         self.root = root
@@ -170,8 +304,20 @@ class ModernPortfolioApp:
         self.is_fetching: bool = False
         self.queue_job = None
         self.auto_refresh_job = None
-        self.refresh_interval_sec: int = 30
-        self.auto_refresh_enabled: bool = True
+
+        # Auto-refresh interval persistence (default: 5 min / 300s)
+        cfg = load_settings()
+        self.saved_refresh_interval: str = cfg.get("auto_refresh_interval", "5 min")
+        interval_mapping = {
+            "Off": 0,
+            "15s": 15,
+            "30s": 30,
+            "1 min": 60,
+            "2 min": 120,
+            "5 min": 300,
+        }
+        self.refresh_interval_sec: int = interval_mapping.get(self.saved_refresh_interval, 300)
+        self.auto_refresh_enabled: bool = (self.refresh_interval_sec > 0)
 
         # Theme, Search & Filter state
         self.dark_mode: bool = False
@@ -197,8 +343,9 @@ class ModernPortfolioApp:
         self._build_status_bar()
         self._build_tabs()
 
-        # Context Menu
+        # Context Menu & Hotkeys
         self._build_context_menu()
+        self._setup_keyboard_shortcuts()
 
         # Populate tables
         self._refresh_holdings_table()
@@ -212,9 +359,10 @@ class ModernPortfolioApp:
         # Start background queue poller
         self.queue_job = self.root.after(100, self._process_fetch_queue)
 
-        # Start initial auto-refresh
-        if self.holdings:
-            self.root.after(1000, self.fetch_all_quotes)
+        # Start initial background quotes update (showing cached data immediately)
+        if self.all_holdings or load_watchlist():
+            self._set_status(f"🔄 {t('msg_cached_data_notice')}")
+            self.root.after(300, self.fetch_all_quotes)
         self._schedule_auto_refresh()
 
     def _setup_style(self):
@@ -306,6 +454,38 @@ class ModernPortfolioApp:
             )
         if hasattr(self, "lbl_title"):
             self.lbl_title.config(bg=self.bg_main, fg=self.primary_color)
+        if hasattr(self, "lbl_engine_badge"):
+            self.lbl_engine_badge.config(
+                bg="#133e24" if self.dark_mode else "#e6f4ea",
+                fg="#81c995" if self.dark_mode else "#137333",
+            )
+        if hasattr(self, "btn_tools_menu"):
+            self.btn_tools_menu.config(
+                bg="#2d3342" if self.dark_mode else "#ffffff",
+                fg=self.primary_color,
+                activebackground="#3c4043" if self.dark_mode else "#e8f0fe",
+                activeforeground=self.primary_color,
+            )
+        if hasattr(self, "tools_menu"):
+            self.tools_menu.config(
+                bg="#2a2e39" if self.dark_mode else "#ffffff",
+                fg=self.text_dark,
+                activebackground=self.primary_color,
+                activeforeground="#ffffff",
+            )
+        if hasattr(self, "btn_refresh"):
+            self.btn_refresh.config(
+                bg="#2d3342" if self.dark_mode else "#ffffff",
+                fg=self.primary_color,
+                activebackground="#3c4043" if self.dark_mode else "#e8f0fe",
+            )
+        if hasattr(self, "btn_watch_category"):
+            self.btn_watch_category.config(
+                bg="#2d3342" if self.dark_mode else "#ffffff",
+                fg=self.primary_color,
+            )
+        if hasattr(self, "lbl_auto"):
+            self.lbl_auto.config(bg=self.bg_main, fg=self.text_dark)
         if hasattr(self, "status_frame"):
             self.status_frame.config(bg=self.card_bg)
         if hasattr(self, "lbl_status"):
@@ -351,23 +531,36 @@ class ModernPortfolioApp:
         top_frame = ttk.Frame(self.root, padding="12 8 12 4")
         top_frame.pack(fill=tk.X)
 
-        # Title
+        # Title & Engine Status
         title_box = ttk.Frame(top_frame)
         title_box.pack(side=tk.LEFT)
         self.lbl_title = tk.Label(
             title_box,
             text=t("app_header"),
-            font=("Segoe UI", 14, "bold"),
+            font=("Segoe UI", 13, "bold"),
             bg=self.bg_main,
             fg=self.primary_color,
         )
-        self.lbl_title.pack(anchor="w")
+        self.lbl_title.pack(side=tk.LEFT, anchor="w")
+
+        self.lbl_engine_badge = tk.Label(
+            title_box,
+            text=t("badge_safe_engine"),
+            font=("Segoe UI", 8),
+            bg="#e6f4ea" if not self.dark_mode else "#133e24",
+            fg="#137333" if not self.dark_mode else "#81c995",
+            padx=6,
+            pady=1,
+            relief="solid",
+            bd=1,
+        )
+        self.lbl_engine_badge.pack(side=tk.LEFT, padx=(8, 0))
 
         # Action and control buttons on right
         ctrl_box = ttk.Frame(top_frame)
         ctrl_box.pack(side=tk.RIGHT)
 
-        # Google Account Sync button
+        # 1. Google Account Sync button
         self.btn_sync = tk.Button(
             ctrl_box,
             text=t("btn_google_sync"),
@@ -378,11 +571,12 @@ class ModernPortfolioApp:
             relief="flat",
             padx=10,
             pady=3,
+            cursor="hand2",
             command=self._open_sync_dialog,
         )
-        self.btn_sync.pack(side=tk.LEFT, padx=(0, 8))
+        self.btn_sync.pack(side=tk.LEFT, padx=(0, 6))
 
-        # Add Stock button
+        # 2. Add Stock button
         self.btn_add = tk.Button(
             ctrl_box,
             text=t("btn_add_stock"),
@@ -391,140 +585,67 @@ class ModernPortfolioApp:
             fg="#ffffff",
             activebackground="#1557b0",
             relief="flat",
-            padx=8,
+            padx=9,
             pady=3,
+            cursor="hand2",
             command=self._open_add_dialog,
         )
-        self.btn_add.pack(side=tk.LEFT, padx=(0, 4))
+        self.btn_add.pack(side=tk.LEFT, padx=(0, 6))
 
-        # Remove Stock button
-        self.btn_remove = tk.Button(
+        # 3. Consolidated Tools & Utilities Menubutton
+        self.btn_tools_menu = tk.Menubutton(
             ctrl_box,
-            text=t("btn_tbl_remove"),
+            text=f"{t('menu_tools')} ▾",
             font=("Segoe UI", 9, "bold"),
-            bg="#ffffff",
-            fg=self.red_color,
-            activebackground="#fce8e6",
+            bg="#ffffff" if not self.dark_mode else "#2d3342",
+            fg=self.primary_color,
+            activebackground="#e8f0fe" if not self.dark_mode else "#3c4043",
+            activeforeground=self.primary_color,
             relief="solid",
             bd=1,
             padx=8,
             pady=3,
-            command=self._delete_selected_holding,
+            cursor="hand2",
+            direction="below",
         )
-        self.btn_remove.pack(side=tk.LEFT, padx=(0, 8))
+        self.tools_menu = tk.Menu(self.btn_tools_menu, tearoff=0, font=("Segoe UI", 9))
+        self.btn_tools_menu["menu"] = self.tools_menu
+        self._rebuild_tools_menu()
+        self.btn_tools_menu.pack(side=tk.LEFT, padx=(0, 8))
 
-        # Export Executive HTML Report
-        self.btn_report = tk.Button(
+        # 4. Refresh Quotes button
+        self.btn_refresh = tk.Button(
             ctrl_box,
-            text=t("btn_report"),
+            text=t("btn_refresh"),
             font=("Segoe UI", 9, "bold"),
-            bg="#ffffff",
+            bg="#ffffff" if not self.dark_mode else "#2d3342",
             fg=self.primary_color,
-            activebackground="#e8f0fe",
-            relief="solid",
-            bd=1,
-            padx=8,
-            pady=3,
-            command=self._export_html_report_dialog,
-        )
-        self.btn_report.pack(side=tk.LEFT, padx=(0, 6))
-
-        # Watchlist button
-        self.btn_watchlist = tk.Button(
-            ctrl_box,
-            text=t("btn_watchlist"),
-            font=("Segoe UI", 9, "bold"),
-            bg="#ffffff",
-            fg=self.primary_color,
-            activebackground="#e8f0fe",
+            activebackground="#e8f0fe" if not self.dark_mode else "#3c4043",
             relief="solid",
             bd=1,
             padx=6,
             pady=3,
-            command=self._switch_to_watchlist_tab,
+            cursor="hand2",
+            command=self.fetch_all_quotes,
         )
-        self.btn_watchlist.pack(side=tk.LEFT, padx=(0, 6))
+        self.btn_refresh.pack(side=tk.LEFT, padx=(0, 4))
 
-        # What-If Simulator button
-        self.btn_what_if = tk.Button(
+        # 5. Auto-Refresh Controls
+        self.lbl_auto = tk.Label(ctrl_box, text=t("lbl_auto"), font=("Segoe UI", 9, "bold"), bg=self.bg_main)
+        self.lbl_auto.pack(side=tk.LEFT, padx=(0, 2))
+
+        self.interval_var = tk.StringVar(value=getattr(self, "saved_refresh_interval", "5 min"))
+        self.interval_menu = ttk.Combobox(
             ctrl_box,
-            text=t("btn_what_if"),
-            font=("Segoe UI", 9, "bold"),
-            bg="#ffffff",
-            fg=self.primary_color,
-            activebackground="#e8f0fe",
-            relief="solid",
-            bd=1,
-            padx=6,
-            pady=3,
-            command=self._open_what_if_dialog,
+            textvariable=self.interval_var,
+            values=["Off", "15s", "30s", "1 min", "2 min", "5 min"],
+            width=6,
+            state="readonly",
         )
-        self.btn_what_if.pack(side=tk.LEFT, padx=(0, 6))
+        self.interval_menu.pack(side=tk.LEFT, padx=(0, 8))
+        self.interval_menu.bind("<<ComboboxSelected>>", self._on_interval_changed)
 
-        # Data Health Scanner button
-        self.btn_data_health = tk.Button(
-            ctrl_box,
-            text=t("btn_data_health"),
-            font=("Segoe UI", 9, "bold"),
-            bg="#ffffff",
-            fg="#188038",
-            activebackground="#e6f4ea",
-            relief="solid",
-            bd=1,
-            padx=6,
-            pady=3,
-            command=self._open_data_health_dialog,
-        )
-        self.btn_data_health.pack(side=tk.LEFT, padx=(0, 6))
-
-        # Embedded Local Web View button
-        self.btn_web_view = tk.Button(
-            ctrl_box,
-            text=t("btn_web_dashboard"),
-            font=("Segoe UI", 9, "bold"),
-            bg="#ffffff",
-            fg="#188038",
-            activebackground="#e6f4ea",
-            relief="solid",
-            bd=1,
-            padx=6,
-            pady=3,
-            command=self._open_local_web_view,
-        )
-        self.btn_web_view.pack(side=tk.LEFT, padx=(0, 6))
-
-        # Feature Guide & Tips button
-        self.btn_feature_guide = tk.Button(
-            ctrl_box,
-            text=t("btn_feature_guide"),
-            font=("Segoe UI", 9, "bold"),
-            bg="#ffffff",
-            fg="#e37400",
-            activebackground="#fff3e0",
-            relief="solid",
-            bd=1,
-            padx=6,
-            pady=3,
-            command=self._open_feature_guide_dialog,
-        )
-        self.btn_feature_guide.pack(side=tk.LEFT, padx=(0, 6))
-
-        # Theme toggle button
-        self.btn_theme_toggle = tk.Button(
-            ctrl_box,
-            text=t("btn_theme_light") if self.dark_mode else t("btn_theme_dark"),
-            font=("Segoe UI", 9, "bold"),
-            bg="#ffffff",
-            fg="#202124",
-            relief="solid",
-            bd=1,
-            padx=6,
-            pady=3,
-            command=self._toggle_theme,
-        )
-        self.btn_theme_toggle.pack(side=tk.LEFT, padx=(0, 6))
-
-        # Language Selector combobox
+        # 6. Language Selector
         avail_langs = get_available_languages()
         cur_lang_name = dict(avail_langs).get(get_current_language(), "English")
         self.lang_var = tk.StringVar(value=cur_lang_name)
@@ -536,77 +657,221 @@ class ModernPortfolioApp:
             state="readonly",
             font=("Segoe UI", 9),
         )
-        self.lang_combo.pack(side=tk.LEFT, padx=(0, 8))
+        self.lang_combo.pack(side=tk.LEFT, padx=(0, 6))
         self.lang_combo.bind("<<ComboboxSelected>>", self._on_language_changed)
 
-        # Auto-Refresh controls
-        self.lbl_auto = tk.Label(ctrl_box, text=t("lbl_auto"), font=("Segoe UI", 9, "bold"), bg=self.bg_main)
-        self.lbl_auto.pack(side=tk.LEFT, padx=(0, 4))
-
-        self.interval_var = tk.StringVar(value="30s")
-        interval_menu = ttk.Combobox(
+        # 7. Theme Toggle
+        self.btn_theme_toggle = tk.Button(
             ctrl_box,
-            textvariable=self.interval_var,
-            values=["Off", "15s", "30s", "1 min", "2 min", "5 min"],
-            width=6,
-            state="readonly",
-        )
-        interval_menu.pack(side=tk.LEFT, padx=(0, 6))
-        interval_menu.bind("<<ComboboxSelected>>", self._on_interval_changed)
-
-        self.btn_refresh = tk.Button(
-            ctrl_box,
-            text=t("btn_refresh"),
+            text=t("btn_theme_light") if self.dark_mode else t("btn_theme_dark"),
             font=("Segoe UI", 9, "bold"),
-            bg="#ffffff",
-            fg=self.primary_color,
-            activebackground="#e8f0fe",
+            bg="#ffffff" if not self.dark_mode else "#3c4043",
+            fg="#202124" if not self.dark_mode else "#fbbc04",
             relief="solid",
             bd=1,
             padx=6,
             pady=3,
-            command=self.fetch_all_quotes,
+            cursor="hand2",
+            command=self._toggle_theme,
         )
-        self.btn_refresh.pack(side=tk.LEFT, padx=(0, 4))
+        self.btn_theme_toggle.pack(side=tk.LEFT)
 
-        self.btn_import = tk.Button(
-            ctrl_box,
-            text=t("btn_import_csv"),
-            font=("Segoe UI", 8),
-            bg="#ffffff",
-            relief="solid",
-            bd=1,
-            padx=4,
-            pady=3,
+        # Compatibility proxies for buttons that may be accessed or updated by code/tests
+        self.btn_remove = tk.Button(self.root, text=t("btn_tbl_remove"), command=self._delete_selected_holding)
+        self.btn_report = tk.Button(self.root, text=t("btn_report"), command=self._export_html_report_dialog)
+        self.btn_watchlist = tk.Button(self.root, text=t("btn_watchlist"), command=self._switch_to_watchlist_tab)
+        self.btn_what_if = tk.Button(self.root, text=t("btn_what_if"), command=self._open_what_if_dialog)
+        self.btn_data_health = tk.Button(self.root, text=t("btn_data_health"), command=self._open_data_health_dialog)
+        self.btn_web_view = tk.Button(self.root, text=t("btn_web_dashboard"), command=self._open_local_web_view)
+        self.btn_feature_guide = tk.Button(self.root, text=t("btn_feature_guide"), command=self._open_feature_guide_dialog)
+        self.btn_import = tk.Button(self.root, text=t("btn_import_csv"), command=self._import_csv_dialog)
+        self.btn_export = tk.Button(self.root, text=t("btn_export_csv"), command=self._export_csv_dialog)
+        self.btn_backups = tk.Button(self.root, text=t("btn_backups"), command=self._open_backups_dialog)
+
+        # Attach hints / tooltips
+        attach_tooltip(self.btn_sync, "tip_sync")
+        attach_tooltip(self.btn_add, "tip_add_holding")
+        attach_tooltip(self.btn_tools_menu, "tip_tools_menu")
+        attach_tooltip(self.btn_refresh, "tip_refresh")
+        attach_tooltip(self.interval_menu, "tip_auto_refresh")
+        attach_tooltip(self.lang_combo, "tip_lang")
+        attach_tooltip(self.btn_theme_toggle, "tip_theme")
+
+    def _rebuild_tools_menu(self):
+        if not hasattr(self, "tools_menu"):
+            return
+        self.tools_menu.delete(0, tk.END)
+        self.tools_menu.add_command(
+            label=f"📄 {t('btn_report')}",
+            command=self._export_html_report_dialog,
+            accelerator="Ctrl+P",
+        )
+        self.tools_menu.add_command(
+            label=f"💡 {t('btn_what_if')}",
+            command=self._open_what_if_dialog,
+            accelerator="Ctrl+W",
+        )
+        self.tools_menu.add_command(
+            label=f"🩺 {t('btn_data_health')}",
+            command=self._open_data_health_dialog,
+            accelerator="Ctrl+H",
+        )
+        self.tools_menu.add_command(
+            label=f"🌐 {t('btn_web_dashboard')}",
+            command=self._open_local_web_view,
+        )
+        self.tools_menu.add_command(
+            label=f"⭐ {t('btn_watchlist')}",
+            command=self._switch_to_watchlist_tab,
+        )
+        self.tools_menu.add_command(
+            label=f"🏛️ {t('btn_fire_toolkit')}",
+            command=self._open_retirement_advanced_toolkit_dialog,
+        )
+        self.tools_menu.add_separator()
+        self.tools_menu.add_command(
+            label=f"📂 {t('btn_import_csv')}",
             command=self._import_csv_dialog,
+            accelerator="Ctrl+O",
         )
-        self.btn_import.pack(side=tk.LEFT, padx=(0, 2))
-
-        self.btn_export = tk.Button(
-            ctrl_box,
-            text=t("btn_export_csv"),
-            font=("Segoe UI", 8),
-            bg="#ffffff",
-            relief="solid",
-            bd=1,
-            padx=4,
-            pady=3,
+        self.tools_menu.add_command(
+            label=f"💾 {t('btn_export_csv')}",
             command=self._export_csv_dialog,
+            accelerator="Ctrl+E",
         )
-        self.btn_export.pack(side=tk.LEFT, padx=(0, 2))
-
-        self.btn_backups = tk.Button(
-            ctrl_box,
-            text=t("btn_backups"),
-            font=("Segoe UI", 8),
-            bg="#ffffff",
-            relief="solid",
-            bd=1,
-            padx=4,
-            pady=3,
+        self.tools_menu.add_command(
+            label=f"🔄 {t('btn_backups')}",
             command=self._open_backups_dialog,
         )
-        self.btn_backups.pack(side=tk.LEFT)
+        self.tools_menu.add_separator()
+        self.tools_menu.add_command(
+            label=f"📖 {t('btn_feature_guide')}",
+            command=self._open_feature_guide_dialog,
+            accelerator="F1",
+        )
+        self.tools_menu.add_command(
+            label=f"{t('btn_shortcuts')}",
+            command=self._open_shortcuts_dialog,
+            accelerator="Ctrl+/",
+        )
+
+    def _setup_keyboard_shortcuts(self):
+        self.root.bind("<F5>", lambda e: self.fetch_all_quotes())
+        self.root.bind("<Control-r>", lambda e: self.fetch_all_quotes())
+        self.root.bind("<Control-R>", lambda e: self.fetch_all_quotes())
+        self.root.bind("<Control-n>", lambda e: self._open_add_dialog())
+        self.root.bind("<Control-N>", lambda e: self._open_add_dialog())
+        self.root.bind("<Control-f>", lambda e: self._focus_search())
+        self.root.bind("<Control-F>", lambda e: self._focus_search())
+        self.root.bind("<Control-p>", lambda e: self._export_html_report_dialog())
+        self.root.bind("<Control-P>", lambda e: self._export_html_report_dialog())
+        self.root.bind("<Control-w>", lambda e: self._open_what_if_dialog())
+        self.root.bind("<Control-W>", lambda e: self._open_what_if_dialog())
+        self.root.bind("<Control-h>", lambda e: self._open_data_health_dialog())
+        self.root.bind("<Control-H>", lambda e: self._open_data_health_dialog())
+        self.root.bind("<Control-o>", lambda e: self._import_csv_dialog())
+        self.root.bind("<Control-O>", lambda e: self._import_csv_dialog())
+        self.root.bind("<Control-e>", lambda e: self._export_csv_dialog())
+        self.root.bind("<Control-E>", lambda e: self._export_csv_dialog())
+        self.root.bind("<Control-d>", lambda e: self._toggle_theme())
+        self.root.bind("<Control-D>", lambda e: self._toggle_theme())
+        self.root.bind("<Control-s>", lambda e: self._open_sync_dialog())
+        self.root.bind("<Control-S>", lambda e: self._open_sync_dialog())
+        self.root.bind("<F1>", lambda e: self._open_feature_guide_dialog())
+        self.root.bind("<Control-slash>", lambda e: self._open_shortcuts_dialog())
+        self.root.bind("<Control-question>", lambda e: self._open_shortcuts_dialog())
+
+    def _focus_search(self):
+        try:
+            current_tab = self.notebook.select()
+            if hasattr(self, "tab_watchlist") and str(current_tab) == str(self.tab_watchlist):
+                if hasattr(self, "watchlist_search_entry"):
+                    self.watchlist_search_entry.focus_set()
+                    self.watchlist_search_entry.select_range(0, tk.END)
+                    return "break"
+            if hasattr(self, "tab_holdings"):
+                self.notebook.select(self.tab_holdings)
+            if hasattr(self, "search_entry"):
+                self.search_entry.focus_set()
+                self.search_entry.select_range(0, tk.END)
+            return "break"
+        except Exception:
+            pass
+
+    def _open_shortcuts_dialog(self):
+        dlg = tk.Toplevel(self.root)
+        dlg.title(t("dlg_shortcuts_title"))
+        dlg.geometry("640x480")
+        dlg.minsize(560, 420)
+        dlg.transient(self.root)
+        dlg.grab_set()
+
+        bg_col = self.card_bg if hasattr(self, "card_bg") else "#ffffff"
+        dlg.configure(bg=self.bg_main)
+
+        header = tk.Frame(dlg, bg=self.bg_main, padx=16, pady=12)
+        header.pack(fill=tk.X)
+        tk.Label(
+            header,
+            text=f"⌨️ {t('dlg_shortcuts_title')}",
+            font=("Segoe UI", 12, "bold"),
+            bg=self.bg_main,
+            fg=self.primary_color,
+        ).pack(anchor="w")
+
+        content = tk.Frame(dlg, bg=bg_col, bd=1, relief="solid", padx=12, pady=12)
+        content.pack(fill=tk.BOTH, expand=True, padx=16, pady=(0, 12))
+
+        tree_frame = ttk.Frame(content)
+        tree_frame.pack(fill=tk.BOTH, expand=True)
+
+        cols = ("shortcut", "action", "scope")
+        shortcut_tree = ttk.Treeview(tree_frame, columns=cols, show="headings", height=10)
+        shortcut_tree.heading("shortcut", text="Shortcut / 快捷鍵")
+        shortcut_tree.heading("action", text="Function / 功能說明")
+        shortcut_tree.heading("scope", text="Category / 分類")
+        shortcut_tree.column("shortcut", width=120, anchor="center")
+        shortcut_tree.column("action", width=260, anchor="w")
+        shortcut_tree.column("scope", width=130, anchor="center")
+
+        v_scr = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=shortcut_tree.yview)
+        shortcut_tree.configure(yscrollcommand=v_scr.set)
+        shortcut_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        v_scr.pack(side=tk.RIGHT, fill=tk.Y)
+
+        shortcut_data = [
+            ("F5 / Ctrl+R", t("btn_refresh"), "行情報價 (Quotes)"),
+            ("Ctrl+N", t("btn_add_stock"), "投資組合 (Portfolio)"),
+            ("Ctrl+F", t("lbl_search"), "搜尋定位 (Search)"),
+            ("Ctrl+D", "切換深淺主題 (Toggle Theme)", "外觀視覺 (Display)"),
+            ("Ctrl+P", t("btn_report"), "分析報告 (Reports)"),
+            ("Ctrl+W", t("btn_what_if"), "進階工具 (Tools)"),
+            ("Ctrl+H", t("btn_data_health"), "健康檢查 (Diagnostic)"),
+            ("Ctrl+O", t("btn_import_csv"), "數據匯入 (Data)"),
+            ("Ctrl+E", t("btn_export_csv"), "數據匯出 (Data)"),
+            ("Ctrl+S", t("btn_google_sync"), "帳號同步 (Cloud)"),
+            ("Delete / Backspace", t("btn_tbl_remove"), "表格操作 (Table)"),
+            ("Escape", "清除搜尋關鍵字 (Clear Search)", "表格操作 (Table)"),
+            ("F1", t("btn_feature_guide"), "說明指南 (Help)"),
+            ("Ctrl+/", t("btn_shortcuts"), "快捷鍵速查 (Help)"),
+        ]
+
+        for s_key, s_act, s_cat in shortcut_data:
+            shortcut_tree.insert("", tk.END, values=(s_key, s_act, s_cat))
+
+        btn_box = tk.Frame(dlg, bg=self.bg_main, padx=16, pady=8)
+        btn_box.pack(fill=tk.X)
+        tk.Button(
+            btn_box,
+            text=t("btn_close", default="Close"),
+            font=("Segoe UI", 9, "bold"),
+            bg=self.primary_color,
+            fg="#ffffff",
+            relief="flat",
+            padx=16,
+            pady=4,
+            command=dlg.destroy,
+        ).pack(side=tk.RIGHT)
 
     def _on_language_changed(self, event=None):
         selected_display = self.lang_var.get()
@@ -628,10 +893,15 @@ class ModernPortfolioApp:
         # 2. Update top bar
         if hasattr(self, "lbl_title"):
             self.lbl_title.config(text=t("app_header"))
+        if hasattr(self, "lbl_engine_badge"):
+            self.lbl_engine_badge.config(text=t("badge_safe_engine"))
         if hasattr(self, "btn_sync"):
             self.btn_sync.config(text=t("btn_google_sync"))
         if hasattr(self, "btn_add"):
             self.btn_add.config(text=t("btn_add_stock"))
+        if hasattr(self, "btn_tools_menu"):
+            self.btn_tools_menu.config(text=f"{t('menu_tools')} ▾")
+            self._rebuild_tools_menu()
         if hasattr(self, "btn_remove"):
             self.btn_remove.config(text=t("btn_tbl_remove"))
         if hasattr(self, "btn_report"):
@@ -925,10 +1195,32 @@ class ModernPortfolioApp:
             self.lbl_fire_cap_title.config(text=f"🏛️ {t('lbl_capital_gap')}")
         if hasattr(self, "fire_s5_box"):
             self.fire_s5_box.config(text=f" {t('fire_step5_title')} ")
+        if hasattr(self, "fire_action_box"):
+            self.fire_action_box.config(text=f" {t('fire_bottom_actions_title')} ")
+        if hasattr(self, "lbl_fire_models_suite"):
+            self.lbl_fire_models_suite.config(text=f"🏛️ {t('lbl_fire_models_suite')}")
+        if hasattr(self, "lbl_fire_actions_suite"):
+            self.lbl_fire_actions_suite.config(text=f"⚡ {t('lbl_fire_actions_suite')}")
         if hasattr(self, "btn_fire_to_rebalance"):
             self.btn_fire_to_rebalance.config(text=t("btn_apply_to_rebalance"))
         if hasattr(self, "btn_fire_simulate"):
             self.btn_fire_simulate.config(text=t("btn_simulate_trade"))
+        if hasattr(self, "btn_fire_toolkit"):
+            self.btn_fire_toolkit.config(text=f"🚀 {t('btn_fire_toolkit')}")
+        if hasattr(self, "btn_fire_toolkit_bar"):
+            self.btn_fire_toolkit_bar.config(text=f"🚀 {t('btn_fire_toolkit')}")
+        if hasattr(self, "btn_fire_deep_risk"):
+            self.btn_fire_deep_risk.config(text=t("btn_deep_risk_short"))
+        if hasattr(self, "btn_fire_crisis_stress"):
+            self.btn_fire_crisis_stress.config(text=t("btn_crisis_stress_short"))
+        if hasattr(self, "btn_fire_tax_drag"):
+            self.btn_fire_tax_drag.config(text=t("btn_fee_tax_drag_short"))
+        if hasattr(self, "btn_fire_rebalance_5_25"):
+            self.btn_fire_rebalance_5_25.config(text=t("btn_rebalance_5_25_short"))
+        if hasattr(self, "btn_fire_simplicity"):
+            self.btn_fire_simplicity.config(text=t("btn_simplicity_short"))
+        if hasattr(self, "btn_fire_recalc"):
+            self.btn_fire_recalc.config(text=f"🔄 {t('btn_recalc_fire')}")
         if hasattr(self, "btn_fire_export"):
             self.btn_fire_export.config(text=t("btn_export_fire_report"))
 
@@ -1267,6 +1559,8 @@ class ModernPortfolioApp:
             self.btn_watch_batch.config(text=t("btn_batch_import"))
         if hasattr(self, "btn_watch_edit"):
             self.btn_watch_edit.config(text=f"✏️ {t('btn_edit_watchlist')}")
+        if hasattr(self, "btn_watch_category"):
+            self.btn_watch_category.config(text=t("btn_change_category"))
         if hasattr(self, "btn_watch_refresh"):
             self.btn_watch_refresh.config(text=t("btn_refresh"))
         if hasattr(self, "btn_watch_buy"):
@@ -1469,6 +1763,15 @@ class ModernPortfolioApp:
             bd=1,
         )
         self.lbl_curr_exposure.pack(side=tk.LEFT, padx=(6, 0))
+
+        # Attach hints / tooltips
+        attach_tooltip(self.portfolio_combo, "tip_portfolio_select")
+        attach_tooltip(self.btn_new_portfolio, "tip_new_portfolio")
+        attach_tooltip(self.btn_rename_portfolio, "tip_rename_portfolio")
+        attach_tooltip(self.btn_delete_portfolio, "tip_delete_portfolio")
+        attach_tooltip(self.btn_portfolio_fees, "tip_portfolio_fees")
+        attach_tooltip(self.curr_combo, "tip_summary_curr")
+        attach_tooltip(btn_fx, "tip_fx_refresh")
 
     def _get_portfolio_dropdown_values(self) -> List[str]:
         all_p = [p for p in get_portfolio_names(PORTFOLIO_CSV) if p != "All Portfolios (Consolidated)"]
@@ -2081,13 +2384,22 @@ class ModernPortfolioApp:
         self.cards = {}
         self.card_titles = {}
         self.card_frames = []
+        curr_label = getattr(self, "summary_currency", "USD")
         metrics = [
-            ("total_value", "Portfolio Value (USD)", "$0.00", self.text_dark),
-            ("total_cost", "Total Cost Basis (USD)", "$0.00", self.text_muted),
-            ("total_gain", "Total Unrealized P/L (USD)", "$0.00 (+0.00%)", self.green_color),
-            ("annual_dividend", "Projected Annual Div (USD)", "$0.00", self.primary_color),
-            ("monthly_dividend", "Monthly Div Avg (USD)", "$0.00", self.primary_color),
+            ("total_value", f"💼 {t('card_total_value')} ({curr_label})", "$0.00", self.text_dark),
+            ("total_cost", f"🏷️ {t('col_cost_basis')} ({curr_label})", "$0.00", self.text_muted),
+            ("total_gain", f"📈 {t('card_unrealized_pl')} ({curr_label})", "$0.00 (+0.00%)", self.green_color),
+            ("annual_dividend", f"💵 {t('card_annual_dividend')} ({curr_label})", "$0.00", self.primary_color),
+            ("monthly_dividend", f"🗓️ {t('div_proj_monthly')} ({curr_label})", "$0.00", self.primary_color),
         ]
+
+        card_tooltip_keys = {
+            "total_value": "tip_card_total_value",
+            "total_cost": "tip_card_total_cost",
+            "total_gain": "tip_card_total_gain",
+            "annual_dividend": "tip_card_annual_div",
+            "monthly_dividend": "tip_card_monthly_div",
+        }
 
         for i, (key, title, default_val, default_color) in enumerate(metrics):
             card = tk.Frame(cards_frame, bg=self.card_bg, bd=1, relief="solid", padx=12, pady=8)
@@ -2102,6 +2414,12 @@ class ModernPortfolioApp:
             lbl_val.pack(anchor="w", pady=(2, 0))
 
             self.cards[key] = lbl_val
+
+            tip_k = card_tooltip_keys.get(key)
+            if tip_k:
+                attach_tooltip(card, tip_k)
+                attach_tooltip(lbl_title, tip_k)
+                attach_tooltip(lbl_val, tip_k)
 
     def _build_tabs(self):
         self.notebook = ttk.Notebook(self.root)
@@ -2692,6 +3010,8 @@ class ModernPortfolioApp:
     def _clear_search(self):
         self.search_filter_var.set("")
         self._refresh_holdings_table()
+        if hasattr(self, "search_entry"):
+            self.search_entry.focus_set()
 
     def _set_performance_filter(self, mode: str):
         self.filter_performance = mode
@@ -2728,6 +3048,7 @@ class ModernPortfolioApp:
         self.search_entry = tk.Entry(sf_bar, textvariable=self.search_filter_var, font=("Segoe UI", 9), width=22, bd=1, relief="solid")
         self.search_entry.pack(side=tk.LEFT, padx=(0, 4))
         self.search_entry.bind("<KeyRelease>", lambda e: self._refresh_holdings_table())
+        self.search_entry.bind("<Escape>", lambda e: self._clear_search())
 
         btn_clear = tk.Button(sf_bar, text="✕", font=("Segoe UI", 8), bg="#ffffff", relief="solid", bd=1, padx=4, pady=1, command=self._clear_search)
         btn_clear.pack(side=tk.LEFT, padx=(0, 12))
@@ -3284,8 +3605,11 @@ class ModernPortfolioApp:
         hdr = tk.Frame(scroll_frame, bg=self.bg_main)
         hdr.pack(fill=tk.X, pady=(0, 8))
 
+        hdr_left = tk.Frame(hdr, bg=self.bg_main)
+        hdr_left.pack(side=tk.LEFT, fill=tk.Y)
+
         self.lbl_fire_title = tk.Label(
-            hdr,
+            hdr_left,
             text=f"🔥 {t('tab_fire').strip()} — {t('fire_title_header')}",
             font=("Segoe UI", 13, "bold"),
             fg="#e37400",
@@ -3294,13 +3618,213 @@ class ModernPortfolioApp:
         self.lbl_fire_title.pack(anchor="w")
 
         self.lbl_fire_sub = tk.Label(
-            hdr,
+            hdr_left,
             text=t("fire_sub_desc"),
             font=("Segoe UI", 9),
             fg="#5f6368" if not self.dark_mode else "#9aa0a6",
             bg=self.bg_main,
         )
         self.lbl_fire_sub.pack(anchor="w", pady=(1, 4))
+
+        # =========================================================
+        # TOP MASTER ACTION & RETIREMENT TOOLKIT TOOLBAR
+        # =========================================================
+        self.fire_action_box = tk.LabelFrame(
+            scroll_frame,
+            text=f" {t('fire_bottom_actions_title')} ",
+            font=("Segoe UI", 9, "bold"),
+            padx=10,
+            pady=8,
+        )
+        self.fire_action_box.pack(fill=tk.X, pady=(0, 10))
+
+        # Row 1: Actuarial Diagnostic Suite (10 Models & Specialized Audits)
+        row1 = tk.Frame(self.fire_action_box)
+        row1.pack(fill=tk.X, pady=(0, 5))
+
+        self.lbl_fire_models_suite = tk.Label(
+            row1,
+            text=f"🏛️ {t('lbl_fire_models_suite')}",
+            font=("Segoe UI", 9, "bold"),
+            fg=self.primary_color,
+        )
+        self.lbl_fire_models_suite.pack(side=tk.LEFT, padx=(0, 6))
+
+        self.btn_fire_toolkit_bar = tk.Button(
+            row1,
+            text=f"🚀 {t('btn_fire_toolkit')}",
+            font=("Segoe UI", 8, "bold"),
+            bg="#1a73e8",
+            fg="#ffffff",
+            relief="solid",
+            bd=1,
+            padx=8,
+            pady=3,
+            cursor="hand2",
+            command=self._open_retirement_advanced_toolkit_dialog,
+        )
+        self.btn_fire_toolkit_bar.pack(side=tk.LEFT, padx=(0, 5))
+        attach_tooltip(self.btn_fire_toolkit_bar, "tip_fire_toolkit_all")
+        self.btn_fire_toolkit = self.btn_fire_toolkit_bar
+
+        self.btn_fire_deep_risk = tk.Button(
+            row1,
+            text=t("btn_deep_risk_short"),
+            font=("Segoe UI", 8, "bold"),
+            bg="#ffffff" if not self.dark_mode else "#2d3342",
+            fg="#1a73e8",
+            relief="solid",
+            bd=1,
+            padx=7,
+            pady=3,
+            cursor="hand2",
+            command=self._show_deep_risk_dialog,
+        )
+        self.btn_fire_deep_risk.pack(side=tk.LEFT, padx=(0, 5))
+        attach_tooltip(self.btn_fire_deep_risk, "btn_deep_risk_audit")
+
+        self.btn_fire_crisis_stress = tk.Button(
+            row1,
+            text=t("btn_crisis_stress_short"),
+            font=("Segoe UI", 8, "bold"),
+            bg="#ffffff" if not self.dark_mode else "#2d3342",
+            fg="#c5221f",
+            relief="solid",
+            bd=1,
+            padx=7,
+            pady=3,
+            cursor="hand2",
+            command=self._show_crisis_stress_test_dialog,
+        )
+        self.btn_fire_crisis_stress.pack(side=tk.LEFT, padx=(0, 5))
+        attach_tooltip(self.btn_fire_crisis_stress, "btn_crisis_stress_test")
+
+        self.btn_fire_tax_drag = tk.Button(
+            row1,
+            text=t("btn_fee_tax_drag_short"),
+            font=("Segoe UI", 8, "bold"),
+            bg="#ffffff" if not self.dark_mode else "#2d3342",
+            fg="#b06000",
+            relief="solid",
+            bd=1,
+            padx=7,
+            pady=3,
+            cursor="hand2",
+            command=self._show_fee_tax_drag_dialog,
+        )
+        self.btn_fire_tax_drag.pack(side=tk.LEFT, padx=(0, 5))
+        attach_tooltip(self.btn_fire_tax_drag, "btn_fee_tax_drag")
+
+        self.btn_fire_rebalance_5_25 = tk.Button(
+            row1,
+            text=t("btn_rebalance_5_25_short"),
+            font=("Segoe UI", 8, "bold"),
+            bg="#ffffff" if not self.dark_mode else "#2d3342",
+            fg="#137333",
+            relief="solid",
+            bd=1,
+            padx=7,
+            pady=3,
+            cursor="hand2",
+            command=self._show_rebalancing_5_25_dialog,
+        )
+        self.btn_fire_rebalance_5_25.pack(side=tk.LEFT, padx=(0, 5))
+        attach_tooltip(self.btn_fire_rebalance_5_25, "btn_rebalance_5_25")
+
+        self.btn_fire_simplicity = tk.Button(
+            row1,
+            text=t("btn_simplicity_short"),
+            font=("Segoe UI", 8, "bold"),
+            bg="#ffffff" if not self.dark_mode else "#2d3342",
+            fg="#681da8",
+            relief="solid",
+            bd=1,
+            padx=7,
+            pady=3,
+            cursor="hand2",
+            command=self._show_simplicity_index_dialog,
+        )
+        self.btn_fire_simplicity.pack(side=tk.LEFT)
+        attach_tooltip(self.btn_fire_simplicity, "btn_simplicity_index")
+
+        # Row 2: Decision Execution, Simulation & Report Export
+        row2 = tk.Frame(self.fire_action_box)
+        row2.pack(fill=tk.X, pady=(2, 0))
+
+        self.lbl_fire_actions_suite = tk.Label(
+            row2,
+            text=f"⚡ {t('lbl_fire_actions_suite')}",
+            font=("Segoe UI", 9, "bold"),
+            fg="#e37400",
+        )
+        self.lbl_fire_actions_suite.pack(side=tk.LEFT, padx=(0, 6))
+
+        self.btn_fire_to_rebalance = tk.Button(
+            row2,
+            text=t("btn_apply_to_rebalance"),
+            font=("Segoe UI", 8, "bold"),
+            bg="#ffffff" if not self.dark_mode else "#2d3342",
+            fg=self.primary_color,
+            relief="solid",
+            bd=1,
+            padx=8,
+            pady=3,
+            cursor="hand2",
+            command=self._apply_fire_to_rebalance,
+        )
+        self.btn_fire_to_rebalance.pack(side=tk.LEFT, padx=(0, 5))
+        attach_tooltip(self.btn_fire_to_rebalance, "tip_fire_apply_rebalance")
+
+        self.btn_fire_simulate = tk.Button(
+            row2,
+            text=t("btn_simulate_trade"),
+            font=("Segoe UI", 8, "bold"),
+            bg="#ffffff" if not self.dark_mode else "#2d3342",
+            fg="#188038",
+            relief="solid",
+            bd=1,
+            padx=8,
+            pady=3,
+            cursor="hand2",
+            command=lambda: self._open_what_if_dialog(
+                initial_symbol="TIP",
+                initial_amount=getattr(self, "_last_safe_gap", 10000.0)
+            ),
+        )
+        self.btn_fire_simulate.pack(side=tk.LEFT, padx=(0, 5))
+        attach_tooltip(self.btn_fire_simulate, "tip_fire_simulate_trade")
+
+        self.btn_fire_recalc = tk.Button(
+            row2,
+            text=f"🔄 {t('btn_recalc_fire')}",
+            font=("Segoe UI", 8, "bold"),
+            bg="#ffffff" if not self.dark_mode else "#2d3342",
+            fg="#5f6368" if not self.dark_mode else "#c4c7c5",
+            relief="solid",
+            bd=1,
+            padx=8,
+            pady=3,
+            cursor="hand2",
+            command=self._refresh_fire_tab,
+        )
+        self.btn_fire_recalc.pack(side=tk.LEFT, padx=(0, 5))
+        attach_tooltip(self.btn_fire_recalc, "tip_fire_recalc")
+
+        self.btn_fire_export = tk.Button(
+            row2,
+            text=t("btn_export_fire_report"),
+            font=("Segoe UI", 8, "bold"),
+            bg="#e37400",
+            fg="#ffffff",
+            relief="solid",
+            bd=1,
+            padx=10,
+            pady=3,
+            cursor="hand2",
+            command=self._export_fire_report_action,
+        )
+        self.btn_fire_export.pack(side=tk.RIGHT)
+        attach_tooltip(self.btn_fire_export, "tip_fire_export_report")
 
         # Main 2-column layout container
         content_box = tk.Frame(scroll_frame, bg=self.bg_main)
@@ -3625,6 +4149,18 @@ class ModernPortfolioApp:
             w.bind("<ButtonRelease-1>", lambda e: self._refresh_fire_tab())
         self.fire_safe_years_combo.bind("<<ComboboxSelected>>", lambda e: self._refresh_fire_tab())
 
+        # Attach hints / tooltips
+        attach_tooltip(self.fire_outside_safe_entry, "tip_fire_outside_safe")
+        attach_tooltip(self.fire_age_spin, "tip_fire_current_age")
+        attach_tooltip(self.fire_retire_age_spin, "tip_fire_retire_age")
+        attach_tooltip(self.fire_horizon_spin, "tip_fire_horizon")
+        attach_tooltip(self.fire_safe_years_combo, "tip_fire_safe_years")
+        attach_tooltip(self.fire_delay_check, "tip_fire_delay_pension")
+        attach_tooltip(self.fire_exp_entry, "tip_fire_exp")
+        attach_tooltip(self.fire_pension_entry, "tip_fire_pension")
+        attach_tooltip(self.fire_savings_entry, "tip_fire_savings")
+        attach_tooltip(self.fire_growth_entry, "tip_fire_growth")
+
         # =========================================================
         # RIGHT COLUMN: STEPS 4 TO 5 (GAP ANALYSIS & ACTION PLAN)
         # =========================================================
@@ -3797,125 +4333,6 @@ class ModernPortfolioApp:
             wraplength=500,
         )
         self.lbl_fire_checklist.pack(anchor="w")
-
-        # Action Buttons
-        btn_bar = tk.Frame(self.fire_s5_box)
-        btn_bar.pack(fill=tk.X, pady=(4, 0))
-
-        self.btn_fire_to_rebalance = tk.Button(
-            btn_bar,
-            text=t("btn_apply_to_rebalance"),
-            font=("Segoe UI", 8, "bold"),
-            bg="#ffffff" if not self.dark_mode else "#2d3342",
-            fg=self.primary_color,
-            relief="solid",
-            bd=1,
-            padx=8,
-            pady=3,
-            command=self._apply_fire_to_rebalance,
-        )
-        self.btn_fire_to_rebalance.pack(side=tk.LEFT, padx=(0, 4))
-
-        self.btn_fire_simulate = tk.Button(
-            btn_bar,
-            text=t("btn_simulate_trade"),
-            font=("Segoe UI", 8, "bold"),
-            bg="#ffffff" if not self.dark_mode else "#2d3342",
-            fg="#188038",
-            relief="solid",
-            bd=1,
-            padx=8,
-            pady=3,
-            command=lambda: self._open_what_if_dialog(
-                initial_symbol="TIP",
-                initial_amount=getattr(self, "_last_safe_gap", 10000.0)
-            ),
-        )
-        self.btn_fire_simulate.pack(side=tk.LEFT, padx=(0, 4))
-
-        self.btn_fire_deep_risk = tk.Button(
-            btn_bar,
-            text=t("btn_deep_risk_audit"),
-            font=("Segoe UI", 8, "bold"),
-            bg="#ffffff" if not self.dark_mode else "#2d3342",
-            fg="#1a73e8",
-            relief="solid",
-            bd=1,
-            padx=8,
-            pady=3,
-            command=self._show_deep_risk_dialog,
-        )
-        self.btn_fire_deep_risk.pack(side=tk.LEFT, padx=(0, 4))
-
-        self.btn_fire_crisis_stress = tk.Button(
-            btn_bar,
-            text=t("btn_crisis_stress_test"),
-            font=("Segoe UI", 8, "bold"),
-            bg="#ffffff" if not self.dark_mode else "#2d3342",
-            fg="#c5221f",
-            relief="solid",
-            bd=1,
-            padx=8,
-            pady=3,
-            command=self._show_crisis_stress_test_dialog,
-        )
-        self.btn_fire_crisis_stress.pack(side=tk.LEFT, padx=(0, 4))
-
-        self.btn_fire_tax_drag = tk.Button(
-            btn_bar,
-            text=t("btn_fee_tax_drag"),
-            font=("Segoe UI", 8, "bold"),
-            bg="#ffffff" if not self.dark_mode else "#2d3342",
-            fg="#b06000",
-            relief="solid",
-            bd=1,
-            padx=8,
-            pady=3,
-            command=self._show_fee_tax_drag_dialog,
-        )
-        self.btn_fire_tax_drag.pack(side=tk.LEFT, padx=(0, 4))
-
-        self.btn_fire_rebalance_5_25 = tk.Button(
-            btn_bar,
-            text=t("btn_rebalance_5_25"),
-            font=("Segoe UI", 8, "bold"),
-            bg="#ffffff" if not self.dark_mode else "#2d3342",
-            fg="#137333",
-            relief="solid",
-            bd=1,
-            padx=8,
-            pady=3,
-            command=self._show_rebalancing_5_25_dialog,
-        )
-        self.btn_fire_rebalance_5_25.pack(side=tk.LEFT, padx=(0, 4))
-
-        self.btn_fire_simplicity = tk.Button(
-            btn_bar,
-            text=t("btn_simplicity_index"),
-            font=("Segoe UI", 8, "bold"),
-            bg="#ffffff" if not self.dark_mode else "#2d3342",
-            fg="#681da8",
-            relief="solid",
-            bd=1,
-            padx=8,
-            pady=3,
-            command=self._show_simplicity_index_dialog,
-        )
-        self.btn_fire_simplicity.pack(side=tk.LEFT, padx=(0, 4))
-
-        self.btn_fire_export = tk.Button(
-            btn_bar,
-            text=t("btn_export_fire_report"),
-            font=("Segoe UI", 8, "bold"),
-            bg="#e37400",
-            fg="#ffffff",
-            relief="solid",
-            bd=1,
-            padx=8,
-            pady=3,
-            command=self._export_fire_report_action,
-        )
-        self.btn_fire_export.pack(side=tk.RIGHT)
 
         # Initial calculation
         self._refresh_fire_tab()
@@ -4650,6 +5067,702 @@ class ModernPortfolioApp:
 
         tk.Button(btn_box, text=t("btn_export_ladder_csv"), font=("Segoe UI", 9, "bold"), relief="solid", bd=1, padx=10, pady=3, command=_export_csv).pack(side=tk.LEFT)
         tk.Button(btn_box, text=t("btn_close"), font=("Segoe UI", 9), padx=10, pady=3, command=dlg.destroy).pack(side=tk.RIGHT)
+
+    def _open_retirement_advanced_toolkit_dialog(self):
+        """Displays the Institutional Retirement & Actuarial Planning Toolkit (10 Dedicated Models)."""
+        if not hasattr(self, "_last_fire_res"):
+            self._refresh_fire_tab()
+        res = getattr(self, "_last_fire_res", {})
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title(t("fire_tk_title"))
+        dlg.geometry("1020x760")
+        dlg.minsize(900, 640)
+        dlg.transient(self.root)
+
+        frame = ttk.Frame(dlg, padding=12)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        # Header Title
+        hdr_box = tk.Frame(frame)
+        hdr_box.pack(fill=tk.X, pady=(0, 8))
+
+        tk.Label(
+            hdr_box,
+            text=f"🚀 {t('fire_tk_title')}",
+            font=("Segoe UI", 12, "bold"),
+            fg="#1a73e8",
+        ).pack(anchor="w")
+
+        tk.Label(
+            hdr_box,
+            text=t("fire_tk_sub"),
+            font=("Segoe UI", 8),
+            fg="#5f6368" if not self.dark_mode else "#9aa0a6",
+        ).pack(anchor="w", pady=(2, 0))
+
+        # Notebook tabs (10 Dedicated Tabs)
+        nb = ttk.Notebook(frame)
+        nb.pack(fill=tk.BOTH, expand=True)
+
+        card_bg = "#ffffff" if not self.dark_mode else "#2d3342"
+        border_c = "#dadce0" if not self.dark_mode else "#3c4043"
+
+        port_val = res.get("portfolio_value", 0.0)
+        ann_rle = res.get("annual_rle", 0.0)
+        cur_safe = res.get("current_safe_assets", 0.0)
+
+        # =========================================================
+        # TAB 1: BLANCHETT SPENDING SMILE
+        # =========================================================
+        t1 = ttk.Frame(nb, padding=10)
+        nb.add(t1, text=f" {t('fire_tk_tab_1')} ")
+
+        smile_data = res.get("spending_smile_data", {})
+        if smile_data:
+            cards_f1 = tk.Frame(t1)
+            cards_f1.pack(fill=tk.X, pady=(0, 8))
+
+            c_info = [
+                (t("fire_tk_gogo_card"), smile_data.get("gogo_annual", 0), t("fire_tk_gogo_note"), "#e8f0fe", "#1a73e8"),
+                (t("fire_tk_slowgo_card"), smile_data.get("slowgo_annual", 0), t("fire_tk_slowgo_note"), "#e6f4ea", "#188038"),
+                (t("fire_tk_care_card"), smile_data.get("care_annual", 0), t("fire_tk_care_note"), "#fce8e6", "#d93025"),
+            ]
+            for title, amt, note, bg_col, fg_col in c_info:
+                card = tk.Frame(cards_f1, bg=bg_col, bd=1, relief="solid", highlightbackground=fg_col, padx=8, pady=8)
+                card.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=4)
+                tk.Label(card, text=title, font=("Segoe UI", 8, "bold"), fg=fg_col, bg=bg_col).pack(anchor="w")
+                tk.Label(card, text=f"${amt:,.0f} / yr", font=("Segoe UI", 12, "bold"), fg=self.text_dark, bg=bg_col).pack(anchor="w", pady=2)
+                tk.Label(card, text=note, font=("Segoe UI", 8), fg=self.text_dark, bg=bg_col).pack(anchor="w")
+
+            sav_banner = tk.Frame(t1, bg="#e6f4ea", bd=1, relief="solid", padx=10, pady=6)
+            sav_banner.pack(fill=tk.X, pady=(0, 8))
+            tot_flat = smile_data.get("flat_total_lifetime", 0)
+            tot_smile = smile_data.get("smile_total_lifetime", 0)
+            savings = smile_data.get("capital_savings", 0)
+            sav_pct = smile_data.get("savings_pct", 0)
+            tk.Label(
+                sav_banner,
+                text=t("fire_tk_smile_banner", tot_smile=tot_smile, tot_flat=tot_flat),
+                font=("Segoe UI", 9, "bold"),
+                fg="#137333",
+                bg="#e6f4ea",
+            ).pack(anchor="w")
+            tk.Label(
+                sav_banner,
+                text=t("fire_tk_smile_savings", savings=savings, sav_pct=sav_pct),
+                font=("Segoe UI", 8),
+                fg=self.text_dark,
+                bg="#e6f4ea",
+            ).pack(anchor="w")
+
+            cols1 = ("age", "phase", "mult", "spend", "cum")
+            tr1 = ttk.Treeview(t1, columns=cols1, show="headings", height=8, selectmode="browse")
+            tr1.heading("age", text=t("col_tk_age"))
+            tr1.heading("phase", text=t("col_tk_phase"))
+            tr1.heading("mult", text=t("col_tk_mult"))
+            tr1.heading("spend", text=t("col_tk_annual_spend"))
+            tr1.heading("cum", text=t("col_tk_cum_spend"))
+            tr1.column("age", width=70, anchor="center")
+            tr1.column("phase", width=150, anchor="w")
+            tr1.column("mult", width=90, anchor="center")
+            tr1.column("spend", width=160, anchor="e")
+            tr1.column("cum", width=180, anchor="e")
+
+            for row in smile_data.get("annual_schedule", []):
+                tr1.insert("", tk.END, values=(
+                    f"{row['age']}",
+                    row.get("phase_desc", row["phase"]),
+                    f"{row['multiplier']:.2f}x",
+                    f"${row['annual_spending']:,.0f}",
+                    f"${row['cumulative_total']:,.0f}",
+                ))
+            sb1 = ttk.Scrollbar(t1, orient="vertical", command=tr1.yview)
+            tr1.configure(yscrollcommand=sb1.set)
+            tr1.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            sb1.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # =========================================================
+        # TAB 2: SEQUENCE OF RETURNS RISK (SRR CRASH SIMULATION)
+        # =========================================================
+        t2 = ttk.Frame(nb, padding=10)
+        nb.add(t2, text=f" {t('fire_tk_tab_2')} ")
+
+        srr_top = tk.Frame(t2)
+        srr_top.pack(fill=tk.X, pady=(0, 8))
+
+        tk.Label(srr_top, text=t("fire_tk_srr_select"), font=("Segoe UI", 9, "bold")).pack(side=tk.LEFT, padx=(0, 8))
+
+        scen_key_map = {
+            t("scen_1973"): "stagflation_1973",
+            t("scen_1929"): "great_depression_1929",
+            t("scen_2000"): "dot_com_2000",
+            t("scen_2008"): "gfc_2008",
+            t("scen_custom"): "custom",
+        }
+        scen_combo = ttk.Combobox(
+            srr_top,
+            values=list(scen_key_map.keys()),
+            state="readonly",
+            width=38,
+            font=("Segoe UI", 9),
+        )
+        scen_combo.set(t("scen_1973"))
+        scen_combo.pack(side=tk.LEFT)
+
+        srr_cards_f = tk.Frame(t2)
+        srr_cards_f.pack(fill=tk.X, pady=(0, 8))
+
+        srr_c1 = tk.Frame(srr_cards_f, bg="#fce8e6", bd=1, relief="solid", highlightbackground="#d93025", padx=8, pady=8)
+        srr_c1.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=4)
+        lbl_srr_c1_title = tk.Label(srr_c1, text=t("fire_tk_srr_unprotected_title"), font=("Segoe UI", 8, "bold"), fg="#d93025", bg="#fce8e6")
+        lbl_srr_c1_title.pack(anchor="w")
+        lbl_srr_c1_val = tk.Label(srr_c1, text="", font=("Segoe UI", 12, "bold"), fg=self.text_dark, bg="#fce8e6")
+        lbl_srr_c1_val.pack(anchor="w", pady=2)
+        lbl_srr_c1_sub = tk.Label(srr_c1, text="", font=("Segoe UI", 8), fg=self.text_dark, bg="#fce8e6")
+        lbl_srr_c1_sub.pack(anchor="w")
+
+        srr_c2 = tk.Frame(srr_cards_f, bg="#e6f4ea", bd=1, relief="solid", highlightbackground="#188038", padx=8, pady=8)
+        srr_c2.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=4)
+        lbl_srr_c2_title = tk.Label(srr_c2, text=t("fire_tk_srr_protected_title"), font=("Segoe UI", 8, "bold"), fg="#188038", bg="#e6f4ea")
+        lbl_srr_c2_title.pack(anchor="w")
+        lbl_srr_c2_val = tk.Label(srr_c2, text="", font=("Segoe UI", 12, "bold"), fg=self.text_dark, bg="#e6f4ea")
+        lbl_srr_c2_val.pack(anchor="w", pady=2)
+        lbl_srr_c2_sub = tk.Label(srr_c2, text="", font=("Segoe UI", 8), fg=self.text_dark, bg="#e6f4ea")
+        lbl_srr_c2_sub.pack(anchor="w")
+
+        cols2 = ("year", "return", "no_buf", "with_buf", "safe_rem")
+        tr2 = ttk.Treeview(t2, columns=cols2, show="headings", height=8, selectmode="browse")
+        tr2.heading("year", text=t("col_tk_year"))
+        tr2.heading("return", text=t("col_tk_mkt_return"))
+        tr2.heading("no_buf", text=t("col_tk_port_no_buf"))
+        tr2.heading("with_buf", text=t("col_tk_port_with_buf"))
+        tr2.heading("safe_rem", text=t("col_tk_safe_rem"))
+        tr2.column("year", width=70, anchor="center")
+        tr2.column("return", width=110, anchor="center")
+        tr2.column("no_buf", width=170, anchor="e")
+        tr2.column("with_buf", width=180, anchor="e")
+        tr2.column("safe_rem", width=170, anchor="e")
+        tr2.pack(fill=tk.BOTH, expand=True)
+
+        def _update_srr(*_):
+            sc_key = scen_key_map.get(scen_combo.get(), "stagflation_1973")
+            srr_res = calc_sequence_of_returns_risk_simulation(
+                portfolio_val=port_val,
+                annual_withdrawal=ann_rle,
+                safe_assets_val=cur_safe,
+                crash_scenario=sc_key,
+            )
+            term_no = srr_res.get("terminal_no_buffer", 0)
+            term_buf = srr_res.get("terminal_with_buffer", 0)
+            dep_no = srr_res.get("depleted_no_buffer_year")
+            sav = srr_res.get("equity_capital_saved", 0)
+
+            lbl_srr_c1_val.config(text=t("fire_tk_srr_terminal", term=term_no))
+            lbl_srr_c1_sub.config(text=t("fire_tk_srr_depleted", dep=dep_no) if dep_no else t("fire_tk_srr_survived"))
+
+            lbl_srr_c2_val.config(text=t("fire_tk_srr_terminal", term=term_buf))
+            lbl_srr_c2_sub.config(text=f"{t('fire_tk_srr_saved_lbl', sav=sav)} {t('fire_tk_srr_solvency')}")
+
+            for item in tr2.get_children():
+                tr2.delete(item)
+
+            c_no = srr_res.get("curve_no_buffer", [])
+            c_buf = srr_res.get("curve_with_buffer", [])
+            for idx in range(len(c_no)):
+                row_no = c_no[idx]
+                row_buf = c_buf[idx]
+                tr2.insert("", tk.END, values=(
+                    f"{row_no['year']}",
+                    f"{row_no['return_pct']:+.1f}%",
+                    f"${row_no['balance']:,.0f}",
+                    f"${row_buf['balance']:,.0f}",
+                    f"${row_buf.get('safe_remaining', 0):,.0f}",
+                ))
+
+        scen_combo.bind("<<ComboboxSelected>>", _update_srr)
+        _update_srr()
+
+        # =========================================================
+        # TAB 3: GUYTON-KLINGER GUARDRAILS
+        # =========================================================
+        t3 = ttk.Frame(nb, padding=10)
+        nb.add(t3, text=f" {t('fire_tk_tab_3')} ")
+
+        gk_data = res.get("guardrails_data", {})
+        if gk_data:
+            trig = gk_data.get("rule_triggered", "none")
+            bg_gk = "#e6f4ea" if trig == "none" else ("#fce8e6" if trig == "capital_preservation" else "#e8f0fe")
+            fg_gk = "#137333" if trig == "none" else ("#d93025" if trig == "capital_preservation" else "#1a73e8")
+
+            gk_banner = tk.Frame(t3, bg=bg_gk, bd=1, relief="solid", padx=10, pady=8)
+            gk_banner.pack(fill=tk.X, pady=(0, 10))
+
+            tk.Label(gk_banner, text=t("fire_tk_gk_status", status=trig.replace('_', ' ').title()), font=("Segoe UI", 10, "bold"), fg=fg_gk, bg=bg_gk).pack(anchor="w")
+            tk.Label(gk_banner, text=gk_data.get("rule_desc", ""), font=("Segoe UI", 9), fg=self.text_dark, bg=bg_gk).pack(anchor="w", pady=(2, 0))
+
+            cards_gk = tk.Frame(t3)
+            cards_gk.pack(fill=tk.X, pady=(0, 10))
+
+            cur_rate = gk_data.get("current_withdrawal_rate_pct", 0)
+            cur_draw = gk_data.get("current_annual_withdrawal", 0)
+            up_rate = gk_data.get("upper_guardrail_pct", 0)
+            up_dol = gk_data.get("upper_guardrail_dollars", 0)
+            low_rate = gk_data.get("lower_guardrail_pct", 0)
+            low_dol = gk_data.get("lower_guardrail_dollars", 0)
+            rec_draw = gk_data.get("recommended_withdrawal", 0)
+            adj_pct = gk_data.get("adjustment_pct", 0)
+
+            c_gk_info = [
+                (t("fire_tk_gk_cur_swr"), f"{cur_rate:.2f}%", f"${cur_draw:,.0f} / yr", card_bg, border_c),
+                (t("fire_tk_gk_upper_card"), f"{up_rate:.2f}%", t("fire_tk_gk_cap_fmt", amt=up_dol), card_bg, "#d93025"),
+                (t("fire_tk_gk_lower_card"), f"{low_rate:.2f}%", t("fire_tk_gk_floor_fmt", amt=low_dol), card_bg, "#188038"),
+                (t("fire_tk_gk_rec_card"), f"${rec_draw:,.0f}", t("fire_tk_gk_adj_fmt", adj=adj_pct), card_bg, "#1a73e8"),
+            ]
+            for title, val, sub, bg_c, bd_c in c_gk_info:
+                card = tk.Frame(cards_gk, bg=bg_c, bd=1, relief="solid", highlightbackground=bd_c, padx=8, pady=8)
+                card.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=4)
+                tk.Label(card, text=title, font=("Segoe UI", 8, "bold"), fg=bd_c, bg=bg_c).pack(anchor="w")
+                tk.Label(card, text=val, font=("Segoe UI", 12, "bold"), fg=self.text_dark, bg=bg_c).pack(anchor="w", pady=2)
+                tk.Label(card, text=sub, font=("Segoe UI", 8), fg=self.text_dark, bg=bg_c).pack(anchor="w")
+
+            guide_box3 = tk.Frame(t3, bg="#f8f9fa" if not self.dark_mode else "#252830", bd=1, relief="solid", padx=10, pady=8)
+            guide_box3.pack(fill=tk.BOTH, expand=True)
+            tk.Label(guide_box3, text=t("fire_tk_gk_principles_title"), font=("Segoe UI", 9, "bold"), fg="#1a73e8", bg="#f8f9fa" if not self.dark_mode else "#252830").pack(anchor="w")
+            tk.Label(guide_box3, text=t("fire_tk_gk_principles_body"), font=("Segoe UI", 8), justify=tk.LEFT, fg=self.text_dark, bg="#f8f9fa" if not self.dark_mode else "#252830").pack(anchor="w", pady=(4, 0))
+
+        # =========================================================
+        # TAB 4: 3-BUCKET RUNWAY ARCHITECTURE
+        # =========================================================
+        t4 = ttk.Frame(nb, padding=10)
+        nb.add(t4, text=f" {t('fire_tk_tab_4')} ")
+
+        b_data = res.get("three_bucket_data", {})
+        if b_data:
+            rw_yrs = b_data.get("total_safe_runway_years", 0)
+            rw_banner = tk.Frame(t4, bg="#e8f0fe", bd=1, relief="solid", padx=10, pady=8)
+            rw_banner.pack(fill=tk.X, pady=(0, 10))
+
+            tk.Label(
+                rw_banner,
+                text=t("fire_tk_b_runway_title", yrs=rw_yrs),
+                font=("Segoe UI", 10, "bold"),
+                fg="#1a73e8",
+                bg="#e8f0fe",
+            ).pack(anchor="w")
+            tk.Label(
+                rw_banner,
+                text=t("fire_tk_b_runway_desc"),
+                font=("Segoe UI", 8),
+                fg=self.text_dark,
+                bg="#e8f0fe",
+            ).pack(anchor="w", pady=(2, 0))
+
+            cards_b = tk.Frame(t4)
+            cards_b.pack(fill=tk.X, pady=(0, 10))
+
+            b_info = [
+                (
+                    t("fire_tk_b1_title"),
+                    b_data.get("bucket1_target", 0),
+                    b_data.get("bucket1_actual", 0),
+                    t("fire_tk_b1_note", mo=b_data.get("bucket1_runway_months", 0), pct=b_data.get("bucket1_funded_pct", 0)),
+                    "#e6f4ea" if b_data.get("bucket1_gap", 0) == 0 else "#fef7e0",
+                    "#188038" if b_data.get("bucket1_gap", 0) == 0 else "#b06000",
+                ),
+                (
+                    t("fire_tk_b2_title"),
+                    b_data.get("bucket2_target", 0),
+                    b_data.get("bucket2_actual", 0),
+                    t("fire_tk_b2_note", mo=b_data.get("bucket2_runway_months", 0)),
+                    "#e8f0fe",
+                    "#1a73e8",
+                ),
+                (
+                    t("fire_tk_b3_title"),
+                    b_data.get("bucket3_target", 0),
+                    b_data.get("bucket3_actual", 0),
+                    t("fire_tk_b3_note"),
+                    card_bg,
+                    "#681da8",
+                ),
+            ]
+            for title, tgt, act, note, bg_c, fg_c in b_info:
+                card = tk.Frame(cards_b, bg=bg_c, bd=1, relief="solid", highlightbackground=fg_c, padx=8, pady=8)
+                card.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=4)
+                tk.Label(card, text=title, font=("Segoe UI", 8, "bold"), fg=fg_c, bg=bg_c).pack(anchor="w")
+                tk.Label(card, text=t("fire_tk_b_actual", act=act), font=("Segoe UI", 11, "bold"), fg=self.text_dark, bg=bg_c).pack(anchor="w", pady=2)
+                tk.Label(card, text=t("fire_tk_b_target", tgt=tgt), font=("Segoe UI", 8), fg=self.text_dark, bg=bg_c).pack(anchor="w")
+                tk.Label(card, text=note, font=("Segoe UI", 8, "italic"), fg=fg_c, bg=bg_c).pack(anchor="w", pady=(2, 0))
+
+            gap_f = tk.Frame(t4, bg="#f8f9fa" if not self.dark_mode else "#252830", bd=1, relief="solid", padx=10, pady=8)
+            gap_f.pack(fill=tk.BOTH, expand=True)
+
+            b1_gap = b_data.get("bucket1_gap", 0)
+            if b1_gap > 0:
+                gap_txt = t("fire_tk_b1_gap_alert", gap=b1_gap)
+                gap_col = "#d93025"
+            else:
+                gap_txt = t("fire_tk_b1_ok_alert", mo=b_data.get("bucket1_runway_months", 0))
+                gap_col = "#188038"
+
+            tk.Label(gap_f, text=t("fire_tk_b_health_title"), font=("Segoe UI", 9, "bold"), fg=gap_col, bg="#f8f9fa" if not self.dark_mode else "#252830").pack(anchor="w")
+            tk.Label(gap_f, text=gap_txt, font=("Segoe UI", 8), fg=self.text_dark, bg="#f8f9fa" if not self.dark_mode else "#252830").pack(anchor="w", pady=(2, 0))
+
+        # =========================================================
+        # TAB 5: HEALTHCARE & LTC CONTINGENCY SHOCK AUDIT
+        # =========================================================
+        t5 = ttk.Frame(nb, padding=10)
+        nb.add(t5, text=f" {t('fire_tk_tab_5')} ")
+
+        ltc_data = res.get("ltc_data", {})
+        if ltc_data:
+            can_abs = ltc_data.get("can_absorb", True)
+            bg_ltc = "#e6f4ea" if can_abs else "#fce8e6"
+            fg_ltc = "#188038" if can_abs else "#d93025"
+
+            ltc_f = tk.Frame(t5, bg=bg_ltc, bd=1, relief="solid", padx=10, pady=8)
+            ltc_f.pack(fill=tk.X, pady=(0, 10))
+
+            status_str = t("fire_tk_ltc_solvent") if can_abs else t("fire_tk_ltc_vulnerable")
+            tk.Label(
+                ltc_f,
+                text=t("fire_tk_ltc_title", status=status_str),
+                font=("Segoe UI", 10, "bold"),
+                fg=fg_ltc,
+                bg=bg_ltc,
+            ).pack(anchor="w")
+
+            cost_yr = ltc_data.get("annual_ltc_cost", 0)
+            tot_ltc = ltc_data.get("total_ltc_cost", 0)
+            pv_ltc = ltc_data.get("present_value_needed", 0)
+            imp_pct = ltc_data.get("ltc_wealth_impact_pct", 0)
+            st_age = ltc_data.get("ltc_start_age", 83)
+            dur_yr = ltc_data.get("ltc_duration_years", 4)
+
+            tk.Label(
+                ltc_f,
+                text=t("fire_tk_ltc_desc", start=st_age, dur=dur_yr, cost=cost_yr, tot=tot_ltc, pv=pv_ltc, pct=imp_pct),
+                font=("Segoe UI", 8),
+                fg=self.text_dark,
+                bg=bg_ltc,
+            ).pack(anchor="w", pady=(2, 0))
+
+            cards_ltc = tk.Frame(t5)
+            cards_ltc.pack(fill=tk.X, pady=(0, 10))
+
+            c_ltc_info = [
+                ("Nominal Shock Cost", f"${tot_ltc:,.0f}", f"{dur_yr} Yrs @ ${cost_yr:,.0f}/yr", card_bg, border_c),
+                ("Present Value Needed", f"${pv_ltc:,.0f}", f"Discounted @ 4.0% Real", card_bg, "#1a73e8"),
+                ("Impact on Total Wealth", f"{imp_pct:.1f}%", "Solvent" if can_abs else "Coverage Needed", bg_ltc, fg_ltc),
+            ]
+            for title, val, sub, bg_c, bd_c in c_ltc_info:
+                card = tk.Frame(cards_ltc, bg=bg_c, bd=1, relief="solid", highlightbackground=bd_c, padx=8, pady=8)
+                card.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=4)
+                tk.Label(card, text=title, font=("Segoe UI", 8, "bold"), fg=bd_c, bg=bg_c).pack(anchor="w")
+                tk.Label(card, text=val, font=("Segoe UI", 12, "bold"), fg=self.text_dark, bg=bg_c).pack(anchor="w", pady=2)
+                tk.Label(card, text=sub, font=("Segoe UI", 8), fg=self.text_dark, bg=bg_c).pack(anchor="w")
+
+            guide_ltc = tk.Frame(t5, bg="#f8f9fa" if not self.dark_mode else "#252830", bd=1, relief="solid", padx=10, pady=8)
+            guide_ltc.pack(fill=tk.BOTH, expand=True)
+            tk.Label(guide_ltc, text=t("fire_tk_ltc_tips_title"), font=("Segoe UI", 9, "bold"), fg="#1a73e8", bg="#f8f9fa" if not self.dark_mode else "#252830").pack(anchor="w")
+            tk.Label(guide_ltc, text=t("fire_tk_ltc_tips_body"), font=("Segoe UI", 8), justify=tk.LEFT, fg=self.text_dark, bg="#f8f9fa" if not self.dark_mode else "#252830").pack(anchor="w", pady=(4, 0))
+
+        # =========================================================
+        # TAB 6: ACTUARIAL LONGEVITY TABLE
+        # =========================================================
+        t6 = ttk.Frame(nb, padding=10)
+        nb.add(t6, text=f" {t('fire_tk_tab_6')} ")
+
+        long_data = res.get("longevity_data", {})
+        if long_data:
+            rec_age = long_data.get("recommended_planning_age", 95)
+            tk.Label(
+                t6,
+                text=t("fire_tk_long_title", age=rec_age),
+                font=("Segoe UI", 9, "bold"),
+                fg="#1a73e8",
+            ).pack(anchor="w", pady=(0, 6))
+
+            cols6 = ("age", "male", "female", "joint")
+            tr6 = ttk.Treeview(t6, columns=cols6, show="headings", height=7, selectmode="browse")
+            tr6.heading("age", text=t("col_tk_target_age"))
+            tr6.heading("male", text=t("col_tk_male_prob"))
+            tr6.heading("female", text=t("col_tk_female_prob"))
+            tr6.heading("joint", text=t("col_tk_joint_prob"))
+            tr6.column("age", width=140, anchor="center")
+            tr6.column("male", width=140, anchor="center")
+            tr6.column("female", width=140, anchor="center")
+            tr6.column("joint", width=160, anchor="center")
+
+            for row in long_data.get("longevity_schedule", []):
+                tr6.insert("", tk.END, values=(
+                    f"Age {row['target_age']}",
+                    f"{row['prob_male']:.1f}%",
+                    f"{row['prob_female']:.1f}%",
+                    f"{row['prob_joint']:.1f}%",
+                ))
+            tr6.pack(fill=tk.X, pady=(0, 10))
+
+            guide_long = tk.Frame(t6, bg="#f8f9fa" if not self.dark_mode else "#252830", bd=1, relief="solid", padx=10, pady=8)
+            guide_long.pack(fill=tk.BOTH, expand=True)
+            tk.Label(guide_long, text=t("fire_tk_long_guidance_title"), font=("Segoe UI", 9, "bold"), fg="#1a73e8", bg="#f8f9fa" if not self.dark_mode else "#252830").pack(anchor="w")
+            tk.Label(guide_long, text=t("fire_tk_long_guidance_body"), font=("Segoe UI", 8), justify=tk.LEFT, fg=self.text_dark, bg="#f8f9fa" if not self.dark_mode else "#252830").pack(anchor="w", pady=(4, 0))
+
+        # =========================================================
+        # TAB 7: MONTE CARLO 500-TRIAL PERCENTILES
+        # =========================================================
+        t7 = ttk.Frame(nb, padding=10)
+        nb.add(t7, text=f" {t('fire_tk_tab_7')} ")
+
+        mc = res.get("monte_carlo_dist", {})
+        if mc:
+            tk.Label(t7, text=t("fire_tk_mc_title"), font=("Segoe UI", 9, "bold"), fg="#1a73e8").pack(anchor="w", pady=(0, 6))
+            mc_cards = tk.Frame(t7)
+            mc_cards.pack(fill=tk.X, pady=(0, 10))
+
+            mc_info = [
+                (t("fire_tk_mc_success"), f"{mc.get('success_rate_pct', 0):.1f}%", t("fire_tk_mc_success_note"), "#e6f4ea", "#188038"),
+                (t("fire_tk_mc_p10"), f"${mc.get('p10_terminal_wealth', 0):,.0f}", t("fire_tk_mc_p10_note"), "#fce8e6", "#d93025"),
+                (t("fire_tk_mc_p50"), f"${mc.get('p50_terminal_wealth', 0):,.0f}", t("fire_tk_mc_p50_note"), "#e8f0fe", "#1a73e8"),
+                (t("fire_tk_mc_p90"), f"${mc.get('p90_terminal_wealth', 0):,.0f}", t("fire_tk_mc_p90_note"), card_bg, "#681da8"),
+            ]
+            for title, val, note, bg_c, fg_c in mc_info:
+                card = tk.Frame(mc_cards, bg=bg_c, bd=1, relief="solid", highlightbackground=fg_c, padx=8, pady=6)
+                card.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=4)
+                tk.Label(card, text=title, font=("Segoe UI", 8, "bold"), fg=fg_c, bg=bg_c).pack(anchor="w")
+                tk.Label(card, text=val, font=("Segoe UI", 11, "bold"), fg=self.text_dark, bg=bg_c).pack(anchor="w", pady=2)
+                tk.Label(card, text=note, font=("Segoe UI", 8), fg=self.text_dark, bg=bg_c).pack(anchor="w")
+
+            guide_mc = tk.Frame(t7, bg="#f8f9fa" if not self.dark_mode else "#252830", bd=1, relief="solid", padx=10, pady=8)
+            guide_mc.pack(fill=tk.BOTH, expand=True)
+            tk.Label(guide_mc, text=t("fire_tk_mc_guide_title"), font=("Segoe UI", 9, "bold"), fg="#1a73e8", bg="#f8f9fa" if not self.dark_mode else "#252830").pack(anchor="w")
+            tk.Label(guide_mc, text=t("fire_tk_mc_guide_body"), font=("Segoe UI", 8), justify=tk.LEFT, fg=self.text_dark, bg="#f8f9fa" if not self.dark_mode else "#252830").pack(anchor="w", pady=(4, 0))
+
+        # =========================================================
+        # TAB 8: STAGFLATION SENSITIVITY MATRIX
+        # =========================================================
+        t8 = ttk.Frame(nb, padding=10)
+        nb.add(t8, text=f" {t('fire_tk_tab_8')} ")
+
+        stag = res.get("stagflation_data", {})
+        if stag:
+            tk.Label(t8, text=t("fire_tk_stag_title"), font=("Segoe UI", 9, "bold"), fg="#e37400").pack(anchor="w", pady=(0, 6))
+            cols8 = ("infl", "r1", "r3", "r5", "r7")
+            tr8 = ttk.Treeview(t8, columns=cols8, show="headings", height=5, selectmode="browse")
+            tr8.heading("infl", text=t("col_tk_infl_level"))
+            tr8.heading("r1", text=t("col_tk_r1"))
+            tr8.heading("r3", text=t("col_tk_r3"))
+            tr8.heading("r5", text=t("col_tk_r5"))
+            tr8.heading("r7", text=t("col_tk_r7"))
+            tr8.column("infl", width=140, anchor="w")
+            tr8.column("r1", width=140, anchor="center")
+            tr8.column("r3", width=140, anchor="center")
+            tr8.column("r5", width=140, anchor="center")
+            tr8.column("r7", width=140, anchor="center")
+
+            for row in stag.get("matrix", []):
+                vals = [f"{row[0]['inflation_pct']:.1f}%"]
+                for cell in row:
+                    dur = cell["longevity_years"]
+                    vals.append(t("fire_tk_perpetual") if cell["is_perpetual"] else t("fire_tk_years_fmt", yr=dur))
+                tr8.insert("", tk.END, values=tuple(vals))
+            tr8.pack(fill=tk.X, pady=(0, 10))
+
+            guide_stag = tk.Frame(t8, bg="#f8f9fa" if not self.dark_mode else "#252830", bd=1, relief="solid", padx=10, pady=8)
+            guide_stag.pack(fill=tk.BOTH, expand=True)
+            tk.Label(guide_stag, text=t("fire_tk_stag_guide_title"), font=("Segoe UI", 9, "bold"), fg="#e37400", bg="#f8f9fa" if not self.dark_mode else "#252830").pack(anchor="w")
+            tk.Label(guide_stag, text=t("fire_tk_stag_guide_body"), font=("Segoe UI", 8), justify=tk.LEFT, fg=self.text_dark, bg="#f8f9fa" if not self.dark_mode else "#252830").pack(anchor="w", pady=(4, 0))
+
+        # =========================================================
+        # TAB 9: RISING EQUITY GLIDEPATH (KITCES-PFAU)
+        # =========================================================
+        t9 = ttk.Frame(nb, padding=10)
+        nb.add(t9, text=f" {t('fire_tk_tab_9')} ")
+
+        glide = res.get("glidepath_data", {})
+        if glide:
+            cur_eq = glide.get("current_equity_pct", 60.0)
+            tgt_eq = glide.get("target_equity_pct", 50.0)
+            tgt_bd = glide.get("target_bond_pct", 50.0)
+            dev = glide.get("deviation_pct", 0.0)
+            phase = glide.get("phase_desc", "")
+
+            gp_banner = tk.Frame(t9, bg="#e8f0fe", bd=1, relief="solid", padx=10, pady=8)
+            gp_banner.pack(fill=tk.X, pady=(0, 10))
+
+            tk.Label(gp_banner, text=t("fire_tk_gp_title"), font=("Segoe UI", 10, "bold"), fg="#1a73e8", bg="#e8f0fe").pack(anchor="w")
+            tk.Label(gp_banner, text=phase, font=("Segoe UI", 9), fg=self.text_dark, bg="#e8f0fe").pack(anchor="w", pady=(2, 0))
+
+            cards_gp = tk.Frame(t9)
+            cards_gp.pack(fill=tk.X, pady=(0, 10))
+
+            dev_status = t("fire_tk_gp_over") if dev > 5 else (t("fire_tk_gp_under") if dev < -5 else t("fire_tk_gp_in_corridor"))
+            gp_info = [
+                (t("fire_tk_gp_cur_card"), f"{cur_eq:.1f}%", t("fire_tk_gp_cur_note"), card_bg, border_c),
+                (t("fire_tk_gp_tgt_card"), f"{tgt_eq:.1f}%", t("fire_tk_gp_safe_tgt", pct=tgt_bd), "#e6f4ea", "#188038"),
+                (t("fire_tk_gp_dev_card"), f"{dev:+.1f}%", dev_status, card_bg, "#e37400"),
+            ]
+            for title, val, note, bg_c, fg_c in gp_info:
+                card = tk.Frame(cards_gp, bg=bg_c, bd=1, relief="solid", highlightbackground=fg_c, padx=8, pady=8)
+                card.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=4)
+                tk.Label(card, text=title, font=("Segoe UI", 8, "bold"), fg=fg_c, bg=bg_c).pack(anchor="w")
+                tk.Label(card, text=val, font=("Segoe UI", 12, "bold"), fg=self.text_dark, bg=bg_c).pack(anchor="w", pady=2)
+                tk.Label(card, text=note, font=("Segoe UI", 8), fg=self.text_dark, bg=bg_c).pack(anchor="w")
+
+            guide_gp = tk.Frame(t9, bg="#f8f9fa" if not self.dark_mode else "#252830", bd=1, relief="solid", padx=10, pady=8)
+            guide_gp.pack(fill=tk.BOTH, expand=True)
+
+            tk.Label(guide_gp, text=t("fire_tk_gp_findings_title"), font=("Segoe UI", 9, "bold"), fg="#1a73e8", bg="#f8f9fa" if not self.dark_mode else "#252830").pack(anchor="w")
+            tk.Label(guide_gp, text=t("fire_tk_gp_findings_body"), font=("Segoe UI", 8), justify=tk.LEFT, fg=self.text_dark, bg="#f8f9fa" if not self.dark_mode else "#252830").pack(anchor="w", pady=(4, 0))
+
+        # =========================================================
+        # TAB 10: EXECUTIVE DIAGNOSTIC SUMMARY & ACTION PLAN
+        # =========================================================
+        t10 = ttk.Frame(nb, padding=10)
+        nb.add(t10, text=f" {t('fire_tk_tab_10')} ")
+
+        # Readiness Grade calculation
+        rw_yrs = b_data.get("total_safe_runway_years", 0)
+        mc_rate = mc.get("success_rate_pct", 0)
+        ltc_ok = ltc_data.get("can_absorb", True)
+        if rw_yrs >= 4.0 and mc_rate >= 85.0 and ltc_ok:
+            grade = "A+ (Institutional Grade Ready)"
+            grade_col = "#188038"
+            bg_grade = "#e6f4ea"
+        elif rw_yrs >= 2.0 and mc_rate >= 75.0:
+            grade = "B+ (Substantial Security / Minor Optimization)"
+            grade_col = "#1a73e8"
+            bg_grade = "#e8f0fe"
+        else:
+            grade = "C (Action Required / Buffer Needed)"
+            grade_col = "#c5221f"
+            bg_grade = "#fce8e6"
+
+        sum_banner = tk.Frame(t10, bg=bg_grade, bd=1, relief="solid", padx=10, pady=8)
+        sum_banner.pack(fill=tk.X, pady=(0, 10))
+
+        tk.Label(sum_banner, text=t("fire_tk_summary_score_title", grade=grade), font=("Segoe UI", 11, "bold"), fg=grade_col, bg=bg_grade).pack(anchor="w")
+        tk.Label(sum_banner, text=t("fire_tk_summary_score_desc"), font=("Segoe UI", 8), fg=self.text_dark, bg=bg_grade).pack(anchor="w", pady=(2, 0))
+
+        # 4 Core Pillar Health Cards
+        cards_sum = tk.Frame(t10)
+        cards_sum.pack(fill=tk.X, pady=(0, 10))
+
+        pillars = [
+            (t("fire_tk_metric_runway"), f"{rw_yrs:.1f} Yrs", "Liquid Cash / Safe Runway", "#e6f4ea" if rw_yrs >= 2.0 else "#fce8e6", "#188038" if rw_yrs >= 2.0 else "#d93025"),
+            (t("fire_tk_metric_srr"), f"{mc_rate:.1f}%", "30-Year Stochastic Solvency", "#e8f0fe", "#1a73e8"),
+            (t("fire_tk_metric_long"), "Solvent" if ltc_ok else "Caution", "Age 83-87 LTC Contingency", "#e6f4ea" if ltc_ok else "#fce8e6", "#188038" if ltc_ok else "#d93025"),
+            (t("fire_tk_metric_guard"), f"{gk_data.get('current_withdrawal_rate_pct', 0):.2f}%", f"Floor: {gk_data.get('lower_guardrail_pct', 0):.1f}% / Cap: {gk_data.get('upper_guardrail_pct', 0):.1f}%", card_bg, "#681da8"),
+        ]
+        for title, val, sub, bg_c, fg_c in pillars:
+            card = tk.Frame(cards_sum, bg=bg_c, bd=1, relief="solid", highlightbackground=fg_c, padx=8, pady=8)
+            card.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=4)
+            tk.Label(card, text=title, font=("Segoe UI", 8, "bold"), fg=fg_c, bg=bg_c).pack(anchor="w")
+            tk.Label(card, text=val, font=("Segoe UI", 12, "bold"), fg=self.text_dark, bg=bg_c).pack(anchor="w", pady=2)
+            tk.Label(card, text=sub, font=("Segoe UI", 8), fg=self.text_dark, bg=bg_c).pack(anchor="w")
+
+        # Action Checklist Box
+        act_box = tk.Frame(t10, bg="#f8f9fa" if not self.dark_mode else "#252830", bd=1, relief="solid", padx=10, pady=10)
+        act_box.pack(fill=tk.BOTH, expand=True)
+
+        tk.Label(act_box, text=t("fire_tk_summary_check_title"), font=("Segoe UI", 9, "bold"), fg="#1a73e8", bg="#f8f9fa" if not self.dark_mode else "#252830").pack(anchor="w", pady=(0, 4))
+        for act_key in ["fire_tk_act_1", "fire_tk_act_2", "fire_tk_act_3", "fire_tk_act_4"]:
+            tk.Label(act_box, text=t(act_key), font=("Segoe UI", 8), fg=self.text_dark, bg="#f8f9fa" if not self.dark_mode else "#252830").pack(anchor="w", pady=2)
+
+        # Bottom Bar: Export Report & Close
+        btn_box = tk.Frame(frame)
+        btn_box.pack(fill=tk.X, pady=(10, 0))
+
+        def _export_toolkit_report():
+            from tkinter import filedialog
+            p = filedialog.asksaveasfilename(
+                title=t("btn_export_toolkit_report"),
+                defaultextension=".md",
+                filetypes=[("Markdown Report", "*.md"), ("Text Document", "*.txt")],
+                initialfile="Institutional_Retirement_Diagnostic_Report.md",
+                parent=dlg,
+            )
+            if not p:
+                return
+            try:
+                content = [
+                    f"# 🚀 Institutional Retirement & Actuarial Planning Diagnostic Report",
+                    f"*Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*\n",
+                    f"## 1. Executive Summary",
+                    f"- Current Age: {res.get('current_age', 60)} | Target Retirement Age: {res.get('retire_age', 65)} | Planning Horizon: {res.get('life_expectancy', 90)}",
+                    f"- Total Liquid Wealth: ${res.get('portfolio_value', 0):,.2f} | Safe Assets Buffer: ${res.get('current_safe_assets', 0):,.2f}",
+                    f"- Real Living Expenditure (Annual): ${res.get('annual_rle', 0):,.2f} | Base Monthly Expense: ${res.get('target_monthly_expense', 0):,.2f}",
+                    f"- Safe Asset Runway: {b_data.get('total_safe_runway_years', 0):.1f} Years of Living Reserves",
+                    f"- Overall Readiness Grade: {grade}\n",
+                    f"## 2. David Blanchett Spending Smile Analysis",
+                    f"- Flat Lifetime Spending Projection: ${smile_data.get('flat_total_lifetime', 0):,.2f}",
+                    f"- Blanchett Spending Smile Lifetime: ${smile_data.get('smile_total_lifetime', 0):,.2f}",
+                    f"- Actuarial Capital Saved: +${smile_data.get('capital_savings', 0):,.2f} ({smile_data.get('savings_pct', 0):+.1f}%)\n",
+                    f"## 3. Sequence of Returns Risk (SRR Crash Simulation)",
+                    f"- Scenario: 1973-1974 Stagflation Simulation",
+                    f"- Unprotected Terminal Wealth: ${res.get('srr_data', {}).get('terminal_no_buffer', 0):,.2f}",
+                    f"- Protected Terminal Wealth: ${res.get('srr_data', {}).get('terminal_with_buffer', 0):,.2f}",
+                    f"- Net Capital Shielded: +${res.get('srr_data', {}).get('equity_capital_saved', 0):,.2f}\n",
+                    f"## 4. Guyton-Klinger Dynamic Guardrails",
+                    f"- Initial SWR Benchmark: {gk_data.get('initial_swr_pct', 4.0):.2f}% | Current Withdrawal Rate: {gk_data.get('current_withdrawal_rate_pct', 0):.2f}%",
+                    f"- Upper Guardrail: {gk_data.get('upper_guardrail_pct', 0):.2f}% | Lower Guardrail: {gk_data.get('lower_guardrail_pct', 0):.2f}%",
+                    f"- Active Status: {gk_data.get('rule_desc', '')}\n",
+                    f"## 5. Three-Bucket Retirement Runway Architecture",
+                    f"- Bucket 1 (Cash/GIC 1-3y): ${b_data.get('bucket1_actual', 0):,.2f} / Target ${b_data.get('bucket1_target', 0):,.2f} ({b_data.get('bucket1_runway_months', 0):.0f} months)",
+                    f"- Bucket 2 (Fixed Income 4-7y): ${b_data.get('bucket2_actual', 0):,.2f} / Target ${b_data.get('bucket2_target', 0):,.2f}",
+                    f"- Bucket 3 (Equity Growth 8+y): ${b_data.get('bucket3_actual', 0):,.2f}\n",
+                    f"## 6. Healthcare & Long-Term Care (LTC) Shock Audit",
+                    f"- Projected LTC Shock: ${ltc_data.get('total_ltc_cost', 0):,.2f} nominal @ Age {ltc_data.get('ltc_start_age', 83)}",
+                    f"- Present Value Discounted Capital Needed: ${ltc_data.get('present_value_needed', 0):,.2f} ({ltc_data.get('ltc_wealth_impact_pct', 0):.1f}% net worth)",
+                    f"- Estate Solvency Status: {'SOLVENT' if ltc_data.get('can_absorb') else 'ATTENTION NEEDED'}\n",
+                    f"## 7. Actuarial Longevity Probabilities",
+                    f"- Recommended Planning Horizon: Age {long_data.get('recommended_planning_age', 95)}",
+                    f"- 60->90 Joint Survivor Survival Probability: 55%+",
+                    f"- 60->95 Joint Survivor Survival Probability: ~25%\n",
+                    f"## 8. Monte Carlo 500-Trial Percentile Distribution",
+                    f"- 30-Year Success Rate: {mc.get('success_rate_pct', 0):.1f}%",
+                    f"- P10 Adverse Estate: ${mc.get('p10_terminal_wealth', 0):,.2f}",
+                    f"- P50 Median Estate: ${mc.get('p50_terminal_wealth', 0):,.2f}",
+                    f"- P90 Abundant Estate: ${mc.get('p90_terminal_wealth', 0):,.2f}\n",
+                    f"## 9. Rising Equity Glidepath (Kitces-Pfau)",
+                    f"- Current Equity: {glide.get('current_equity_pct', 0):.1f}% | Target Equity: {glide.get('target_equity_pct', 0):.1f}%",
+                    f"- Status: {glide.get('phase_desc', '')}\n",
+                    f"## 10. Prioritized Master Action Plan",
+                    f"- 1. Liquid Cash & Safe Buffer: Secure 24 months of essential expenses in CASH.TO / VGSH / GIC.",
+                    f"- 2. TIPS / Bond Ladder: Construct 5-7 year duration protection to immunize against early Sequence Risk.",
+                    f"- 3. Dynamic Guardrails: Apply Guyton-Klinger +/-10% spending rule to prevent forced capital liquidation.",
+                    f"- 4. Longevity & LTC: Verify estate solvency against age 83-87 healthcare shock contingency.\n",
+                    f"---",
+                    f"*Report generated by Google Finance Portfolio Tracker & Actuarial Diagnostic Suite.*",
+                ]
+                with open(p, "w", encoding="utf-8") as f_out:
+                    f_out.write("\n".join(content))
+                messagebox.showinfo("Export Success", f"Institutional retirement report exported successfully to:\n{p}", parent=dlg)
+            except Exception as ex:
+                messagebox.showerror("Export Failed", str(ex), parent=dlg)
+
+        tk.Button(
+            btn_box,
+            text=f"📑 {t('btn_export_toolkit_report')}",
+            font=("Segoe UI", 9, "bold"),
+            bg="#1a73e8",
+            fg="#ffffff",
+            relief="solid",
+            bd=1,
+            padx=12,
+            pady=4,
+            command=_export_toolkit_report,
+        ).pack(side=tk.LEFT)
+
+        tk.Button(
+            btn_box,
+            text=t("btn_close_window"),
+            font=("Segoe UI", 9),
+            padx=14,
+            pady=4,
+            command=dlg.destroy,
+        ).pack(side=tk.RIGHT)
 
     def _show_pension_actuary_dialog(self):
         """Displays William J. Bernstein's Delay-to-70 longevity actuarial comparison dialog."""
@@ -8386,11 +9499,13 @@ class ModernPortfolioApp:
             "2 min": 120,
             "5 min": 300,
         }
-        sec = mapping.get(val, 30)
+        sec = mapping.get(val, 300)
+        self.saved_refresh_interval = val
+        save_settings({"auto_refresh_interval": val})
         if sec == 0:
             self.auto_refresh_enabled = False
             self.refresh_interval_sec = 0
-            self._set_status("Auto-receive paused.")
+            self._set_status(f"Auto-receive paused ({val}).")
         else:
             self.auto_refresh_enabled = True
             self.refresh_interval_sec = sec
@@ -8398,7 +9513,7 @@ class ModernPortfolioApp:
         self._schedule_auto_refresh()
 
     def fetch_all_quotes(self):
-        if self.is_fetching:
+        if getattr(self, "is_fetching", False):
             return
 
         hold_symbols = {h["symbol"].strip().upper() for h in self.all_holdings if h.get("symbol")}
@@ -8408,24 +9523,35 @@ class ModernPortfolioApp:
             return
 
         self.is_fetching = True
-        self._set_status(f"Fetching live quotes from Google Finance for {len(symbols)} symbol(s)...")
+        self._set_status(f"🔄 {t('msg_cached_data_notice', default='Showing cached data. Updating live quotes & statistics in background...')} (0/{len(symbols)})")
+        if hasattr(self, "_refresh_watchlist_tab") and hasattr(self, "notebook") and hasattr(self, "tab_watchlist"):
+            try:
+                if self.notebook.select() == str(self.tab_watchlist):
+                    self._refresh_watchlist_tab()
+            except Exception:
+                pass
 
         def worker():
             results = []
+            tot = len(symbols)
             for idx, sym in enumerate(symbols, 1):
                 if not getattr(self, "is_running", True):
                     return
-                quote = self.fetcher.fetch_quote(sym)
+                try:
+                    quote = self.fetcher.fetch_quote(sym)
+                except Exception as e:
+                    quote = {"symbol": sym, "success": False, "error": str(e)}
                 if not getattr(self, "is_running", True):
                     return
                 results.append((sym, quote))
-                self.fetch_queue.put(("STREAM_QUOTE", (sym, quote, idx, len(symbols))))
-                time.sleep(0.15)
+                self.fetch_queue.put(("STREAM_QUOTE", (sym, quote, idx, tot)))
+                time.sleep(0.15)  # Single-thread respectful delay to avoid session bursts & blocking
+
             if getattr(self, "is_running", True):
                 self.fetch_queue.put(("ALL_QUOTES", results))
 
-        t = threading.Thread(target=worker, daemon=True)
-        t.start()
+        th = threading.Thread(target=worker, daemon=True)
+        th.start()
 
     def _process_fetch_queue(self):
         if not getattr(self, "is_running", True):
@@ -8460,6 +9586,195 @@ class ModernPortfolioApp:
             except Exception:
                 pass
 
+    def _update_watchlist_row_in_place(self, sym_clean: str, quote: Dict[str, Any]) -> bool:
+        if not hasattr(self, "watchlist_tree"):
+            return False
+        item_id = f"wl_{sym_clean}"
+        raw_children = self.watchlist_tree.get_children()
+        children = set(raw_children) if isinstance(raw_children, (list, tuple, set)) else set()
+        if item_id not in children:
+            return False
+
+        try:
+            vals = list(self.watchlist_tree.item(item_id, "values"))
+            if not vals or len(vals) < 15:
+                return False
+
+            q_name = quote.get("name")
+            if q_name and (not vals[1] or str(vals[1]).strip().upper() == sym_clean) and q_name.strip().upper() != sym_clean:
+                vals[1] = q_name.strip()
+
+            price = float(quote.get("price", 0.0) or 0.0)
+            if price > 0:
+                vals[3] = f"${price:.2f}"
+
+            tgt_str = str(vals[5]).replace("$", "").replace(",", "").strip()
+            try:
+                tgt = float(tgt_str) if tgt_str and tgt_str != "-" else 0.0
+            except ValueError:
+                tgt = 0.0
+
+            tag = "normal"
+            if price > 0 and tgt > 0:
+                diff_pct = ((price - tgt) / tgt) * 100.0
+                vals[6] = f"{diff_pct:+.2f}%"
+                if price <= tgt:
+                    vals[10] = t("status_target_reached")
+                    tag = "reached"
+                else:
+                    vals[10] = t("status_monitoring")
+                    tag = "above"
+            elif tgt > 0:
+                vals[10] = t("status_monitoring")
+
+            day_change_pct = quote.get("change_percent") or quote.get("change_pct")
+            if day_change_pct is not None:
+                try:
+                    vals[4] = f"{float(day_change_pct):+.2f}%"
+                except Exception:
+                    vals[4] = str(day_change_pct)
+
+            pe_val = quote.get("pe_ratio")
+            if pe_val is not None:
+                try:
+                    vals[7] = f"{float(pe_val):.1f}"
+                except Exception:
+                    pass
+
+            div_yield_val = quote.get("dividend_yield")
+            if div_yield_val is not None and float(div_yield_val) > 0:
+                try:
+                    vals[9] = f"{float(div_yield_val):.2f}%"
+                except Exception:
+                    pass
+
+            h52 = quote.get("52_week_high")
+            l52 = quote.get("52_week_low")
+            if h52 is not None and l52 is not None:
+                try:
+                    vals[8] = f"${float(l52):.2f} - ${float(h52):.2f}"
+                except Exception:
+                    pass
+
+            if quote.get("currency"):
+                vals[11] = str(quote["currency"]).strip().upper()
+
+            now_str = quote.get("last_updated") or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            vals[12] = now_str
+
+            self.watchlist_tree.item(item_id, values=tuple(vals), tags=(tag,))
+
+            if hasattr(self, "watch_stats_frame"):
+                sel = self.watchlist_tree.selection()
+                if item_id in sel:
+                    self._update_watchlist_stats_panel()
+            return True
+        except Exception:
+            return False
+
+    def _schedule_watchlist_tab_refresh(self):
+        if getattr(self, "_wl_refresh_scheduled", False):
+            return
+        self._wl_refresh_scheduled = True
+        try:
+            self.root.after(300, self._run_scheduled_watchlist_tab_refresh)
+        except Exception:
+            self._wl_refresh_scheduled = False
+
+    def _run_scheduled_watchlist_tab_refresh(self):
+        self._wl_refresh_scheduled = False
+        if hasattr(self, "notebook") and hasattr(self, "tab_watchlist"):
+            try:
+                if self.notebook.select() == str(self.tab_watchlist):
+                    self._refresh_watchlist_tab()
+            except Exception:
+                pass
+
+    def _update_holdings_row_in_place(self, sym_clean: str, quote: Dict[str, Any]):
+        if not hasattr(self, "holdings_tree") or not hasattr(self, "holding_map"):
+            return
+        price = float(quote.get("price", 0.0) or 0.0)
+        if price <= 0:
+            return
+
+        for sid in self.holdings_tree.get_children():
+            h = self.holding_map.get(sid)
+            if not h:
+                continue
+            cur_sym = str(h.get("symbol", "")).strip().upper()
+            if cur_sym != sym_clean:
+                continue
+
+            vals = list(self.holdings_tree.item(sid, "values"))
+            if not vals or len(vals) < 17:
+                continue
+
+            h["current_price"] = price
+            if quote.get("name"):
+                h["name"] = quote["name"]
+                vals[2] = quote["name"]
+            h["change"] = quote.get("change")
+            h["change_percent"] = quote.get("change_percent")
+            if quote.get("dividend_yield") is not None:
+                h["dividend_yield"] = quote["dividend_yield"]
+            if quote.get("annual_dividend_per_share") is not None:
+                h["annual_div_per_share"] = quote["annual_dividend_per_share"]
+
+            summary = calc_holding_summary(
+                h["shares"],
+                h["buy_price"],
+                price,
+                h.get("dividend_yield", 0.0),
+                h.get("annual_div_per_share", 0.0),
+            )
+            h.update(summary)
+
+            shares = float(h.get("shares", 0.0))
+            buy_price = float(h.get("buy_price", 0.0))
+            cost_basis = float(h.get("cost_basis", 0.0))
+            market_value = float(h.get("market_value", 0.0))
+            unrealized = float(h.get("unrealized_gain", 0.0))
+            unrealized_pct = float(h.get("unrealized_gain_pct", 0.0))
+            curr = h.get("currency", "USD").strip().upper() or "USD"
+            sym_char = self.converter.CURRENCY_SYMBOLS.get(curr, "$")
+            unreal_sign = "+" if unrealized >= 0 else "-"
+
+            chg = h.get("change")
+            chg_pct = h.get("change_percent")
+            if chg is not None and chg_pct is not None:
+                c_val = float(chg)
+                c_sign = "+" if c_val >= 0 else "-"
+                chg_str = f"{c_sign}{sym_char}{abs(c_val):.2f} ({float(chg_pct):+.2f}%)"
+            elif chg is not None:
+                c_val = float(chg)
+                c_sign = "+" if c_val >= 0 else "-"
+                chg_str = f"{c_sign}{sym_char}{abs(c_val):.2f}"
+            elif chg_pct is not None:
+                chg_str = f"{float(chg_pct):+.2f}%"
+            else:
+                chg_str = "-"
+
+            vals[6] = f"{sym_char}{price:.2f}"
+            vals[7] = chg_str
+            vals[8] = f"{sym_char}{market_value:,.2f}"
+            vals[9] = f"{sym_char}{cost_basis:,.2f}"
+            vals[10] = f"{unreal_sign}{sym_char}{abs(unrealized):,.2f}"
+            vals[11] = f"{unrealized_pct:+.2f}%"
+            vals[14] = f"{float(h.get('dividend_yield', 0.0)):.2f}%"
+            vals[15] = f"{sym_char}{float(h.get('annual_dividend', 0.0)):,.2f}"
+            vals[16] = h.get("last_updated", "")
+
+            tag = "positive" if unrealized > 0 else ("negative" if unrealized < 0 else "neutral")
+            row_tags = [tag]
+            target_p = float(h.get("target_sell_price") or 0.0)
+            stop_loss = float(h.get("stop_loss_price") or 0.0)
+            if stop_loss > 0 and price <= stop_loss:
+                row_tags.append("stop_loss_alert")
+            elif target_p > 0 and price >= target_p:
+                row_tags.append("target_sell_alert")
+
+            self.holdings_tree.item(sid, values=tuple(vals), tags=tuple(row_tags))
+
     def _handle_stream_quote(self, sym: str, quote: Dict[str, Any], idx: int, tot: int):
         sym_clean = sym.strip().upper()
         if quote.get("success"):
@@ -8481,14 +9796,24 @@ class ModernPortfolioApp:
                         h["currency"] = quote["currency"]
                     h["last_updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
+            # 1. Update Watchlist row in-place (preserves selection and eliminates UI churn)
             if hasattr(self, "notebook") and hasattr(self, "tab_watchlist"):
                 try:
                     if self.notebook.select() == str(self.tab_watchlist):
-                        self._refresh_watchlist_tab()
+                        updated = self._update_watchlist_row_in_place(sym_clean, quote)
+                        if not updated:
+                            self._schedule_watchlist_tab_refresh()
                 except Exception:
                     pass
 
-        self._set_status(f"Fetching quotes ({idx}/{tot}): {sym}...")
+            # 2. Update Holdings row in-place (preserves selection and live-updates prices)
+            if hasattr(self, "holdings_tree"):
+                try:
+                    self._update_holdings_row_in_place(sym_clean, quote)
+                except Exception:
+                    pass
+
+        self._set_status(f"🔄 {t('msg_updating_background', default='Updating live quotes & statistics in background...')} ({idx}/{tot}): {sym}")
 
     def _handle_all_quotes_result(self, results):
         if not getattr(self, "is_running", True):
@@ -8556,12 +9881,37 @@ class ModernPortfolioApp:
 
         save_portfolio(self.all_holdings, PORTFOLIO_CSV)
         save_watchlist_quotes_cache(self._watchlist_quotes_cache)
+
+        # Update watchlist items with resolved company names & currencies
+        try:
+            w_items = load_watchlist(WATCHLIST_CSV)
+            w_updated = False
+            for sym, quote in results:
+                if not quote.get("success"):
+                    continue
+                q_name = str(quote.get("name", "")).strip()
+                q_curr = str(quote.get("currency", "")).strip()
+                sym_clean = sym.strip().upper()
+                for w in w_items:
+                    if str(w.get("symbol", "")).strip().upper() == sym_clean:
+                        curr_w_name = str(w.get("name", "")).strip()
+                        if q_name and (not curr_w_name or curr_w_name.upper() == sym_clean) and q_name.upper() != sym_clean:
+                            w["name"] = q_name
+                            w_updated = True
+                        if q_curr and (not w.get("currency") or w.get("currency") == "USD"):
+                            w["currency"] = q_curr
+                            w_updated = True
+            if w_updated:
+                save_watchlist(w_items, WATCHLIST_CSV)
+        except Exception:
+            pass
+
         self._on_portfolio_selected()
         if hasattr(self, "_refresh_watchlist_tab"):
             self._refresh_watchlist_tab()
         self._update_network_status_badge()
 
-        self._set_status(f"Updated {updated_count}/{len(results)} quotes from Google Finance at {now_str}")
+        self._set_status(f"✅ {t('msg_update_completed')} ({updated_count}/{len(results)}) at {now_str}")
         self.lbl_time.config(text=t("last_sync", time=now_str))
 
     def _set_status(self, text: str):
@@ -8571,8 +9921,20 @@ class ModernPortfolioApp:
     # Tables and Dropdowns Sync
     # -------------------------------------------------------------
     def _refresh_holdings_table(self):
-        for item in self.holdings_tree.get_children():
-            self.holdings_tree.delete(item)
+        selected_keys = set()
+        if hasattr(self, "holdings_tree"):
+            try:
+                for sid in self.holdings_tree.selection():
+                    vals = self.holdings_tree.item(sid, "values")
+                    if vals and len(vals) >= 2:
+                        p_val = str(vals[0]).strip()
+                        s_val = vals[1].replace("🎯 ", "").replace("⚠️ ", "").strip().upper()
+                        selected_keys.add((p_val, s_val))
+            except Exception:
+                pass
+
+            for item in self.holdings_tree.get_children():
+                self.holdings_tree.delete(item)
 
         search_query = self.search_filter_var.get().strip().lower() if hasattr(self, "search_filter_var") else ""
         perf_filter = getattr(self, "filter_performance", "All")
@@ -8700,6 +10062,22 @@ class ModernPortfolioApp:
                 ),
                 tags=tuple(row_tags),
             )
+
+        # Restore selection
+        if hasattr(self, "holdings_tree") and selected_keys:
+            to_select = []
+            try:
+                for sid in self.holdings_tree.get_children():
+                    vals = self.holdings_tree.item(sid, "values")
+                    if vals and len(vals) >= 2:
+                        p_val = str(vals[0]).strip()
+                        s_val = vals[1].replace("🎯 ", "").replace("⚠️ ", "").strip().upper()
+                        if (p_val, s_val) in selected_keys:
+                            to_select.append(sid)
+                if to_select:
+                    self.holdings_tree.selection_set(to_select)
+            except Exception:
+                pass
 
         if hasattr(self, "lbl_holdings_count"):
             self.lbl_holdings_count.config(
@@ -9934,14 +11312,14 @@ class ModernPortfolioApp:
         if hasattr(self, "card_titles"):
             if has_any_day_chg:
                 self.card_titles["total_value"].config(
-                    text=f"{t('card_total_value')} ({curr_label}) • Day: {day_sign}{sym}{abs(total_day_chg):,.2f} ({day_chg_pct:+.2f}%)"
+                    text=f"💼 {t('card_total_value')} ({curr_label}) • Day: {day_sign}{sym}{abs(total_day_chg):,.2f} ({day_chg_pct:+.2f}%)"
                 )
             else:
-                self.card_titles["total_value"].config(text=f"{t('card_total_value')} ({curr_label})")
-            self.card_titles["total_cost"].config(text=f"{t('col_cost_basis')} ({curr_label})")
-            self.card_titles["total_gain"].config(text=f"{t('card_unrealized_pl')} ({curr_label})")
-            self.card_titles["annual_dividend"].config(text=f"{t('card_annual_dividend')} ({curr_label})")
-            self.card_titles["monthly_dividend"].config(text=f"{t('div_proj_monthly')} ({curr_label})")
+                self.card_titles["total_value"].config(text=f"💼 {t('card_total_value')} ({curr_label})")
+            self.card_titles["total_cost"].config(text=f"🏷️ {t('col_cost_basis')} ({curr_label})")
+            self.card_titles["total_gain"].config(text=f"📈 {t('card_unrealized_pl')} ({curr_label})")
+            self.card_titles["annual_dividend"].config(text=f"💵 {t('card_annual_dividend')} ({curr_label})")
+            self.card_titles["monthly_dividend"].config(text=f"🗓️ {t('div_proj_monthly')} ({curr_label})")
 
         # Multi-currency Exposure Matrix
         if hasattr(self, "lbl_curr_exposure"):
@@ -10390,21 +11768,25 @@ class ModernPortfolioApp:
             return
         cached = getattr(self, "_watchlist_quotes_cache", {})
 
-        def has_valid_quote(sym):
+        def has_valid_quote(sym, it_name=""):
             if sym in cached:
                 q = cached[sym]
                 price = float(q.get("price", 0.0) or 0.0)
-                if price > 0 and q.get("last_updated") and q.get("change_percent") != -0.83:
+                q_name = str(q.get("name", "")).strip()
+                has_name = (it_name and it_name.upper() != sym) or (q_name and q_name.upper() != sym)
+                if price > 0 and q.get("last_updated") and q.get("change_percent") != -0.83 and has_name:
                     return True
             for h in getattr(self, "all_holdings", []):
                 if str(h.get("symbol", "")).strip().upper() == sym and float(h.get("current_price", 0.0) or 0.0) > 0 and h.get("last_updated"):
-                    return True
+                    h_name = str(h.get("name", "")).strip()
+                    if (it_name and it_name.upper() != sym) or (h_name and h_name.upper() != sym):
+                        return True
             return False
 
         missing = [
             it.get("symbol", "").strip().upper()
             for it in items
-            if it.get("symbol") and not has_valid_quote(it.get("symbol").strip().upper())
+            if it.get("symbol") and not has_valid_quote(it.get("symbol").strip().upper(), str(it.get("name", "")).strip())
         ]
         if missing:
             self.fetch_all_quotes()
@@ -10430,8 +11812,23 @@ class ModernPortfolioApp:
         self.lbl_watch_search.pack(side=tk.LEFT, padx=(0, 4))
         self.watchlist_search_var = tk.StringVar()
         self.watchlist_search_var.trace_add("write", lambda *args: self._refresh_watchlist_tab())
-        search_entry = tk.Entry(toolbar, textvariable=self.watchlist_search_var, width=14, font=("Segoe UI", 9), relief="solid", bd=1)
-        search_entry.pack(side=tk.LEFT, padx=(0, 8))
+        self.watchlist_search_entry = tk.Entry(toolbar, textvariable=self.watchlist_search_var, width=15, font=("Segoe UI", 9), relief="solid", bd=1)
+        self.watchlist_search_entry.pack(side=tk.LEFT, padx=(0, 2))
+        self.watchlist_search_entry.bind("<Escape>", lambda e: self._clear_watchlist_search())
+
+        self.btn_watch_clear = tk.Button(
+            toolbar,
+            text="✕",
+            font=("Segoe UI", 8),
+            bg="#ffffff" if not self.dark_mode else "#2d3342",
+            fg=self.text_dark,
+            relief="solid",
+            bd=1,
+            padx=4,
+            pady=1,
+            command=self._clear_watchlist_search,
+        )
+        self.btn_watch_clear.pack(side=tk.LEFT, padx=(0, 8))
 
         # Tag Filter
         self.lbl_watch_tag = tk.Label(toolbar, text=f"{t('lbl_watchlist_tags')}", font=("Segoe UI", 9, "bold"), bg=self.card_bg, fg=self.text_dark)
@@ -10486,6 +11883,21 @@ class ModernPortfolioApp:
             command=self._open_edit_watchlist_dialog,
         )
         self.btn_watch_edit.pack(side=tk.LEFT, padx=(0, 4))
+
+        self.btn_watch_category = tk.Button(
+            toolbar,
+            text=t("btn_change_category"),
+            font=("Segoe UI", 9, "bold"),
+            bg="#ffffff" if not self.dark_mode else "#2d3342",
+            fg=self.primary_color,
+            relief="solid",
+            bd=1,
+            padx=8,
+            pady=3,
+            cursor="hand2",
+            command=self._open_batch_change_category_dialog,
+        )
+        self.btn_watch_category.pack(side=tk.LEFT, padx=(0, 4))
 
         self.btn_watch_refresh = tk.Button(
             toolbar,
@@ -10546,6 +11958,18 @@ class ModernPortfolioApp:
             command=self._export_watchlist_csv,
         )
         self.btn_watch_export.pack(side=tk.LEFT, padx=(0, 8))
+
+        # Attach hints / tooltips
+        attach_tooltip(self.watchlist_search_entry, "tip_watch_search")
+        attach_tooltip(self.watchlist_tag_combo, "tip_watch_tag")
+        attach_tooltip(self.btn_watch_add, "tip_watch_add")
+        attach_tooltip(self.btn_watch_batch, "tip_watch_batch")
+        attach_tooltip(self.btn_watch_edit, "tip_watch_edit")
+        attach_tooltip(self.btn_watch_category, "tip_watch_category")
+        attach_tooltip(self.btn_watch_refresh, "tip_watch_refresh")
+        attach_tooltip(self.btn_watch_buy, "tip_watch_buy")
+        attach_tooltip(self.btn_watch_remove, "tip_watch_remove")
+        attach_tooltip(self.btn_watch_export, "tip_watch_export")
 
         # Stats Badge (right side)
         self.lbl_watchlist_stats = tk.Label(
@@ -10627,6 +12051,7 @@ class ModernPortfolioApp:
         self.watchlist_menu.add_command(label=f"📊 {t('btn_view_full_stats')}", command=self._show_watchlist_stock_stats_dialog)
         self.watchlist_menu.add_command(label=f"➕ {t('btn_buy_into_portfolio')}", command=self._buy_from_watchlist_into_portfolio)
         self.watchlist_menu.add_command(label=f"✏️ {t('btn_edit_watchlist')}", command=self._open_edit_watchlist_dialog)
+        self.watchlist_menu.add_command(label=f"🏷️ {t('btn_change_category')}", command=self._open_batch_change_category_dialog)
         self.watchlist_menu.add_command(label=f"📈 {t('tab_chart')}", command=self._view_watchlist_chart)
         self.watchlist_menu.add_separator()
         self.watchlist_menu.add_command(label=f"🗑️ {t('btn_remove_watchlist')}", command=self._remove_selected_watchlist)
@@ -10827,12 +12252,25 @@ class ModernPortfolioApp:
         btn_close = tk.Button(btn_bar, text=t("btn_close") if "btn_close" in TRANSLATIONS.get(get_current_language(), {}) else "Close", font=("Segoe UI", 9), command=dlg.destroy)
         btn_close.pack(side=tk.RIGHT)
 
+    def _clear_watchlist_search(self):
+        self.watchlist_search_var.set("")
+        self._refresh_watchlist_tab()
+        if hasattr(self, "watchlist_search_entry"):
+            self.watchlist_search_entry.focus_set()
+
     def _refresh_watchlist_tab(self):
         if not hasattr(self, "watchlist_tree"):
             return
 
-        for it in self.watchlist_tree.get_children():
-            self.watchlist_tree.delete(it)
+        # Capture current selection (symbols) to preserve across refresh
+        selected_symbols = set()
+        try:
+            for sid in self.watchlist_tree.selection():
+                vals = self.watchlist_tree.item(sid, "values")
+                if vals:
+                    selected_symbols.add(str(vals[0]).strip().upper())
+        except Exception:
+            pass
 
         items = load_watchlist()
         q_filter = self.watchlist_search_var.get().strip().upper() if hasattr(self, "watchlist_search_var") else ""
@@ -10856,6 +12294,7 @@ class ModernPortfolioApp:
 
         rows = []
         target_reached_count = 0
+        watchlist_dirty = False
 
         for row in items:
             sym = str(row.get("symbol", "")).strip().upper()
@@ -10880,10 +12319,15 @@ class ModernPortfolioApp:
             if sym in self._watchlist_quotes_cache:
                 q = self._watchlist_quotes_cache[sym]
                 curr_price = float(q.get("price", 0.0) or 0.0)
-                if not name and q.get("name"):
-                    name = q.get("name")
+                if (not name or name.strip().upper() == sym) and q.get("name") and q.get("name").strip().upper() != sym:
+                    name = q.get("name").strip()
+                    row["name"] = name
+                    watchlist_dirty = True
                 if q.get("currency"):
                     curr_code = q.get("currency")
+                    if not row.get("currency") or row.get("currency") == "USD":
+                        row["currency"] = curr_code
+                        watchlist_dirty = True
                 day_change_val = q.get("change")
                 day_change_pct = q.get("change_percent") or q.get("change_pct")
                 last_updated_str = q.get("last_updated") or q.get("timestamp", "")
@@ -10894,24 +12338,29 @@ class ModernPortfolioApp:
                 if h52 is not None and l52 is not None:
                     range_52w_str = f"${l52:.2f} - ${h52:.2f}"
 
-            # 2. Check all holdings if not found or price <= 0
-            if curr_price <= 0 or not last_updated_str:
-                for h in getattr(self, "all_holdings", getattr(self, "holdings", [])):
-                    if str(h.get("symbol", "")).strip().upper() == sym:
-                        hp = float(h.get("current_price", 0.0) or 0.0)
-                        if hp > 0 and curr_price <= 0:
-                            curr_price = hp
-                            if not name and h.get("name"):
-                                name = h.get("name")
-                            if h.get("currency"):
-                                curr_code = h.get("currency")
+            # 2. Check all holdings if not found or price <= 0 or name needs resolving
+            for h in getattr(self, "all_holdings", getattr(self, "holdings", [])):
+                if str(h.get("symbol", "")).strip().upper() == sym:
+                    hp = float(h.get("current_price", 0.0) or 0.0)
+                    if hp > 0 and curr_price <= 0:
+                        curr_price = hp
+                        if day_change_pct is None:
                             day_change_pct = h.get("change_percent")
+                        if day_change_val is None:
                             day_change_val = h.get("change")
-                        if not last_updated_str and h.get("last_updated"):
-                            last_updated_str = h.get("last_updated")
-                        if div_yield_val is None and h.get("dividend_yield") is not None:
-                            div_yield_val = h.get("dividend_yield")
-                        break
+                    if (not name or name.strip().upper() == sym) and h.get("name") and h.get("name").strip().upper() != sym:
+                        name = h.get("name").strip()
+                        row["name"] = name
+                        watchlist_dirty = True
+                    if h.get("currency") and (not row.get("currency") or row.get("currency") == "USD"):
+                        curr_code = h.get("currency")
+                        row["currency"] = curr_code
+                        watchlist_dirty = True
+                    if not last_updated_str and h.get("last_updated"):
+                        last_updated_str = h.get("last_updated")
+                    if div_yield_val is None and h.get("dividend_yield") is not None:
+                        div_yield_val = h.get("dividend_yield")
+                    break
 
             if not last_updated_str:
                 last_updated_str = added_date if added_date else "-"
@@ -11011,34 +12460,82 @@ class ModernPortfolioApp:
 
         rows.sort(key=sort_key, reverse=reverse)
 
-        for r in rows:
-            self.watchlist_tree.insert(
-                "",
-                tk.END,
-                values=(
-                    r["symbol"],
-                    r["name"],
-                    r["tags"],
-                    r["curr_display"],
-                    r["change_pct"],
-                    r["tgt_display"],
-                    r["diff"],
-                    r["pe_display"],
-                    r["range_52w"],
-                    r["div_display"],
-                    r["status"],
-                    r["currency"],
-                    r["updated"],
-                    r["added_date"],
-                    r["notes"],
-                ),
-                tags=(r["tag"],),
+        raw_children = self.watchlist_tree.get_children()
+        existing_items = set(raw_children) if isinstance(raw_children, (list, tuple, set)) else set()
+        kept_items = set()
+
+        for idx, r in enumerate(rows):
+            item_id = f"wl_{r['symbol']}"
+            kept_items.add(item_id)
+            row_vals = (
+                r["symbol"],
+                r["name"],
+                r["tags"],
+                r["curr_display"],
+                r["change_pct"],
+                r["tgt_display"],
+                r["diff"],
+                r["pe_display"],
+                r["range_52w"],
+                r["div_display"],
+                r["status"],
+                r["currency"],
+                r["updated"],
+                r["added_date"],
+                r["notes"],
             )
+            row_tags = (r["tag"],)
+
+            if item_id in existing_items:
+                self.watchlist_tree.item(item_id, values=row_vals, tags=row_tags)
+                try:
+                    self.watchlist_tree.move(item_id, "", idx)
+                except Exception:
+                    pass
+            else:
+                try:
+                    self.watchlist_tree.insert(
+                        "",
+                        idx,
+                        iid=item_id,
+                        values=row_vals,
+                        tags=row_tags,
+                    )
+                except TypeError:
+                    self.watchlist_tree.insert(
+                        "",
+                        idx,
+                        values=row_vals,
+                        tags=row_tags,
+                    )
+
+        # Remove any items that are no longer present
+        for old_id in existing_items - kept_items:
+            try:
+                self.watchlist_tree.delete(old_id)
+            except Exception:
+                pass
+
+        # Restore selection
+        to_select = [f"wl_{s}" for s in selected_symbols if f"wl_{s}" in kept_items]
+        if to_select:
+            try:
+                self.watchlist_tree.selection_set(to_select)
+            except Exception:
+                pass
 
         if hasattr(self, "lbl_watchlist_stats"):
             total_items = len(rows)
             stats_txt = f"{t('tab_monitoring')}: {total_items}  |  {t('status_target_reached')}: {target_reached_count}"
+            if getattr(self, "is_fetching", False):
+                stats_txt += f"  |  🔄 {t('msg_updating_background')}"
             self.lbl_watchlist_stats.config(text=stats_txt)
+
+        if watchlist_dirty:
+            try:
+                save_watchlist(items, WATCHLIST_CSV)
+            except Exception:
+                pass
 
         self._update_watchlist_stats_panel()
 
@@ -11154,6 +12651,11 @@ class ModernPortfolioApp:
                 messagebox.showerror(t("dlg_error"), t("msg_enter_symbol"), parent=dlg)
                 return
             n = name_entry.get().strip()
+            if not n or n.upper() == s:
+                if s in lookup_data and lookup_data[s].get("name"):
+                    n = lookup_data[s]["name"]
+                elif s in self._watchlist_quotes_cache and self._watchlist_quotes_cache[s].get("name"):
+                    n = self._watchlist_quotes_cache[s]["name"]
             t_str = tgt_entry.get().strip()
             try:
                 t_val = float(t_str) if t_str else 0.0
@@ -11297,7 +12799,14 @@ class ModernPortfolioApp:
             if not new_sym:
                 messagebox.showerror(t("dlg_error"), t("msg_enter_symbol"), parent=dlg)
                 return
-            new_name = name_entry.get().strip() or new_sym
+            new_name = name_entry.get().strip()
+            if not new_name or new_name.upper() == new_sym:
+                if new_sym in self._watchlist_quotes_cache and self._watchlist_quotes_cache[new_sym].get("name"):
+                    new_name = self._watchlist_quotes_cache[new_sym]["name"]
+                elif old_sym.upper() in self._watchlist_quotes_cache and self._watchlist_quotes_cache[old_sym.upper()].get("name"):
+                    new_name = self._watchlist_quotes_cache[old_sym.upper()]["name"]
+                else:
+                    new_name = new_sym
             t_str = tgt_entry.get().strip()
             try:
                 t_val = float(t_str) if t_str else 0.0
@@ -11356,6 +12865,226 @@ class ModernPortfolioApp:
             dlg.grab_set()
         except Exception:
             pass
+
+    def _open_batch_change_category_dialog(self):
+        sel = self.watchlist_tree.selection()
+        if not sel:
+            messagebox.showinfo(
+                t("tab_monitoring"),
+                t("msg_select_stock_for_category"),
+                parent=self.root,
+            )
+            return
+
+        selected_symbols = []
+        for it in sel:
+            vals = self.watchlist_tree.item(it, "values")
+            if vals:
+                selected_symbols.append(str(vals[0]).strip().upper())
+
+        if not selected_symbols:
+            return
+
+        # Fetch existing categories from watchlist for suggestions
+        w_items = load_watchlist()
+        existing_tags_set = set()
+        for item in w_items:
+            tg = str(item.get("tags", "")).strip()
+            if tg:
+                for sub in re.split(r"[,;]+", tg):
+                    if sub.strip():
+                        existing_tags_set.add(sub.strip())
+
+        preset_tags = ["Tech", "Core", "Dividend", "Growth", "Value", "Speculative", "ETF", "Energy", "Healthcare", "Crypto"]
+        for pt in preset_tags:
+            existing_tags_set.add(pt)
+        available_tags = sorted(list(existing_tags_set))
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title(t("dlg_change_category_title"))
+        dlg.geometry("520x450")
+        dlg.minsize(480, 400)
+        dlg.transient(self.root)
+        dlg.grab_set()
+
+        bg_main = getattr(self, "bg_main", "#f4f6f9")
+        card_bg = getattr(self, "card_bg", "#ffffff")
+        text_dark = getattr(self, "text_dark", "#202124")
+        text_muted = getattr(self, "text_muted", "#5f6368")
+        primary_col = getattr(self, "primary_color", "#1a73e8")
+
+        dlg.configure(bg=bg_main)
+
+        # Header Box
+        header_box = tk.Frame(dlg, bg=bg_main, padx=16, pady=12)
+        header_box.pack(fill=tk.X)
+
+        tk.Label(
+            header_box,
+            text=f"🏷️ {t('dlg_change_category_title')}",
+            font=("Segoe UI", 12, "bold"),
+            bg=bg_main,
+            fg=primary_col,
+        ).pack(anchor="w")
+
+        # Container Card
+        card = tk.Frame(dlg, bg=card_bg, bd=1, relief="solid", padx=16, pady=12)
+        card.pack(fill=tk.BOTH, expand=True, padx=16, pady=(0, 10))
+
+        # Selected Stocks Info
+        tk.Label(
+            card,
+            text=t("lbl_category_target_stocks", count=len(selected_symbols)),
+            font=("Segoe UI", 9, "bold"),
+            bg=card_bg,
+            fg=text_dark,
+        ).pack(anchor="w", pady=(0, 2))
+
+        sym_display = ", ".join(selected_symbols)
+        if len(sym_display) > 80:
+            sym_display = sym_display[:77] + "..."
+        tk.Label(
+            card,
+            text=sym_display,
+            font=("Segoe UI", 9, "bold"),
+            bg=card_bg,
+            fg=primary_col,
+            wraplength=460,
+            justify=tk.LEFT,
+        ).pack(anchor="w", pady=(0, 10))
+
+        # Category Input / Dropdown
+        tk.Label(
+            card,
+            text=t("lbl_new_category"),
+            font=("Segoe UI", 9, "bold"),
+            bg=card_bg,
+            fg=text_dark,
+        ).pack(anchor="w", pady=(0, 4))
+
+        cat_var = tk.StringVar()
+        cat_combo = ttk.Combobox(card, textvariable=cat_var, values=available_tags, font=("Segoe UI", 9))
+        cat_combo.pack(fill=tk.X, pady=(0, 8))
+
+        # Quick Tag Chips Frame
+        chips_frame = tk.Frame(card, bg=card_bg)
+        chips_frame.pack(fill=tk.X, pady=(0, 10))
+
+        def add_chip(val):
+            cur = cat_var.get().strip()
+            if not cur:
+                cat_var.set(val)
+            else:
+                existing = [x.strip() for x in re.split(r"[,;]+", cur) if x.strip()]
+                if val not in existing:
+                    existing.append(val)
+                cat_var.set(", ".join(existing))
+
+        tk.Label(chips_frame, text=t("lbl_quick_chips"), font=("Segoe UI", 8), bg=card_bg, fg=text_muted).pack(anchor="w", pady=(0, 4))
+        chips_bar = tk.Frame(chips_frame, bg=card_bg)
+        chips_bar.pack(anchor="w")
+
+        for sample_chip in ["Tech", "Core", "Dividend", "Growth", "Value", "ETF"]:
+            tk.Button(
+                chips_bar,
+                text=f"+ {sample_chip}",
+                font=("Segoe UI", 8),
+                bg="#ffffff" if not self.dark_mode else "#2d3342",
+                fg=primary_col,
+                relief="solid",
+                bd=1,
+                padx=6,
+                pady=1,
+                cursor="hand2",
+                command=lambda sc=sample_chip: add_chip(sc),
+            ).pack(side=tk.LEFT, padx=(0, 4))
+
+        # Action Modes (Radiobuttons)
+        mode_var = tk.StringVar(value="replace")
+        modes_box = tk.LabelFrame(
+            card,
+            text=f" {t('lbl_update_mode')} ",
+            font=("Segoe UI", 8, "bold"),
+            bg=card_bg,
+            fg=text_muted,
+            padx=10,
+            pady=6,
+        )
+        modes_box.pack(fill=tk.X, pady=(0, 4))
+
+        tk.Radiobutton(
+            modes_box,
+            text=t("opt_category_replace"),
+            variable=mode_var,
+            value="replace",
+            font=("Segoe UI", 9),
+            bg=card_bg,
+            fg=text_dark,
+            activebackground=card_bg,
+        ).pack(anchor="w", pady=1)
+
+        tk.Radiobutton(
+            modes_box,
+            text=t("opt_category_append"),
+            variable=mode_var,
+            value="append",
+            font=("Segoe UI", 9),
+            bg=card_bg,
+            fg=text_dark,
+            activebackground=card_bg,
+        ).pack(anchor="w", pady=1)
+
+        tk.Radiobutton(
+            modes_box,
+            text=t("opt_category_clear"),
+            variable=mode_var,
+            value="clear",
+            font=("Segoe UI", 9),
+            bg=card_bg,
+            fg=self.red_color if hasattr(self, "red_color") else "#d93025",
+            activebackground=card_bg,
+        ).pack(anchor="w", pady=1)
+
+        # Buttons Box
+        btn_bar = tk.Frame(dlg, bg=bg_main, padx=16, pady=8)
+        btn_bar.pack(fill=tk.X)
+
+        def on_confirm():
+            new_cat = cat_var.get().strip()
+            chosen_mode = mode_var.get()
+            if chosen_mode != "clear" and not new_cat:
+                messagebox.showwarning(t("dlg_warning", default="Warning"), t("msg_enter_category_name"), parent=dlg)
+                return
+
+            updated = bulk_update_watchlist_category(selected_symbols, new_cat, mode=chosen_mode)
+            dlg.destroy()
+            self._refresh_watchlist_tab()
+            self._set_status(f"🏷️ {t('msg_category_updated', count=updated)}")
+
+        tk.Button(
+            btn_bar,
+            text=t("btn_apply_changes"),
+            font=("Segoe UI", 9, "bold"),
+            bg=primary_col,
+            fg="#ffffff",
+            relief="flat",
+            padx=14,
+            pady=4,
+            cursor="hand2",
+            command=on_confirm,
+        ).pack(side=tk.RIGHT, padx=(6, 0))
+
+        tk.Button(
+            btn_bar,
+            text=t("btn_cancel"),
+            font=("Segoe UI", 9),
+            relief="solid",
+            bd=1,
+            padx=10,
+            pady=4,
+            cursor="hand2",
+            command=dlg.destroy,
+        ).pack(side=tk.RIGHT)
 
     def _open_batch_watchlist_dialog(self):
         dlg = tk.Toplevel(self.root)
@@ -11583,7 +13312,8 @@ class ModernPortfolioApp:
     def _on_watchlist_right_click(self, event):
         item = self.watchlist_tree.identify_row(event.y)
         if item:
-            self.watchlist_tree.selection_set(item)
+            if item not in self.watchlist_tree.selection():
+                self.watchlist_tree.selection_set(item)
             try:
                 self.watchlist_menu.tk_popup(event.x_root, event.y_root)
             finally:

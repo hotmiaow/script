@@ -241,22 +241,6 @@ class CiscoTracerouteMapper:
         # de-duplicate while preserving order
         return "; ".join(dict.fromkeys(infos))
 
-    def get_iface_description(self, ip: Optional[str]) -> str:
-        """Interface description from the inventory CSV ('' if none / N/A)."""
-        if not ip:
-            return ""
-        desc = self.ip_to_device_map.get(ip, (None, None, None, None, ""))[4] or ""
-        return "" if desc.strip().upper() in {"", "N/A", "NA", "NONE"} else desc.strip()
-
-    def _details_suffix(self, ip: Optional[str]) -> str:
-        """'  Desc: … [Info: …]' suffix for list-style output."""
-        desc = self.get_iface_description(ip)
-        info = self.get_extra_info(ip)
-        s = f"  Desc: {desc}" if desc else ""
-        if info:
-            s += f"  [Info: {info}]"
-        return s
-
     # ───── low-level traceroute helpers ──────────────────────────────────────
     def _test_connectivity(self, ip: str) -> bool:
         """Single-echo ping to confirm reachability (non-fatal)."""
@@ -557,17 +541,12 @@ class CiscoTracerouteMapper:
 
                     device, iface, _, _, _ = self.ip_to_device_map.get(hop_ip, (None, None, None, None, None))
 
-                    desc_suffix = ""
                     if device:
                         cell_text = f"{hop_ip} [{device} - {iface}]"
                         info = self.get_extra_info(hop_ip, device, iface)
-                        desc = self.get_iface_description(hop_ip)
                         if info:
                             cell_text = f"{hop_ip} ℹ [{device} - {iface}]"
-                        if desc:
-                            desc_suffix = f" {desc}"
-                        if info or desc:
-                            info_legend.setdefault(hop_ip, (device, iface, desc, info))
+                            info_legend.setdefault(hop_ip, (device, iface, info))
                     else:
                         # Check addon
                         addons = self.check_addon_subnet(hop_ip)
@@ -588,7 +567,6 @@ class CiscoTracerouteMapper:
                     # Add highlight if applicable
                     if highlight_ips and hop_ip in highlight_ips:
                         cell_text += " ✅"
-                    cell_text += desc_suffix
 
                 # Truncate to col_width - 1
                 row_str += f"{cell_text[:col_width-1]:<{col_width}} "
@@ -599,14 +577,9 @@ class CiscoTracerouteMapper:
             print(row_str)
 
         if info_legend:
-            print("\nℹ  Interface details (description / additional info):")
-            for hop_ip, (device, iface, desc, info) in info_legend.items():
-                parts = []
-                if desc:
-                    parts.append(f"Desc: {desc}")
-                if info:
-                    parts.append(f"Info: {info}")
-                print(f"   {hop_ip:<16} {device} - {iface}: {' | '.join(parts)}")
+            print("\nℹ  Additional interface info:")
+            for hop_ip, (device, iface, info) in info_legend.items():
+                print(f"   {hop_ip:<16} {device} - {iface}: {info}")
 
     def compare_traces(self, targets: List[str]) -> None:
         """
@@ -964,7 +937,8 @@ class CiscoTracerouteMapper:
             if matches:
                 print(f"  ✓ VERIFIED: Found {len(matches)} monitored hop(s):")
                 for h, ip_str, dev, mtype in matches:
-                    info_s = self._details_suffix(ip_str)
+                    info = self.get_extra_info(ip_str)
+                    info_s = f"  [Info: {info}]" if info else ""
                     print(f"    - Hop {h:<2}: {dev:<20} ({ip_str}){info_s}")
             else:
                 if monitored_devices or manual_ips or manual_subnets:
@@ -979,7 +953,8 @@ class CiscoTracerouteMapper:
                 for h, ip_str, dev in sightings:
                     # Mark if this was one of the verified ones
                     is_ver = " (Verified)" if any(m[1] == ip_str for m in matches) else ""
-                    info_s = self._details_suffix(ip_str)
+                    info = self.get_extra_info(ip_str)
+                    info_s = f"  [Info: {info}]" if info else ""
                     print(f"    - Hop {h:<2}: {dev:<20} ({ip_str}){is_ver}{info_s}")
 
     # ───── source ↔ destination (WAN aware) ──────────────────────────────────
@@ -1040,10 +1015,10 @@ class CiscoTracerouteMapper:
         self, path: List[Tuple[str, Optional[str], str]]
     ) -> None:
         """Prints stitched path rows: (segment, ip_or_None, note)."""
-        print("-" * 150)
+        print("-" * 120)
         print(f"{'#':>3}  {'Segment':<10} {'IP Address':<16} {'Device Name':<25} "
-              f"{'Interface':<22} {'Zone':<12} {'Description':<30} Note")
-        print("-" * 150)
+              f"{'Interface':<22} {'Zone':<15} Note")
+        print("-" * 120)
         n = 0
         for seg, ip, note in path:
             if seg == "WAN":
@@ -1054,15 +1029,14 @@ class CiscoTracerouteMapper:
                 print(f"{n:>3}  {seg:<10} {'*':<16} {'(timeout)':<25}")
                 continue
             dev, iface, zone = self._hop_info(ip)
-            desc = self.get_iface_description(ip)
             if self._is_wan_router(self._hop_device(ip)):
                 note = (note + " " if note else "") + "🌐 WAN router"
             info = self.get_extra_info(ip)
             if info:
                 note = (note + " " if note else "") + f"[Info: {info}]"
             print(f"{n:>3}  {seg:<10} {ip:<16} {dev[:25]:<25} {iface[:22]:<22} "
-                  f"{zone[:12]:<12} {desc[:30]:<30} {note}")
-        print("-" * 150)
+                  f"{zone[:15]:<15} {note}")
+        print("-" * 120)
 
     def trace_source_destination(self, source: str, destination: str) -> None:
         """

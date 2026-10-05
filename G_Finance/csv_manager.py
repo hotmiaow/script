@@ -1120,7 +1120,10 @@ def add_to_watchlist(
     clean_sym = symbol.strip().upper()
     existing = next((i for i in items if i["symbol"] == clean_sym), None)
     if existing:
-        existing["name"] = name or existing["name"]
+        if name and name.strip().upper() != clean_sym:
+            existing["name"] = name.strip()
+        elif (not existing.get("name") or existing.get("name").strip().upper() == clean_sym) and name:
+            existing["name"] = name.strip()
         existing["target_price"] = target_price
         existing["target_buy_price"] = target_price
         existing["currency"] = currency
@@ -1128,9 +1131,17 @@ def add_to_watchlist(
         if tags:
             existing["tags"] = tags
     else:
+        final_name = name.strip() if name else ""
+        if not final_name or final_name.upper() == clean_sym:
+            try:
+                q_cache = load_watchlist_quotes_cache()
+                if clean_sym in q_cache and q_cache[clean_sym].get("name"):
+                    final_name = q_cache[clean_sym]["name"]
+            except Exception:
+                pass
         items.append({
             "symbol": clean_sym,
-            "name": name or clean_sym,
+            "name": final_name or clean_sym,
             "target_price": target_price,
             "target_buy_price": target_price,
             "currency": currency,
@@ -1161,8 +1172,10 @@ def update_watchlist_item(
     existing = next((i for i in items if i["symbol"] == old_clean), None)
     if existing:
         existing["symbol"] = new_clean
-        if name:
-            existing["name"] = name
+        if name and name.strip().upper() != new_clean:
+            existing["name"] = name.strip()
+        elif (not existing.get("name") or existing.get("name").strip().upper() == old_clean) and name:
+            existing["name"] = name.strip()
         existing["target_price"] = max(0.0, float(target_price or 0.0))
         existing["target_buy_price"] = existing["target_price"]
         existing["currency"] = currency.strip().upper() if currency else "USD"
@@ -1170,9 +1183,17 @@ def update_watchlist_item(
         if tags is not None and tags != "":
             existing["tags"] = tags.strip()
     else:
+        final_name = name.strip() if name else ""
+        if not final_name or final_name.upper() == new_clean:
+            try:
+                q_cache = load_watchlist_quotes_cache()
+                if new_clean in q_cache and q_cache[new_clean].get("name"):
+                    final_name = q_cache[new_clean]["name"]
+            except Exception:
+                pass
         items.append({
             "symbol": new_clean,
-            "name": name or new_clean,
+            "name": final_name or new_clean,
             "target_price": max(0.0, float(target_price or 0.0)),
             "target_buy_price": max(0.0, float(target_price or 0.0)),
             "currency": currency.strip().upper() if currency else "USD",
@@ -1181,6 +1202,53 @@ def update_watchlist_item(
             "added_date": datetime.now().strftime("%Y-%m-%d"),
         })
     return save_watchlist(items, filepath)
+
+
+def bulk_update_watchlist_category(
+    symbols: List[str],
+    new_category: str,
+    mode: str = "replace",  # "replace", "append", or "clear"
+    filepath: str = WATCHLIST_CSV,
+) -> int:
+    """
+    Updates the tags/category for multiple symbols in the watchlist.
+    mode:
+      - 'replace': sets tags to new_category
+      - 'append': appends new_category to existing tags (comma-separated, unique)
+      - 'clear': clears tags entirely
+    Returns the count of items updated.
+    """
+    if not symbols:
+        return 0
+
+    items = load_watchlist(filepath)
+    clean_syms = {s.strip().upper() for s in symbols if s.strip()}
+    new_cat_clean = new_category.strip()
+
+    updated_count = 0
+    for item in items:
+        sym = str(item.get("symbol", "")).strip().upper()
+        if sym in clean_syms:
+            if mode == "clear":
+                item["tags"] = ""
+                updated_count += 1
+            elif mode == "replace":
+                item["tags"] = new_cat_clean
+                updated_count += 1
+            elif mode == "append":
+                existing_tags_raw = str(item.get("tags", "")).strip()
+                existing_parts = [t.strip() for t in re.split(r"[,;]+", existing_tags_raw) if t.strip()]
+                new_parts = [t.strip() for t in re.split(r"[,;]+", new_cat_clean) if t.strip()]
+                for np in new_parts:
+                    if np not in existing_parts:
+                        existing_parts.append(np)
+                item["tags"] = ", ".join(existing_parts)
+                updated_count += 1
+
+    if updated_count > 0:
+        save_watchlist(items, filepath)
+
+    return updated_count
 
 
 def scan_data_integrity(
@@ -1506,7 +1574,9 @@ def bulk_add_to_watchlist(records: List[Dict[str, Any]], filepath: str = WATCHLI
         notes = str(rec.get("notes", "")).strip()
 
         if existing:
-            if name:
+            if name and name.upper() != clean_sym:
+                existing["name"] = name
+            elif (not existing.get("name") or existing.get("name").upper() == clean_sym) and name:
                 existing["name"] = name
             if tgt > 0:
                 existing["target_price"] = tgt
@@ -1516,9 +1586,17 @@ def bulk_add_to_watchlist(records: List[Dict[str, Any]], filepath: str = WATCHLI
             if notes:
                 existing["notes"] = notes
         else:
+            final_name = name
+            if not final_name or final_name.upper() == clean_sym:
+                try:
+                    q_cache = load_watchlist_quotes_cache()
+                    if clean_sym in q_cache and q_cache[clean_sym].get("name"):
+                        final_name = q_cache[clean_sym]["name"]
+                except Exception:
+                    pass
             items.append({
                 "symbol": clean_sym,
-                "name": name or clean_sym,
+                "name": final_name or clean_sym,
                 "target_price": tgt,
                 "target_buy_price": tgt,
                 "currency": curr,

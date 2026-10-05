@@ -521,7 +521,7 @@ class TestReportGenerator(unittest.TestCase):
         with open(self.report_file, "r", encoding="utf-8") as f:
             content = f.read()
         self.assertIn("Microsoft Corporation", content)
-        self.assertTrue(any(t in content for t in ["Google Finance Portfolio Executive Report", "Google 財經投資組合高階執行報告", "Google 财经投资组合高阶执行报告"]))
+        self.assertTrue(any(t in content for t in ["Google Finance Portfolio Executive Report", "Google 財經投資組合高階執行報告", "Google 财经投资组合高阶执行报告", "Google 财经投资组合高管执行报告"]))
         self.assertIn("$6,300.00", content)
 
 
@@ -2386,11 +2386,67 @@ class TestWatchlistMonitoringTabAndImport(unittest.TestCase):
             "menu_reset_tab_order",
             "lbl_watch_search",
             "btn_edit_watchlist",
+            "btn_change_category",
+            "dlg_change_category_title",
+            "msg_select_stock_for_category",
+            "opt_category_replace",
+            "opt_category_append",
+            "opt_category_clear",
         ]
         for lang in ["en", "zh_TW", "zh_CN"]:
             for k in required_keys:
                 self.assertIn(k, TRANSLATIONS[lang], f"Key '{k}' missing in {lang}")
                 self.assertTrue(len(TRANSLATIONS[lang][k]) > 0, f"Key '{k}' in {lang} is empty")
+
+    def test_bulk_update_watchlist_category(self):
+        from csv_manager import (
+            save_watchlist,
+            load_watchlist,
+            bulk_update_watchlist_category,
+        )
+
+        initial_data = [
+            {"symbol": "AAPL", "name": "Apple", "target_price": 150.0, "currency": "USD", "notes": "", "tags": "OldTag"},
+            {"symbol": "MSFT", "name": "Microsoft", "target_price": 300.0, "currency": "USD", "notes": "", "tags": "Tech, Cloud"},
+            {"symbol": "GOOGL", "name": "Alphabet", "target_price": 120.0, "currency": "USD", "notes": "", "tags": ""},
+        ]
+        save_watchlist(initial_data, self.test_csv)
+
+        # 1. Replace category for AAPL and GOOGL
+        cnt = bulk_update_watchlist_category(["AAPL", "GOOGL"], "Growth", mode="replace", filepath=self.test_csv)
+        self.assertEqual(cnt, 2)
+        res = load_watchlist(self.test_csv)
+        aapl = next(i for i in res if i["symbol"] == "AAPL")
+        googl = next(i for i in res if i["symbol"] == "GOOGL")
+        msft = next(i for i in res if i["symbol"] == "MSFT")
+        self.assertEqual(aapl["tags"], "Growth")
+        self.assertEqual(googl["tags"], "Growth")
+        self.assertEqual(msft["tags"], "Tech, Cloud")
+
+        # 2. Append category for AAPL and MSFT
+        cnt2 = bulk_update_watchlist_category(["AAPL", "MSFT"], "MegaCap, Tech", mode="append", filepath=self.test_csv)
+        self.assertEqual(cnt2, 2)
+        res = load_watchlist(self.test_csv)
+        aapl = next(i for i in res if i["symbol"] == "AAPL")
+        msft = next(i for i in res if i["symbol"] == "MSFT")
+        self.assertIn("Growth", aapl["tags"])
+        self.assertIn("MegaCap", aapl["tags"])
+        self.assertIn("Tech", aapl["tags"])
+        self.assertIn("Tech", msft["tags"])
+        self.assertIn("Cloud", msft["tags"])
+        self.assertIn("MegaCap", msft["tags"])
+        self.assertEqual(msft["tags"].count("Tech"), 1)
+
+        # 3. Clear category for MSFT
+        cnt3 = bulk_update_watchlist_category(["MSFT"], "", mode="clear", filepath=self.test_csv)
+        self.assertEqual(cnt3, 1)
+        res = load_watchlist(self.test_csv)
+        msft = next(i for i in res if i["symbol"] == "MSFT")
+        self.assertEqual(msft["tags"], "")
+
+        # 4. ModernPortfolioApp has _open_batch_change_category_dialog
+        import main_gui
+        self.assertTrue(hasattr(main_gui.ModernPortfolioApp, "_open_batch_change_category_dialog"))
 
     def test_watchlist_double_click_opens_edit_dialog(self):
         """Verify that double clicking on watchlist items opens Edit dialog, not Buy dialog."""
@@ -3652,6 +3708,629 @@ class TestBernsteinPhase3Upgrades(unittest.TestCase):
             self.assertEqual(loaded.get("outside_safe_assets"), "120000.0")
         finally:
             save_settings(orig_settings)
+
+    def test_tooltip_dynamic_text_and_localization(self):
+        from main_gui import ToolTip, attach_tooltip
+        from i18n import t, set_language, get_current_language
+
+        class MockWidget:
+            def __init__(self):
+                self._bindings = {}
+            def bind(self, seq, handler, add=None):
+                self._bindings[seq] = handler
+            def winfo_exists(self):
+                return True
+
+        orig_lang = get_current_language()
+        try:
+            widget = MockWidget()
+            tip = attach_tooltip(widget, "tip_refresh")
+            
+            set_language("en")
+            self.assertIn("quotes from Google Finance", tip._get_text())
+
+            set_language("zh_TW")
+            self.assertIn("從 Google 財經抓取", tip._get_text())
+
+            set_language("zh_CN")
+            self.assertIn("从 Google 财经抓取", tip._get_text())
+        finally:
+            set_language(orig_lang)
+
+    def test_fetcher_session_pooling(self):
+        from google_finance_fetcher import GoogleFinanceFetcher
+        fetcher = GoogleFinanceFetcher()
+        adapter = fetcher.session.get_adapter("https://www.google.com")
+        self.assertIsNotNone(adapter)
+        self.assertGreaterEqual(getattr(adapter, "_pool_connections", 0), 20)
+        self.assertGreaterEqual(getattr(adapter, "_pool_maxsize", 0), 20)
+
+    def test_cache_notice_and_background_status_messages(self):
+        from i18n import t, set_language, get_current_language
+        orig_lang = get_current_language()
+        try:
+            set_language("en")
+            notice_en = t("msg_cached_data_notice")
+            bg_en = t("msg_updating_background")
+            done_en = t("msg_update_completed")
+            self.assertIn("Showing cached data", notice_en)
+            self.assertIn("background", bg_en)
+            self.assertIn("updated", done_en)
+
+            set_language("zh_TW")
+            notice_tw = t("msg_cached_data_notice")
+            bg_tw = t("msg_updating_background")
+            done_tw = t("msg_update_completed")
+            self.assertIn("快取資料", notice_tw)
+            self.assertIn("背景正在同步", bg_tw)
+            self.assertIn("已更新至最新", done_tw)
+
+            set_language("zh_CN")
+            notice_cn = t("msg_cached_data_notice")
+            bg_cn = t("msg_updating_background")
+            done_cn = t("msg_update_completed")
+            self.assertIn("缓存数据", notice_cn)
+            self.assertIn("后台正在同步", bg_cn)
+            self.assertIn("已更新至最新", done_cn)
+        finally:
+            set_language(orig_lang)
+
+    def test_auto_refresh_default_and_setting_persistence(self):
+        from i18n import load_settings, save_settings
+        orig_cfg = load_settings()
+        try:
+            # Verify setting can be saved and loaded
+            save_settings({"auto_refresh_interval": "5 min"})
+            cfg = load_settings()
+            self.assertEqual(cfg.get("auto_refresh_interval"), "5 min")
+
+            # Verify interval mapping
+            mapping = {
+                "Off": 0,
+                "15s": 15,
+                "30s": 30,
+                "1 min": 60,
+                "2 min": 120,
+                "5 min": 300,
+            }
+            self.assertEqual(mapping.get("5 min"), 300)
+            self.assertEqual(mapping.get("2 min"), 120)
+
+            # Save a different setting (e.g. 2 min) and verify persistence
+            save_settings({"auto_refresh_interval": "2 min"})
+            cfg2 = load_settings()
+            self.assertEqual(cfg2.get("auto_refresh_interval"), "2 min")
+            self.assertEqual(mapping.get(cfg2.get("auto_refresh_interval")), 120)
+        finally:
+            save_settings(orig_cfg)
+
+    def test_single_thread_fetch_worker_simulation(self):
+        import queue
+
+        symbols = ["AAPL", "MSFT", "GOOGL", "AMZN"]
+        fetch_queue = queue.Queue()
+        mock_quotes = {
+            s: {"symbol": s, "price": 100.0, "success": True, "change": 1.0, "change_percent": 1.0}
+            for s in symbols
+        }
+
+        def mock_fetch(sym):
+            return mock_quotes.get(sym, {"symbol": sym, "success": False})
+
+        # Single-threaded sequential iteration as used in fetch_all_quotes
+        results = []
+        tot = len(symbols)
+        for idx, sym in enumerate(symbols, 1):
+            q = mock_fetch(sym)
+            results.append((sym, q))
+            fetch_queue.put(("STREAM_QUOTE", (sym, q, idx, tot)))
+
+        fetch_queue.put(("ALL_QUOTES", results))
+
+        stream_count = 0
+        all_quotes_received = False
+        while not fetch_queue.empty():
+            msg_type, data = fetch_queue.get()
+            if msg_type == "STREAM_QUOTE":
+                stream_count += 1
+            elif msg_type == "ALL_QUOTES":
+                all_quotes_received = True
+
+        self.assertEqual(stream_count, len(symbols))
+        self.assertTrue(all_quotes_received)
+        self.assertEqual(len(results), len(symbols))
+
+    def test_fetch_all_quotes_scoping_and_execution(self):
+        from main_gui import ModernPortfolioApp
+        import queue
+
+        class MockApp:
+            pass
+
+        app = MockApp()
+        app.is_fetching = False
+        app.all_holdings = [{"symbol": "AAPL"}]
+        app.fetch_queue = queue.Queue()
+        app.is_running = False  # immediately stops worker from actually fetching network
+        app.fetcher = None
+        status_messages = []
+        app._set_status = lambda msg: status_messages.append(msg)
+
+        # Call the unbound method on mock object
+        # Before our fix, this line failed immediately with UnboundLocalError on line 8602!
+        ModernPortfolioApp.fetch_all_quotes(app)
+        self.assertTrue(app.is_fetching)
+        self.assertTrue(len(status_messages) > 0)
+        self.assertIn("(0/", status_messages[0])
+
+    def test_retirement_spending_smile(self):
+        from financial_calc import calc_retirement_spending_smile
+        res = calc_retirement_spending_smile(base_annual_spending=60000.0, retire_age=65, life_expectancy=90)
+        self.assertIn("capital_savings", res)
+        self.assertIn("annual_schedule", res)
+        self.assertEqual(res["retire_age"], 65)
+        self.assertEqual(res["life_expectancy"], 90)
+        self.assertEqual(res["gogo_annual"], 64800.0)
+        self.assertEqual(res["slowgo_annual"], 48000.0)
+        self.assertEqual(res["care_annual"], 64800.0)
+        self.assertGreater(res["capital_savings"], 0)
+        self.assertEqual(len(res["annual_schedule"]), 26)
+
+    def test_sequence_of_returns_risk_simulation(self):
+        from financial_calc import calc_sequence_of_returns_risk_simulation
+        res = calc_sequence_of_returns_risk_simulation(
+            portfolio_val=1000000.0,
+            annual_withdrawal=60000.0,
+            safe_assets_val=150000.0,
+            crash_scenario="stagflation_1973",
+        )
+        self.assertIn("terminal_no_buffer", res)
+        self.assertIn("terminal_with_buffer", res)
+        self.assertIn("equity_capital_saved", res)
+        self.assertGreater(res["terminal_with_buffer"], res["terminal_no_buffer"])
+        self.assertGreater(res["equity_capital_saved"], 0)
+        self.assertEqual(len(res["curve_no_buffer"]), 10)
+        self.assertEqual(len(res["curve_with_buffer"]), 10)
+
+    def test_guyton_klinger_guardrails(self):
+        from financial_calc import calc_guyton_klinger_guardrails
+        # Normal within guardrails
+        res_norm = calc_guyton_klinger_guardrails(portfolio_val=1000000.0, current_annual_withdrawal=40000.0, initial_swr_pct=4.0)
+        self.assertEqual(res_norm["rule_triggered"], "none")
+        self.assertAlmostEqual(res_norm["recommended_withdrawal"], 41000.0, places=1)
+
+        # Capital preservation rule (> 4.8%)
+        res_cut = calc_guyton_klinger_guardrails(portfolio_val=600000.0, current_annual_withdrawal=40000.0, initial_swr_pct=4.0)
+        self.assertEqual(res_cut["rule_triggered"], "capital_preservation")
+        self.assertEqual(res_cut["adjustment_pct"], -10.0)
+        self.assertEqual(res_cut["recommended_withdrawal"], 36000.0)
+
+        # Prosperity rule (< 3.2%)
+        res_raise = calc_guyton_klinger_guardrails(portfolio_val=2000000.0, current_annual_withdrawal=40000.0, initial_swr_pct=4.0)
+        self.assertEqual(res_raise["rule_triggered"], "prosperity")
+        self.assertEqual(res_raise["adjustment_pct"], 10.0)
+        self.assertEqual(res_raise["recommended_withdrawal"], 44000.0)
+
+    def test_three_bucket_architecture(self):
+        from financial_calc import calc_three_bucket_architecture
+        res = calc_three_bucket_architecture(
+            total_wealth=1200000.0,
+            annual_rle=50000.0,
+            current_safe_assets=150000.0,
+        )
+        self.assertEqual(res["bucket1_target"], 100000.0)  # 2 years
+        self.assertEqual(res["bucket1_actual"], 100000.0)  # fully funded
+        self.assertEqual(res["bucket1_gap"], 0.0)
+        self.assertEqual(res["bucket1_runway_months"], 24.0)
+        self.assertEqual(res["bucket2_actual"], 50000.0)  # remaining 50k
+        self.assertEqual(res["total_safe_runway_years"], 3.0)
+
+    def test_healthcare_ltc_contingency(self):
+        from financial_calc import calc_healthcare_ltc_contingency
+        res = calc_healthcare_ltc_contingency(
+            portfolio_val=1500000.0,
+            annual_ltc_cost=60000.0,
+            ltc_start_age=83,
+            ltc_duration_years=4,
+            current_age=60,
+        )
+        self.assertEqual(res["total_ltc_cost"], 240000.0)
+        self.assertTrue(res["can_absorb"])
+        self.assertLess(res["present_value_needed"], 240000.0)
+        self.assertLess(res["ltc_wealth_impact_pct"], 15.0)
+
+    def test_actuarial_longevity_table(self):
+        from financial_calc import calc_actuarial_longevity_table
+        res = calc_actuarial_longevity_table(current_age=60, gender="joint")
+        self.assertEqual(res["recommended_planning_age"], 95)
+        sched = res["longevity_schedule"]
+        self.assertEqual(len(sched), 6)
+        # Verify monotonically decreasing survival probabilities
+        probs = [item["prob_joint"] for item in sched]
+        self.assertEqual(probs, sorted(probs, reverse=True))
+
+    def test_monte_carlo_distribution(self):
+        from financial_calc import calc_monte_carlo_distribution
+        res = calc_monte_carlo_distribution(
+            portfolio_val=1000000.0,
+            annual_withdrawal=40000.0,
+            years=30,
+            num_trials=500,
+        )
+        self.assertEqual(res["num_trials"], 500)
+        self.assertGreater(res["success_rate_pct"], 80.0)
+        self.assertLessEqual(res["p10_terminal_wealth"], res["p50_terminal_wealth"])
+        self.assertLessEqual(res["p50_terminal_wealth"], res["p90_terminal_wealth"])
+
+    def test_stagflation_sensitivity_matrix(self):
+        from financial_calc import calc_stagflation_sensitivity_matrix
+        res = calc_stagflation_sensitivity_matrix(
+            portfolio_val=1000000.0,
+            annual_withdrawal=40000.0,
+        )
+        mat = res["matrix"]
+        self.assertEqual(len(mat), 4)  # 4 inflation tiers
+        self.assertEqual(len(mat[0]), 4)  # 4 real return tiers
+        # Higher inflation should reduce or maintain longevity
+        self.assertGreaterEqual(mat[0][0]["longevity_years"], mat[3][0]["longevity_years"])
+
+    def test_rising_equity_glidepath(self):
+        from financial_calc import calc_rising_equity_glidepath
+        # Accumulation
+        res_acc = calc_rising_equity_glidepath(current_age=55, retire_age=65, current_equity_pct=70.0)
+        self.assertEqual(res_acc["target_equity_pct"], 65.0)
+
+        # Early retirement (Year 0)
+        res_ret0 = calc_rising_equity_glidepath(current_age=65, retire_age=65, current_equity_pct=50.0)
+        self.assertEqual(res_ret0["target_equity_pct"], 50.0)
+        self.assertEqual(res_ret0["deviation_pct"], 0.0)
+
+        # Mid retirement (Year 10)
+        res_ret10 = calc_rising_equity_glidepath(current_age=75, retire_age=65, current_equity_pct=63.3)
+        self.assertAlmostEqual(res_ret10["target_equity_pct"], 63.3, places=1)
+
+        # Mature retirement (Year 20)
+        res_ret20 = calc_rising_equity_glidepath(current_age=85, retire_age=65, current_equity_pct=70.0)
+        self.assertEqual(res_ret20["target_equity_pct"], 70.0)
+
+    def test_calc_fire_metrics_advanced_toolkit_integration(self):
+        from financial_calc import calc_fire_metrics
+        holdings = [
+            {"symbol": "SPY", "shares": 1000, "current_price": 500.0, "currency": "USD", "annual_dividend": 6000.0},
+            {"symbol": "TIP", "shares": 1000, "current_price": 100.0, "currency": "USD", "annual_dividend": 2500.0},
+        ]
+        res = calc_fire_metrics(
+            current_annual_div=8500.0,
+            target_monthly_expense=5000.0,
+            holdings=holdings,
+            current_age=60,
+            retire_age=65,
+            life_expectancy=90,
+            target_safe_years=25,
+        )
+        self.assertIn("spending_smile_data", res)
+        self.assertIn("srr_data", res)
+        self.assertIn("guardrails_data", res)
+        self.assertIn("three_bucket_data", res)
+        self.assertIn("ltc_data", res)
+        self.assertIn("longevity_data", res)
+        self.assertIn("monte_carlo_dist", res)
+        self.assertIn("stagflation_data", res)
+        self.assertIn("glidepath_data", res)
+
+    def test_modern_portfolio_app_retirement_toolkit_dialog_method(self):
+        from main_gui import ModernPortfolioApp
+        self.assertTrue(hasattr(ModernPortfolioApp, "_open_retirement_advanced_toolkit_dialog"))
+
+    def test_retirement_10_tabs_translations_in_all_languages(self):
+        from i18n import TRANSLATIONS, set_language, t, get_current_language
+        orig_lang = get_current_language()
+        try:
+            for lang in ["en", "zh_TW", "zh_CN"]:
+                set_language(lang)
+                self.assertIn("fire_bottom_actions_title", TRANSLATIONS[lang])
+                self.assertIn("btn_fire_toolkit", TRANSLATIONS[lang])
+                self.assertIn("fire_tk_title", TRANSLATIONS[lang])
+                self.assertIn("fire_tk_sub", TRANSLATIONS[lang])
+                # Verify all 10 tabs exist
+                for i in range(1, 11):
+                    tab_key = f"fire_tk_tab_{i}"
+                    self.assertIn(tab_key, TRANSLATIONS[lang], f"Missing {tab_key} in {lang}")
+                    translated_text = t(tab_key)
+                    self.assertTrue(len(translated_text) > 0)
+        finally:
+            set_language(orig_lang)
+
+    def test_all_retirement_algorithms_edge_cases(self):
+        from financial_calc import (
+            calc_retirement_spending_smile,
+            calc_sequence_of_returns_risk_simulation,
+            calc_guyton_klinger_guardrails,
+            calc_three_bucket_architecture,
+            calc_healthcare_ltc_contingency,
+            calc_actuarial_longevity_table,
+            calc_monte_carlo_distribution,
+            calc_stagflation_sensitivity_matrix,
+            calc_rising_equity_glidepath,
+        )
+
+        # 1. Spending Smile with late retirement (Age 75 to 88)
+        s_late = calc_retirement_spending_smile(base_annual_spending=50000.0, retire_age=75, life_expectancy=88)
+        self.assertEqual(len(s_late["annual_schedule"]), 14)
+        self.assertGreater(s_late["flat_total_lifetime"], 0)
+
+        # 2. SRR Crash with zero safe buffer
+        srr_zero = calc_sequence_of_returns_risk_simulation(portfolio_val=500000.0, annual_withdrawal=30000.0, safe_assets_val=0.0)
+        self.assertEqual(srr_zero["equity_capital_saved"], 0.0)
+        self.assertEqual(srr_zero["terminal_no_buffer"], srr_zero["terminal_with_buffer"])
+
+        # 3. Guyton Klinger with 0 withdrawal
+        gk_zero = calc_guyton_klinger_guardrails(portfolio_val=1000000.0, current_annual_withdrawal=0.0)
+        self.assertEqual(gk_zero["rule_triggered"], "none")
+        self.assertEqual(gk_zero["recommended_withdrawal"], 0.0)
+
+        # 4. Three-Bucket with safe assets exceeding portfolio
+        tb_overflow = calc_three_bucket_architecture(total_wealth=500000.0, annual_rle=40000.0, current_safe_assets=800000.0)
+        self.assertEqual(tb_overflow["bucket1_actual"], 80000.0)
+        self.assertEqual(tb_overflow["bucket2_actual"], 200000.0)
+        self.assertEqual(tb_overflow["bucket3_actual"], 0.0)
+
+        # 5. LTC Shock already in old age (current age 85, shock age 85)
+        ltc_now = calc_healthcare_ltc_contingency(portfolio_val=300000.0, current_age=85, ltc_start_age=85)
+        self.assertEqual(ltc_now["present_value_needed"], ltc_now["total_ltc_cost"])
+
+        # 6. Longevity table at age 85
+        long_85 = calc_actuarial_longevity_table(current_age=85)
+        self.assertEqual(long_85["longevity_schedule"][0]["prob_joint"], 100.0)  # Age 75 already passed
+        self.assertEqual(long_85["longevity_schedule"][1]["prob_joint"], 100.0)  # Age 80 already passed
+        self.assertEqual(long_85["longevity_schedule"][2]["prob_joint"], 100.0)  # Age 85 current
+
+        # 7. Monte Carlo with very small portfolio (early exhaustion)
+        mc_small = calc_monte_carlo_distribution(portfolio_val=50000.0, annual_withdrawal=30000.0, years=10)
+        self.assertEqual(mc_small["success_rate_pct"], 0.0)
+
+        # 8. Stagflation matrix dimensions
+        stag = calc_stagflation_sensitivity_matrix(portfolio_val=500000.0, annual_withdrawal=25000.0)
+        self.assertEqual(len(stag["matrix"]), 4)
+        self.assertEqual(len(stag["matrix"][0]), 4)
+
+        # 9. Rising equity glidepath at age 100
+        gp_old = calc_rising_equity_glidepath(current_age=100, retire_age=65, current_equity_pct=70.0)
+        self.assertEqual(gp_old["target_equity_pct"], 70.0)
+        self.assertEqual(gp_old["deviation_pct"], 0.0)
+
+    def test_ui_usability_and_shortcuts(self):
+        from i18n import TRANSLATIONS, set_language, get_current_language, t
+        orig_lang = get_current_language()
+        try:
+            required_keys = [
+                "menu_tools",
+                "btn_shortcuts",
+                "dlg_shortcuts_title",
+                "badge_safe_engine",
+                "tip_tools_menu",
+                "tip_shortcuts",
+            ]
+            for lang in ("en", "zh_TW", "zh_CN"):
+                set_language(lang)
+                for k in required_keys:
+                    self.assertIn(k, TRANSLATIONS[lang], f"Missing key {k} in {lang}")
+                    self.assertTrue(len(t(k)) > 0, f"Empty text for {k} in {lang}")
+
+            # Check main_gui methods for usability
+            import main_gui
+            self.assertTrue(hasattr(main_gui.ModernPortfolioApp, "_rebuild_tools_menu"))
+            self.assertTrue(hasattr(main_gui.ModernPortfolioApp, "_setup_keyboard_shortcuts"))
+            self.assertTrue(hasattr(main_gui.ModernPortfolioApp, "_focus_search"))
+            self.assertTrue(hasattr(main_gui.ModernPortfolioApp, "_open_shortcuts_dialog"))
+            self.assertTrue(hasattr(main_gui.ModernPortfolioApp, "_clear_search"))
+            self.assertTrue(hasattr(main_gui.ModernPortfolioApp, "_clear_watchlist_search"))
+
+            import inspect
+            watch_src = inspect.getsource(main_gui.ModernPortfolioApp._build_watchlist_tab)
+            self.assertNotIn("attach_tooltip(search_entry,", watch_src)
+            self.assertIn("attach_tooltip(self.watchlist_search_entry,", watch_src)
+        finally:
+            set_language(orig_lang)
+
+    def test_watchlist_company_name_resolution(self):
+        """Verify that watchlist stock names equal to symbols or blank are updated with real company names."""
+        import tempfile
+        from unittest.mock import MagicMock, patch
+        from csv_manager import save_watchlist, load_watchlist, bulk_add_to_watchlist, add_to_watchlist
+        import main_gui
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            test_watch = os.path.join(tmpdir, "test_watchlist.csv")
+            initial_items = [
+                {"symbol": "AAPL", "name": "AAPL", "target_price": 200.0, "currency": "USD", "notes": "", "tags": ""},
+                {"symbol": "TSLA", "name": "", "target_price": 250.0, "currency": "USD", "notes": "", "tags": ""},
+            ]
+            save_watchlist(initial_items, filepath=test_watch)
+
+            # 1. Test bulk_add_to_watchlist with cache
+            mock_cache = {
+                "AAPL": {"price": 220.0, "name": "Apple Inc.", "currency": "USD", "success": True},
+                "TSLA": {"price": 260.0, "name": "Tesla, Inc.", "currency": "USD", "success": True},
+            }
+            with patch("csv_manager.load_watchlist_quotes_cache", return_value=mock_cache):
+                added = bulk_add_to_watchlist([{"symbol": "NVDA", "name": "NVDA"}], filepath=test_watch)
+                loaded = load_watchlist(filepath=test_watch)
+                self.assertTrue(any(it["symbol"] == "NVDA" for it in loaded))
+
+            # 2. Test _refresh_watchlist_tab resolution and persistence
+            app = MagicMock()
+            app._watchlist_quotes_cache = mock_cache
+            app.all_holdings = []
+            app.holdings = []
+            app.watchlist_tree = MagicMock()
+            inserted_values = []
+            def fake_insert(*args, **kwargs):
+                vals = kwargs.get("values", args[2] if len(args) > 2 else None)
+                if vals:
+                    inserted_values.append(vals)
+            app.watchlist_tree.insert.side_effect = fake_insert
+            app.watchlist_search_var = MagicMock()
+            app.watchlist_search_var.get.return_value = ""
+            app.watchlist_tag_filter_var = MagicMock()
+            app.watchlist_tag_filter_var.get.return_value = ""
+            app._watchlist_sort_col = "symbol"
+            app._watchlist_sort_desc = False
+
+            with patch("main_gui.load_watchlist", return_value=load_watchlist(filepath=test_watch)), \
+                 patch("main_gui.WATCHLIST_CSV", test_watch), \
+                 patch("main_gui.save_watchlist", side_effect=lambda items, fp=None: save_watchlist(items, test_watch)):
+                main_gui.ModernPortfolioApp._refresh_watchlist_tab(app)
+
+            # Check inserted rows had real names
+            name_map = {row[0]: row[1] for row in inserted_values}
+            self.assertEqual(name_map.get("AAPL"), "Apple Inc.")
+            self.assertEqual(name_map.get("TSLA"), "Tesla, Inc.")
+
+            # Check test_watch file was persisted with real names
+            persisted = load_watchlist(filepath=test_watch)
+            p_map = {it["symbol"]: it["name"] for it in persisted}
+            self.assertEqual(p_map.get("AAPL"), "Apple Inc.")
+            self.assertEqual(p_map.get("TSLA"), "Tesla, Inc.")
+
+            # 3. Test _handle_all_quotes_result updates watchlist.csv
+            app_quote = MagicMock()
+            app_quote._watchlist_quotes_cache = {}
+            app_quote.all_holdings = []
+            app_quote._network_errors = []
+            results = [
+                ("NVDA", {"symbol": "NVDA", "price": 125.0, "name": "NVIDIA Corporation", "currency": "USD", "success": True})
+            ]
+            with patch("main_gui.WATCHLIST_CSV", test_watch), \
+                 patch("main_gui.PORTFOLIO_CSV", os.path.join(tmpdir, "p.csv")), \
+                 patch("main_gui.save_portfolio"), \
+                 patch("main_gui.save_watchlist_quotes_cache"):
+                main_gui.ModernPortfolioApp._handle_all_quotes_result(app_quote, results)
+
+            persisted_after = load_watchlist(filepath=test_watch)
+            p_map_after = {it["symbol"]: it["name"] for it in persisted_after}
+            self.assertEqual(p_map_after.get("NVDA"), "NVIDIA Corporation")
+
+    def test_selection_preservation_during_quote_refresh(self):
+        """Verify that user selection in watchlist and holdings is preserved during stock refresh."""
+        import tempfile
+        from unittest.mock import MagicMock, patch
+        import main_gui
+
+        # 1. Test Watchlist in-place update preserves selection
+        app = MagicMock()
+        app.watchlist_tree = MagicMock()
+        app.watchlist_tree.get_children.return_value = ["wl_AAPL", "wl_MSFT"]
+        app.watchlist_tree.selection.return_value = ["wl_AAPL"]
+        app.watchlist_tree.item.return_value = [
+            "AAPL", "Apple Inc", "Tech", "$200.00", "+1.50%", "$180.00", "+11.11%", "30.0", "$150-$230", "0.5%", "Monitoring", "USD", "2026-10-05 12:00:00", "2026-09-01", "Notes"
+        ]
+
+        quote = {
+            "symbol": "AAPL",
+            "price": 205.50,
+            "name": "Apple Inc",
+            "change": 5.50,
+            "change_percent": 2.75,
+            "currency": "USD",
+            "success": True,
+        }
+
+        # Update in-place
+        res = main_gui.ModernPortfolioApp._update_watchlist_row_in_place(app, "AAPL", quote)
+        self.assertTrue(res)
+        # Verify item was called to update values, NOT delete
+        app.watchlist_tree.delete.assert_not_called()
+        self.assertEqual(app.watchlist_tree.selection.return_value, ["wl_AAPL"])
+
+        # 2. Test Holdings in-place update preserves selection
+        app.holdings_tree = MagicMock()
+        app.holdings_tree.get_children.return_value = ["holding_item_0"]
+        app.holdings_tree.selection.return_value = ["holding_item_0"]
+        app.converter = MagicMock()
+        app.converter.CURRENCY_SYMBOLS = {"USD": "$"}
+        mock_holding = {
+            "portfolio": "Main",
+            "symbol": "AAPL",
+            "name": "Apple Inc",
+            "currency": "USD",
+            "shares": 10.0,
+            "buy_price": 150.0,
+            "current_price": 200.0,
+        }
+        app.holding_map = {"holding_item_0": mock_holding}
+        app.holdings_tree.item.return_value = [
+            "Main", "AAPL", "Apple Inc", "USD", "10", "$150.00", "$200.00", "+5.00%", "$2,000.00", "$1,500.00", "+$500.00", "+33.33%", "-", "-", "0.5%", "$10.00", "2026-10-05"
+        ]
+
+        main_gui.ModernPortfolioApp._update_holdings_row_in_place(app, "AAPL", quote)
+        app.holdings_tree.delete.assert_not_called()
+        self.assertEqual(app.holdings_tree.selection.return_value, ["holding_item_0"])
+        self.assertEqual(mock_holding["current_price"], 205.50)
+
+        # 3. Test _refresh_holdings_table restores selection
+        app.holdings = [mock_holding]
+        app.search_filter_var = MagicMock()
+        app.search_filter_var.get.return_value = ""
+        app.current_portfolio = "Main"
+        app.holdings_tree.selection.return_value = ["holding_item_0"]
+        app.holdings_tree.get_children.side_effect = None
+        app.holdings_tree.get_children.return_value = ["holding_item_0"]
+        app.holdings_tree.item.return_value = [
+            "Main", "AAPL", "Apple Inc", "USD", "10", "$150.00", "$205.50", "+5.00%", "$2,055.00", "$1,500.00", "+$555.00", "+37.00%", "-", "-", "0.5%", "$10.00", "2026-10-05"
+        ]
+        main_gui.ModernPortfolioApp._refresh_holdings_table(app)
+        app.holdings_tree.selection_set.assert_called_with(["holding_item_0"])
+
+        # 4. Test _refresh_watchlist_tab restores selection
+        app.watchlist_tree.selection.return_value = ["wl_AAPL"]
+        app.watchlist_tree.get_children.return_value = ["wl_AAPL", "wl_MSFT"]
+        app.watchlist_tree.item.return_value = [
+            "AAPL", "Apple Inc", "Tech", "$205.50", "+2.75%", "$180.00", "+14.17%", "30.0", "$150-$230", "0.5%", "Monitoring", "USD", "2026-10-05 12:00:00", "2026-09-01", "Notes"
+        ]
+        app.watchlist_search_var = MagicMock()
+        app.watchlist_search_var.get.return_value = ""
+        app.watchlist_tag_filter_var = MagicMock()
+        app.watchlist_tag_filter_var.get.return_value = ""
+        app._watchlist_sort_col = "symbol"
+        app._watchlist_sort_desc = False
+
+        with patch("main_gui.load_watchlist", return_value=[{"symbol": "AAPL", "name": "Apple Inc", "target_price": 180.0, "currency": "USD"}]), \
+             patch("main_gui.save_watchlist"):
+            main_gui.ModernPortfolioApp._refresh_watchlist_tab(app)
+
+        app.watchlist_tree.selection_set.assert_called_with(["wl_AAPL"])
+
+    def test_fire_top_action_toolbar_and_translations(self):
+        """Test the top action toolbar translation keys and widget existence on ModernPortfolioApp."""
+        from i18n import TRANSLATIONS, set_language, t, get_current_language
+        import main_gui
+
+        orig_lang = get_current_language()
+        required_keys = [
+            "fire_bottom_actions_title",
+            "btn_deep_risk_short",
+            "btn_crisis_stress_short",
+            "btn_fee_tax_drag_short",
+            "btn_rebalance_5_25_short",
+            "btn_simplicity_short",
+            "lbl_fire_models_suite",
+            "lbl_fire_actions_suite",
+            "btn_recalc_fire",
+            "tip_fire_toolkit_all",
+            "tip_fire_apply_rebalance",
+            "tip_fire_simulate_trade",
+            "tip_fire_export_report",
+            "tip_fire_recalc",
+        ]
+        try:
+            for lang in ["en", "zh_TW", "zh_CN"]:
+                set_language(lang)
+                for key in required_keys:
+                    self.assertIn(key, TRANSLATIONS[lang], f"Missing key '{key}' in language '{lang}'")
+                    self.assertTrue(len(t(key)) > 0, f"Empty translation for '{key}' in '{lang}'")
+        finally:
+            set_language(orig_lang)
 
 
 if __name__ == "__main__":

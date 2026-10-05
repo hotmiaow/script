@@ -3,14 +3,14 @@
   "tab_order": [
     "holdings",
     "watchlist",
+    "fire",
     "analytics",
     "chart",
     "dividend",
     "split",
     "sell",
     "history",
-    "report",
-    "fire"
+    "report"
   ],
   "fire_params": {
     "current_age": "43",
@@ -25,6 +25,7 @@
     "monthly_savings": "500.0",
     "expected_div_growth": "5.0",
     "current_cape": "34.0",
-    "outside_safe_assets": "120000.0"
-  }
+    "outside_safe_assets": "150000.0"
+  },
+  "auto_refresh_interval": "5 min"
 }
