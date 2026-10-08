@@ -2200,9 +2200,11 @@ class TestMultiplePortfolioCreationAndSelection(unittest.TestCase):
         mock_app.fetcher = MagicMock()
         mock_app.fetcher.fx_cache = {}
 
-        ModernPortfolioApp._on_portfolio_selected(mock_app)
-        self.assertEqual(mock_app.current_portfolio, "USD CIBC Investment")
-        self.assertEqual(len(mock_app.holdings), 0)
+        from unittest.mock import patch
+        with patch("main_gui.load_portfolio", return_value=[]):
+            ModernPortfolioApp._on_portfolio_selected(mock_app)
+            self.assertEqual(mock_app.current_portfolio, "USD CIBC Investment")
+            self.assertEqual(len(mock_app.holdings), 0)
 
 
 class TestWatchlistMonitoringTabAndImport(unittest.TestCase):
@@ -4331,6 +4333,144 @@ class TestBernsteinPhase3Upgrades(unittest.TestCase):
                     self.assertTrue(len(t(key)) > 0, f"Empty translation for '{key}' in '{lang}'")
         finally:
             set_language(orig_lang)
+
+    def test_fire_step1_combines_same_stock_and_calculates(self):
+        """Test that Step 1 of FIRE aggregates multiple holdings of the same stock into a single entry with combined calculation."""
+        import main_gui
+        from unittest.mock import MagicMock, patch
+
+        app = object.__new__(main_gui.ModernPortfolioApp)
+        # User has 2 separate entries of VOO (e.g. from 2 accounts) and 1 TIP
+        app.holdings = [
+            {"symbol": "VOO", "name": "Vanguard S&P 500 ETF", "shares": 50, "current_price": 500.0, "currency": "USD", "annual_dividend": 200.0},
+            {"symbol": "VOO", "name": "Vanguard S&P 500 ETF", "shares": 50, "current_price": 500.0, "currency": "USD", "annual_dividend": 200.0},
+            {"symbol": "TIP", "name": "iShares TIPS Bond ETF", "shares": 100, "current_price": 100.0, "currency": "USD", "annual_dividend": 300.0},
+        ]
+        app.summary_currency = "USD"
+        app.converter = MagicMock()
+        app.converter.format_money = lambda v, c: f"${v:,.2f}"
+        app.converter.convert = lambda v, f, t: v
+
+        app.tab_fire = MagicMock()
+        inserted_items = []
+        app.fire_holdings_tree = MagicMock()
+        app.fire_holdings_tree.get_children.return_value = []
+        app.fire_holdings_tree.insert.side_effect = lambda parent, index, values, tags: inserted_items.append({"values": values, "tags": tags})
+
+        app.fire_audit_summary_lbl = MagicMock()
+        app.fire_outside_safe_entry = MagicMock(get=lambda: "0.0")
+        app.fire_age_spin = MagicMock(get=lambda: "45")
+        app.fire_retire_age_spin = MagicMock(get=lambda: "60")
+        app.fire_horizon_spin = MagicMock(get=lambda: "90")
+        app.fire_safe_years_combo = MagicMock(get=lambda: "25")
+        app.fire_exp_entry = MagicMock(get=lambda: "3500")
+        app.fire_pension_entry = MagicMock(get=lambda: "15000")
+        app.fire_savings_entry = MagicMock(get=lambda: "500")
+        app.fire_growth_entry = MagicMock(get=lambda: "5.0")
+        app.fire_ess_exp_entry = MagicMock(get=lambda: "2000")
+        app.fire_disc_exp_entry = MagicMock(get=lambda: "1500")
+        app.fire_cape_spin = MagicMock(get=lambda: "34.0")
+        app.fire_delay_pension_var = MagicMock(get=lambda: True)
+        app.fire_timeline_lbl = MagicMock()
+        app.lbl_safe_gap_val = MagicMock()
+        app.lbl_safe_gap_status = MagicMock()
+        app.lbl_div_gap_val = MagicMock()
+        app.lbl_div_gap_status = MagicMock()
+        app.lbl_cap_gap_val = MagicMock()
+        app.lbl_cap_gap_status = MagicMock()
+        app.fire_burn_banner = MagicMock()
+        app.lbl_fire_burn_badge = MagicMock()
+        app.lbl_fire_rle_summary = MagicMock()
+        app.card_cape_swr = MagicMock()
+        app.lbl_cape_swr_val = MagicMock()
+        app.lbl_cape_zone_badge = MagicMock()
+        app.lbl_cape_swr_status = MagicMock()
+        app.lbl_fire_checklist = MagicMock()
+        app.dark_mode = False
+        app.text_dark = "#202124"
+
+        with patch("main_gui.save_settings"):
+            main_gui.ModernPortfolioApp._refresh_fire_tab(app)
+
+        # Verify that the treeview receives exactly 2 items (VOO combined, and TIP) instead of 3
+        self.assertEqual(len(inserted_items), 2, "Duplicate VOO must be combined into a single entry!")
+        voo_entry = next(it for it in inserted_items if it["values"][0] == "VOO")
+        tip_entry = next(it for it in inserted_items if it["values"][0] == "TIP")
+
+        # Total VOO value: 50*500 + 50*500 = $50,000.00
+        self.assertEqual(voo_entry["values"][2], "$50,000.00")
+        # Total portfolio: 50,000 + 10,000 = 60,000. VOO weight: 50000/60000 = 83.3%
+        self.assertEqual(voo_entry["values"][3], "83.3%")
+
+        # Combined holdings stored on app
+        self.assertEqual(len(app._last_combined_fire_holdings), 2)
+        combined_voo = next(h for h in app._last_combined_fire_holdings if h["symbol"] == "VOO")
+        self.assertEqual(combined_voo["shares"], 100.0)
+        self.assertEqual(combined_voo["value"], 50000.0)
+        # Test sorting
+        tree_items = {"id1": ("VOO", "Vanguard", "$50,000.00", "83.3%", "Stock"), "id2": ("TIP", "TIPS", "$10,000.00", "16.7%", "Safe")}
+        app.fire_holdings_tree.get_children = lambda root="": list(tree_items.keys())
+        app.fire_holdings_tree.item = lambda iid, field: tree_items[iid] if field == "values" else ("tag",)
+        reinserted = []
+        app.fire_holdings_tree.delete = lambda iid: None
+        app.fire_holdings_tree.insert = lambda p, idx, values, tags: reinserted.append(values)
+        main_gui.ModernPortfolioApp._sort_fire_holdings_by(app, "value")
+        self.assertEqual(len(reinserted), 2)
+
+    def test_watchlist_colorful_gain_loss_tags(self):
+        """Test that Watchlist displays stocks with colorful tags when they drop or raise."""
+        import main_gui
+        from unittest.mock import MagicMock, patch
+
+        app = object.__new__(main_gui.ModernPortfolioApp)
+        app.dark_mode = False
+        app.green_color = "#0f9d58"
+        app.red_color = "#d93025"
+        app.text_dark = "#202124"
+        app._watchlist_quotes_cache = {
+            "AAPL": {"price": 200.0, "change": 5.0, "change_percent": 2.56, "name": "Apple Inc"},
+            "TSLA": {"price": 180.0, "change": -9.0, "change_percent": -4.76, "name": "Tesla Inc"},
+            "MSFT": {"price": 300.0, "change": 2.0, "change_percent": 0.67, "name": "Microsoft Corp"},
+        }
+        app.all_holdings = []
+        app.holdings = []
+        app.watchlist_search_var = MagicMock(get=lambda: "")
+        app.watchlist_tag_filter_var = MagicMock(get=lambda: "")
+        app._watchlist_sort_col = "symbol"
+        app._watchlist_sort_desc = False
+
+        inserted_rows = {}
+        def mock_insert(*args, **kwargs):
+            iid = kwargs.get("iid", args[1] if len(args) > 1 else None)
+            vals = kwargs.get("values", args[2] if len(args) > 2 else None)
+            tags = kwargs.get("tags", args[3] if len(args) > 3 else ())
+            inserted_rows[iid] = {"values": vals, "tags": tags}
+
+        app.watchlist_tree = MagicMock()
+        app.watchlist_tree.get_children.return_value = []
+        app.watchlist_tree.insert.side_effect = mock_insert
+        app.watchlist_tree.selection.return_value = []
+
+        test_items = [
+            {"symbol": "AAPL", "name": "Apple Inc", "target_buy_price": 150.0},  # Up, target NOT reached -> positive
+            {"symbol": "TSLA", "name": "Tesla Inc", "target_buy_price": 150.0},  # Down, target NOT reached -> negative
+            {"symbol": "MSFT", "name": "Microsoft Corp", "target_buy_price": 350.0},  # Up, target REACHED (300 <= 350) -> reached_positive
+        ]
+
+        with patch("main_gui.load_watchlist", return_value=test_items), \
+             patch("main_gui.save_watchlist"):
+            main_gui.ModernPortfolioApp._refresh_watchlist_tab(app)
+
+        self.assertIn("wl_AAPL", inserted_rows)
+        self.assertIn("wl_TSLA", inserted_rows)
+        self.assertIn("wl_MSFT", inserted_rows)
+
+        # AAPL rose (+2.56%) -> positive tag (green)
+        self.assertEqual(inserted_rows["wl_AAPL"]["tags"], ("positive",))
+        # TSLA dropped (-4.76%) -> negative tag (red)
+        self.assertEqual(inserted_rows["wl_TSLA"]["tags"], ("negative",))
+        # MSFT target reached & rose -> reached_positive tag
+        self.assertEqual(inserted_rows["wl_MSFT"]["tags"], ("reached_positive",))
 
 
 if __name__ == "__main__":

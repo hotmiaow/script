@@ -2312,43 +2312,58 @@ def calc_fee_and_tax_drag_autopsy(
     div_yield = max(0.0, min(0.15, float(dividend_yield_pct)))
     turnover = max(0.0, min(1.0, float(annual_turnover_pct) / 100.0))
 
-    # Calculate holding-level weights and values
-    total_val = 0.0
-    holding_details = []
-
+    # Calculate holding-level weights and values with ticker aggregation
+    agg_holdings_map = {}
     for h in holdings:
+        raw_sym = str(h.get("symbol", "")).strip().upper()
+        if not raw_sym:
+            continue
         sh = float(h.get("shares", 0.0) or 0.0)
         p = float(h.get("current_price", h.get("price", 0.0)) or 0.0)
         h_val = max(0.0, sh * p)
-        total_val += h_val
+        if raw_sym not in agg_holdings_map:
+            agg_holdings_map[raw_sym] = {
+                "symbol": raw_sym,
+                "name": h.get("name", raw_sym),
+                "shares": sh,
+                "val": h_val,
+                "currency": str(h.get("currency", "USD")).upper(),
+                "expense_ratio": h.get("expense_ratio"),
+                "mer": h.get("mer"),
+            }
+        else:
+            agg_holdings_map[raw_sym]["shares"] += sh
+            agg_holdings_map[raw_sym]["val"] += h_val
+            if not agg_holdings_map[raw_sym].get("name") and h.get("name"):
+                agg_holdings_map[raw_sym]["name"] = h["name"]
 
+    total_val = sum(a["val"] for a in agg_holdings_map.values())
     effective_port_val = max(port_val, total_val)
     if effective_port_val <= 0.0:
         effective_port_val = 100000.0  # default modeling base
 
     weighted_ter = 0.0
     weighted_wht = 0.0
+    holding_details = []
 
-    for h in holdings:
-        sh = float(h.get("shares", 0.0) or 0.0)
-        p = float(h.get("current_price", h.get("price", 0.0)) or 0.0)
-        h_val = max(0.0, sh * p)
+    for a in agg_holdings_map.values():
+        h_val = a["val"]
         w = (h_val / effective_port_val) if effective_port_val > 0 else 0.0
 
-        raw_sym = str(h.get("symbol", "")).strip().upper()
+        raw_sym = a["symbol"]
         clean_sym = raw_sym.split(":")[0].split(".")[0].strip()
-        curr = str(h.get("currency", "USD")).upper()
+        curr = a["currency"]
 
         # 1. Determine Expense Ratio (TER / MER)
         if clean_sym in KNOWN_ETF_TER:
             ter = KNOWN_ETF_TER[clean_sym]
-        elif "expense_ratio" in h and h["expense_ratio"] is not None:
-            ter = float(h["expense_ratio"])
-        elif "mer" in h and h["mer"] is not None:
-            ter = float(h["mer"])
+        elif "expense_ratio" in a and a["expense_ratio"] is not None:
+            ter = float(a["expense_ratio"])
+        elif "mer" in a and a["mer"] is not None:
+            ter = float(a["mer"])
         else:
             # Check if it looks like an ETF or mutual fund
-            name = str(h.get("name", "")).upper()
+            name = str(a.get("name", "")).upper()
             if "ETF" in name or "INDEX" in name or "FUND" in name or clean_sym in ("XEQT", "VGRO", "VFV", "VEQT"):
                 ter = 0.18
             else:
@@ -2386,7 +2401,7 @@ def calc_fee_and_tax_drag_autopsy(
 
         holding_details.append({
             "symbol": raw_sym,
-            "name": h.get("name", raw_sym),
+            "name": a.get("name", raw_sym),
             "weight_pct": round(w * 100.0, 1),
             "ter_pct": ter,
             "wht_pct": wht,
@@ -2730,7 +2745,8 @@ def calc_simplicity_index(
             index_val += val
 
     eff_val = max(total_portfolio_val, tot_val)
-    count = len(holdings)
+    unique_symbols = {str(h.get("symbol", "")).strip().upper().split(":")[0].split(".")[0] for h in holdings if str(h.get("symbol", "")).strip()}
+    count = len(unique_symbols) if unique_symbols else len(holdings)
 
     # 1. Holding count score (max 30)
     if count <= 4:

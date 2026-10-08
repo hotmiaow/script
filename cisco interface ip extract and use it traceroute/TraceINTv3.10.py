@@ -64,45 +64,6 @@ def get_reverse_dns(ip: str) -> Optional[str]:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# IP & Subnet helpers
-# ──────────────────────────────────────────────────────────────────────────────
-def parse_ip_and_network(
-    ip_sub: str,
-) -> Tuple[Optional[str], Optional[ipaddress.IPv4Network]]:
-    """
-    Parses IP string (e.g. '10.1.1.1/24', '10.1.1.1 255.255.255.0', '10.1.1.1/24 (secondary)')
-    into (ip_str, network_obj). Returns (None, None) if dynamic or invalid.
-    """
-    clean = re.sub(r"\(.*?\)", "", ip_sub).strip()
-    if (
-        not clean
-        or clean.upper() in {"DHCP", "PPPOE", "UNASSIGNED", "NONE"}
-        or clean.upper().startswith("SOURCE:")
-    ):
-        return None, None
-    if " " in clean:
-        parts = clean.split()
-        if len(parts) >= 2:
-            clean = f"{parts[0]}/{parts[1]}"
-        else:
-            clean = parts[0]
-    try:
-        if "/" in clean:
-            iface_obj = ipaddress.ip_interface(clean)
-            return str(iface_obj.ip), iface_obj.network
-        else:
-            ip_obj = ipaddress.ip_address(clean)
-            return str(ip_obj), None
-    except ValueError:
-        ip_part = clean.split("/")[0].strip()
-        try:
-            ip_obj = ipaddress.ip_address(ip_part)
-            return str(ip_obj), None
-        except ValueError:
-            return None, None
-
-
-# ──────────────────────────────────────────────────────────────────────────────
 # Core class
 # ──────────────────────────────────────────────────────────────────────────────
 class CiscoTracerouteMapper:
@@ -111,10 +72,7 @@ class CiscoTracerouteMapper:
         self.csv_file: str = csv_file
         # (iface, ip, zone, vrf, description)
         self.device_inventory: Dict[str, List[Tuple[str, str, str, str, str]]] = {}
-        # Structured interface records: device -> list of dicts with net, ip, iface, etc.
-        self.device_interfaces: Dict[str, List[dict]] = {}
         self.ip_to_device_map: Dict[str, Tuple[str, str, str, str, str]] = {}
-        self.ip_to_network_map: Dict[str, Optional[ipaddress.IPv4Network]] = {}
         self.device_zones: Dict[str, str] = {}
         # traceroute settings
         self.resolve_dns: bool = False  # Default to False for speed
@@ -143,26 +101,20 @@ class CiscoTracerouteMapper:
                     vrf = row.get("vrf", "N/A").strip()
                     description = row.get("description", "").strip()
 
-                    parsed_ip, net_obj = parse_ip_and_network(ip_sub)
-                    if not parsed_ip:
+                    if ip_sub.upper() in {"DHCP", "PPPOE", "SOURCE: LOOPBACK1"} or not ip_sub:
                         continue                     # skip dynamic or empty
 
-                    ip = parsed_ip
+                    ip = ip_sub.split("/")[0]
+                    try:
+                        ipaddress.ip_address(ip)
+                    except ValueError:
+                        print(f"Warning: invalid IP '{ip}' for {device}")
+                        continue
+
                     self.device_inventory.setdefault(device, []).append(
                         (iface, ip, zone, vrf, description)
                     )
-                    self.device_interfaces.setdefault(device, []).append({
-                        "device": device,
-                        "iface": iface,
-                        "ip": ip,
-                        "network": net_obj,
-                        "zone": zone,
-                        "vrf": vrf,
-                        "description": description,
-                        "raw_ip": ip_sub,
-                    })
                     self.ip_to_device_map[ip] = (device, iface, zone, vrf, description)
-                    self.ip_to_network_map[ip] = net_obj
                     self.device_zones.setdefault(device, zone)
 
             print(f"✓ Loaded {len(self.device_inventory)} devices")
@@ -401,573 +353,47 @@ class CiscoTracerouteMapper:
 
         proc.wait(timeout=10)
 
-    # ───── subnet-based path interface resolution ─────────────────────────────
-    def find_matching_subnet_interfaces(
-        self, dev1: str, dev2: str
-    ) -> Optional[Tuple[dict, dict]]:
-        """
-        Finds an interface on dev1 (outbound) and an interface on dev2 (inbound)
-        that reside in the same subnet / IP network.
-        Returns (iface_dev1_dict, iface_dev2_dict) or None.
-        """
-        if not dev1 or not dev2 or dev1 == dev2:
-            return None
-
-        ifs1 = self.device_interfaces.get(dev1, [])
-        ifs2 = self.device_interfaces.get(dev2, [])
-        if not ifs1 or not ifs2:
-            return None
-
-        best_match = None
-        best_score = -1
-
-        for if1 in ifs1:
-            ip1_str = if1.get("ip")
-            net1 = if1.get("network")
-            try:
-                ip1_obj = ipaddress.ip_address(ip1_str) if ip1_str else None
-            except ValueError:
-                ip1_obj = None
-
-            for if2 in ifs2:
-                ip2_str = if2.get("ip")
-                net2 = if2.get("network")
-                try:
-                    ip2_obj = ipaddress.ip_address(ip2_str) if ip2_str else None
-                except ValueError:
-                    ip2_obj = None
-
-                score = -1
-
-                # 1. Exact network match (both have network, prefixlen < 32 and > 0)
-                if net1 and net2 and 0 < net1.prefixlen < 32 and 0 < net2.prefixlen < 32:
-                    if net1 == net2:
-                        score = 200 + net1.prefixlen
-                    elif ip2_obj and ip2_obj in net1:
-                        score = 150 + net1.prefixlen
-                    elif ip1_obj and ip1_obj in net2:
-                        score = 150 + net2.prefixlen
-
-                # 2. One has network, one has IP
-                elif net1 and 0 < net1.prefixlen < 32 and ip2_obj:
-                    if ip2_obj in net1:
-                        score = 150 + net1.prefixlen
-                elif net2 and 0 < net2.prefixlen < 32 and ip1_obj:
-                    if ip1_obj in net2:
-                        score = 150 + net2.prefixlen
-
-                # 3. Neither has network, check point-to-point /30, /31, etc.
-                elif ip1_obj and ip2_obj:
-                    for prefix in [31, 30, 29, 28, 24]:
-                        try:
-                            test_net = ipaddress.ip_network(f"{ip1_str}/{prefix}", strict=False)
-                            if ip2_obj in test_net:
-                                score = 50 + prefix
-                                break
-                        except ValueError:
-                            pass
-
-                if score > best_score:
-                    best_score = score
-                    best_match = (if1, if2)
-
-        return best_match
-
-    def find_interface_by_ip(
-        self, device: str, target_ip_str: str
-    ) -> Optional[dict]:
-        """
-        Finds an interface on device that directly owns target_ip_str or
-        whose subnet contains target_ip_str.
-        """
-        if not device or not target_ip_str:
-            return None
-        ifs = self.device_interfaces.get(device, [])
-        if not ifs:
-            return None
-
-        try:
-            target_ip_obj = ipaddress.ip_address(target_ip_str)
-        except ValueError:
-            return None
-
-        best_match = None
-        best_score = -1
-
-        for item in ifs:
-            ip_str = item.get("ip")
-            net = item.get("network")
-
-            # Exact IP match
-            if ip_str == target_ip_str:
-                return item
-
-            score = -1
-            if net and 0 < net.prefixlen < 32:
-                if target_ip_obj in net:
-                    score = 100 + net.prefixlen
-            elif ip_str:
-                for prefix in [31, 30, 29, 28, 24]:
-                    try:
-                        test_net = ipaddress.ip_network(f"{ip_str}/{prefix}", strict=False)
-                        if target_ip_obj in test_net:
-                            score = 20 + prefix
-                            break
-                    except ValueError:
-                        pass
-
-            if score > best_score:
-                best_score = score
-                best_match = item
-
-        return best_match
-
-    def get_interface_record(
-        self, device: Optional[str], iface: Optional[str]
-    ) -> Optional[dict]:
-        """Looks up the interface dictionary for a device and interface name."""
-        if not device or not iface:
-            return None
-        ifs = self.device_interfaces.get(device, [])
-        for item in ifs:
-            if item.get("iface", "").strip().lower() == iface.strip().lower():
-                return item
-        return None
-
-    def resolve_path_interfaces(
-        self,
-        hops: List[Tuple[int, Optional[str]]],
-        target_ip: Optional[str] = None,
-        source_ip: Optional[str] = None,
-    ) -> List[dict]:
-        """
-        Resolves Inbound and Outbound interfaces for every hop in the path by:
-        1. Subnet matching between Device N (outbound) and Device N+1 (inbound).
-        2. Interface subnet containment for source IP (ingress) and target IP (egress).
-        3. Fallback to matched interface on hop IP if direction cannot be disambiguated.
-        Populates individual metadata (vrf, zone, desc) for both IN and OUT interfaces.
-        """
-        resolved_hops: List[dict] = []
-        for h_no, ip in hops:
-            if ip is None:
-                resolved_hops.append({
-                    "hop_no": h_no,
-                    "ip": None,
-                    "device": None,
-                    "matched_iface": None,
-                    "in_iface": None,
-                    "in_ip": None,
-                    "in_zone": "-",
-                    "in_vrf": "-",
-                    "in_desc": "",
-                    "out_iface": None,
-                    "out_ip": None,
-                    "out_zone": "-",
-                    "out_vrf": "-",
-                    "out_desc": "",
-                    "next_hop": "* (timeout)",
-                    "next_in_iface": None,
-                    "zone": "-",
-                    "vrf": "-",
-                    "desc": "",
-                    "is_timeout": True,
-                })
-            else:
-                dev, iface, zone, vrf, desc = self.ip_to_device_map.get(
-                    ip, (None, None, None, None, "")
-                )
-                if not dev and self.resolve_dns:
-                    ptr = get_reverse_dns(ip)
-                    if ptr:
-                        dev = ptr.split(".")[0]
-                resolved_hops.append({
-                    "hop_no": h_no,
-                    "ip": ip,
-                    "device": dev,
-                    "matched_iface": iface,
-                    "in_iface": None,
-                    "in_ip": None,
-                    "in_zone": zone or "-",
-                    "in_vrf": vrf or "-",
-                    "in_desc": "",
-                    "out_iface": None,
-                    "out_ip": None,
-                    "out_zone": zone or "-",
-                    "out_vrf": vrf or "-",
-                    "out_desc": "",
-                    "next_hop": None,
-                    "next_in_iface": None,
-                    "zone": zone or "-",
-                    "vrf": vrf or "-",
-                    "desc": desc or "",
-                    "is_timeout": False,
-                })
-
-        valid_indices = [
-            idx for idx, h in enumerate(resolved_hops) if not h["is_timeout"]
-        ]
-
-        # Link consecutive valid hops
-        for i in range(len(valid_indices) - 1):
-            idx_curr = valid_indices[i]
-            idx_next = valid_indices[i + 1]
-            curr = resolved_hops[idx_curr]
-            next_h = resolved_hops[idx_next]
-            dev_curr = curr["device"]
-            dev_next = next_h["device"]
-            ip_curr = curr["ip"]
-            ip_next = next_h["ip"]
-
-            if dev_curr and dev_next and dev_curr != dev_next:
-                match = self.find_matching_subnet_interfaces(dev_curr, dev_next)
-                if match:
-                    if_out, if_in = match
-                    curr["out_iface"] = if_out["iface"]
-                    curr["out_ip"] = if_out["ip"]
-                    curr["out_zone"] = if_out["zone"]
-                    curr["out_vrf"] = if_out.get("vrf", "-")
-                    curr["out_desc"] = if_out.get("description", "")
-                    next_h["in_iface"] = if_in["iface"]
-                    next_h["in_ip"] = if_in["ip"]
-                    next_h["in_zone"] = if_in["zone"]
-                    next_h["in_vrf"] = if_in.get("vrf", "-")
-                    next_h["in_desc"] = if_in.get("description", "")
-                    curr["next_hop"] = f"{dev_next} ({if_in['iface']})"
-                    curr["next_in_iface"] = f"{dev_next}:{if_in['iface']}"
-                else:
-                    if_out = self.find_interface_by_ip(dev_curr, ip_next)
-                    if if_out:
-                        curr["out_iface"] = if_out["iface"]
-                        curr["out_ip"] = if_out["ip"]
-                        curr["out_zone"] = if_out["zone"]
-                        curr["out_vrf"] = if_out.get("vrf", "-")
-                        curr["out_desc"] = if_out.get("description", "")
-                    if_in = self.find_interface_by_ip(dev_next, ip_curr)
-                    if if_in:
-                        next_h["in_iface"] = if_in["iface"]
-                        next_h["in_ip"] = if_in["ip"]
-                        next_h["in_zone"] = if_in["zone"]
-                        next_h["in_vrf"] = if_in.get("vrf", "-")
-                        next_h["in_desc"] = if_in.get("description", "")
-                    next_in_label = next_h["in_iface"] or ip_next
-                    curr["next_hop"] = f"{dev_next} ({next_in_label})"
-                    curr["next_in_iface"] = f"{dev_next}:{next_in_label}"
-            elif dev_curr and not dev_next:
-                if_out = self.find_interface_by_ip(dev_curr, ip_next)
-                if if_out:
-                    curr["out_iface"] = if_out["iface"]
-                    curr["out_ip"] = if_out["ip"]
-                    curr["out_zone"] = if_out["zone"]
-                    curr["out_vrf"] = if_out.get("vrf", "-")
-                    curr["out_desc"] = if_out.get("description", "")
-                curr["next_hop"] = ip_next
-                curr["next_in_iface"] = ip_next
-            elif not dev_curr and dev_next:
-                if_in = self.find_interface_by_ip(dev_next, ip_curr)
-                if if_in:
-                    next_h["in_iface"] = if_in["iface"]
-                    next_h["in_ip"] = if_in["ip"]
-                    next_h["in_zone"] = if_in["zone"]
-                    next_h["in_vrf"] = if_in.get("vrf", "-")
-                    next_h["in_desc"] = if_in.get("description", "")
-                next_in_label = next_h["in_iface"] or ip_next
-                curr["next_hop"] = f"{dev_next} ({next_in_label})"
-                curr["next_in_iface"] = f"{dev_next}:{next_in_label}"
-            else:
-                curr["next_hop"] = ip_next
-                curr["next_in_iface"] = ip_next
-
-        # Inbound on first valid hop
-        if valid_indices:
-            first_h = resolved_hops[valid_indices[0]]
-            if first_h["in_iface"] is None and first_h["device"]:
-                if source_ip:
-                    if_in = self.find_interface_by_ip(first_h["device"], source_ip)
-                    if if_in:
-                        first_h["in_iface"] = if_in["iface"]
-                        first_h["in_ip"] = if_in["ip"]
-                        first_h["in_zone"] = if_in["zone"]
-                        first_h["in_vrf"] = if_in.get("vrf", "-")
-                        first_h["in_desc"] = if_in.get("description", "")
-                if first_h["in_iface"] is None:
-                    if first_h["matched_iface"] and first_h["matched_iface"] != first_h["out_iface"]:
-                        first_h["in_iface"] = first_h["matched_iface"]
-                    elif first_h["out_iface"] is None and first_h["matched_iface"]:
-                        first_h["out_iface"] = first_h["matched_iface"]
-                        first_h["in_iface"] = "(ingress)"
-                    else:
-                        first_h["in_iface"] = "(ingress)"
-
-        # Outbound on last valid hop
-        if valid_indices:
-            last_h = resolved_hops[valid_indices[-1]]
-            if target_ip:
-                if last_h["ip"] == target_ip:
-                    last_h["out_iface"] = "Connected / Target"
-                    last_h["next_hop"] = "Destination Reached"
-                    last_h["next_in_iface"] = "Target Reached"
-                    last_h["out_desc"] = "Destination Endpoint"
-                elif last_h["device"]:
-                    if_out = self.find_interface_by_ip(last_h["device"], target_ip)
-                    if if_out:
-                        last_h["out_iface"] = if_out["iface"]
-                        last_h["out_ip"] = if_out["ip"]
-                        last_h["out_zone"] = if_out["zone"]
-                        last_h["out_vrf"] = if_out.get("vrf", "-")
-                        last_h["out_desc"] = if_out.get("description", "")
-                        last_h["next_hop"] = f"Target ({target_ip})"
-                        last_h["next_in_iface"] = f"Target:{target_ip}"
-                    else:
-                        last_h["next_hop"] = f"Target ({target_ip})"
-                        last_h["next_in_iface"] = f"Target:{target_ip}"
-            if last_h["out_iface"] is None:
-                if last_h["matched_iface"] and last_h["matched_iface"] != last_h["in_iface"]:
-                    last_h["out_iface"] = last_h["matched_iface"]
-                else:
-                    last_h["out_iface"] = last_h["matched_iface"] or "-"
-
-        # Fill remaining fallbacks and lookup descriptions for both interfaces
-        for h in resolved_hops:
-            if not h["is_timeout"]:
-                if not h["out_iface"]:
-                    h["out_iface"] = h["matched_iface"] or "-"
-                if not h["in_iface"]:
-                    if h["matched_iface"] and h["matched_iface"] != h["out_iface"]:
-                        h["in_iface"] = h["matched_iface"]
-                    else:
-                        h["in_iface"] = "-"
-
-                dev = h.get("device")
-                # Inbound interface metadata
-                in_if = h.get("in_iface")
-                if in_if and in_if not in {"-", "(ingress)"} and dev:
-                    rec_in = self.get_interface_record(dev, in_if)
-                    if rec_in:
-                        if not h.get("in_desc"):
-                            h["in_desc"] = rec_in.get("description", "")
-                        if not h.get("in_zone") or h["in_zone"] == "-":
-                            h["in_zone"] = rec_in.get("zone", "-")
-                        if not h.get("in_vrf") or h["in_vrf"] == "-":
-                            h["in_vrf"] = rec_in.get("vrf", "-")
-                        if not h.get("in_ip"):
-                            h["in_ip"] = rec_in.get("ip")
-                elif in_if == "(ingress)":
-                    if not h.get("in_desc"):
-                        h["in_desc"] = "(ingress from source)"
-
-                # Outbound interface metadata
-                out_if = h.get("out_iface")
-                if out_if and out_if not in {"-", "Connected / Target"} and dev:
-                    rec_out = self.get_interface_record(dev, out_if)
-                    if rec_out:
-                        if not h.get("out_desc"):
-                            h["out_desc"] = rec_out.get("description", "")
-                        if not h.get("out_zone") or h["out_zone"] == "-":
-                            h["out_zone"] = rec_out.get("zone", "-")
-                        if not h.get("out_vrf") or h["out_vrf"] == "-":
-                            h["out_vrf"] = rec_out.get("vrf", "-")
-                        if not h.get("out_ip"):
-                            h["out_ip"] = rec_out.get("ip")
-                elif out_if == "Connected / Target":
-                    if not h.get("out_desc"):
-                        h["out_desc"] = "Destination Endpoint"
-
-                # Direct IP lookup fallback for description
-                if h.get("ip"):
-                    desc = self.get_iface_description(h["ip"])
-                    if desc:
-                        if h.get("matched_iface") == in_if and not h.get("in_desc"):
-                            h["in_desc"] = desc
-                        if h.get("matched_iface") == out_if and not h.get("out_desc"):
-                            h["out_desc"] = desc
-
-                in_z = h.get("in_zone")
-                out_z = h.get("out_zone")
-                if (
-                    in_z
-                    and out_z
-                    and in_z != out_z
-                    and in_z != "Unknown"
-                    and out_z != "Unknown"
-                    and in_z != "-"
-                    and out_z != "-"
-                ):
-                    h["zone"] = f"{in_z} -> {out_z}"
-                elif out_z and out_z not in {"Unknown", "-"}:
-                    h["zone"] = out_z
-                elif in_z and in_z not in {"Unknown", "-"}:
-                    h["zone"] = in_z
-
-        return resolved_hops
-
-    def format_path_flow(self, resolved_hops: List[dict]) -> List[str]:
-        """Generates formatted lines showing end-to-end device/link path flow."""
-        lines = []
-        valid_hops = [h for h in resolved_hops if not h.get("is_timeout")]
-        if not valid_hops:
-            return ["  (No responsive hops recorded)"]
-
-        for idx, h in enumerate(valid_hops):
-            dev = h.get("device") or h.get("ip") or "Unknown"
-            in_if = h.get("in_iface") or "-"
-            out_if = h.get("out_iface") or "-"
-            ip_str = h.get("ip", "")
-
-            # Zone formatting: prefer zone, or infer from in_zone -> out_zone
-            zone = h.get("zone")
-            if not zone or zone == "-":
-                in_z = h.get("in_zone")
-                out_z = h.get("out_zone")
-                if (
-                    in_z
-                    and out_z
-                    and in_z != out_z
-                    and in_z not in {"-", "Unknown"}
-                    and out_z not in {"-", "Unknown"}
-                ):
-                    zone = f"{in_z} -> {out_z}"
-                elif out_z and out_z not in {"-", "Unknown"}:
-                    zone = out_z
-                elif in_z and in_z not in {"-", "Unknown"}:
-                    zone = in_z
-            zone_str = f" [{zone}]" if zone and zone != "-" else ""
-
-            node_str = f"  [{idx + 1}] {dev} (IP: {ip_str}){zone_str} [In: {in_if} | Out: {out_if}]"
-            lines.append(node_str)
-
-            # Link connecting to next hop
-            if idx < len(valid_hops) - 1:
-                next_h = valid_hops[idx + 1]
-                next_dev = next_h.get("device") or next_h.get("ip") or "Unknown"
-                next_in = next_h.get("in_iface") or "-"
-                if next_in == "-" and next_h.get("ip"):
-                    next_target = f"{next_dev}:{next_h.get('ip')}"
-                else:
-                    next_target = f"{next_dev}:{next_in}"
-
-                if out_if == "-" and ip_str:
-                    src_target = f"{dev}:{ip_str}"
-                else:
-                    src_target = f"{dev}:{out_if}"
-
-                link_desc = f"{src_target} ⇄ {next_target}"
-                lines.append(f"       ↳ Link: {link_desc}")
-            elif h.get("next_hop") and "Destination Reached" in h.get("next_hop", ""):
-                lines.append(f"       ↳ Destination Reached ({ip_str})")
-            elif h.get("next_hop") and "Connected" in h.get("next_hop", ""):
-                lines.append(f"       ↳ Destination Reached ({ip_str})")
-            elif h.get("next_hop"):
-                lines.append(f"       ↳ Towards: {h['next_hop']}")
-            else:
-                lines.append(f"       ↳ Destination Reached ({ip_str})")
-
-        return lines
-
     # ───── display helpers ────────────────────────────────────────────────────
-    def _display_resolved_hop(self, rec: dict) -> None:
-        """Prints one hop across 2 lines: line 1 for INBOUND, line 2 for OUTBOUND."""
-        hop_no = rec.get("hop_no", 0)
-        ip = rec.get("ip")
-        if ip is None or rec.get("is_timeout"):
-            print(f"{hop_no:>2}   {'* * * (timeout)':<20}")
+    def _display_hop(self, hop_no: int, ip: Optional[str]) -> None:
+        """Prints one hop line with PTR + inventory info."""
+        if ip is None:
+            print(f"{hop_no:>2}   * * *  (timeout)")
             return
 
         ptr = None
         if self.resolve_dns:
             ptr = get_reverse_dns(ip)
 
+        device, iface, zone, vrf, description = self.ip_to_device_map.get(ip, (None, None, None, None, None))
         show_ip = f"{ip} ({ptr})" if ptr else ip
-        device = rec.get("device") or "External/Unknown"
 
-        in_iface = rec.get("in_iface") or "-"
-        out_iface = rec.get("out_iface") or "-"
-        next_hop = rec.get("next_hop") or "-"
-
-        in_zone = rec.get("in_zone") or "-"
-        out_zone = rec.get("out_zone") or "-"
-        in_vrf = rec.get("in_vrf") or "-"
-        out_vrf = rec.get("out_vrf") or "-"
-
-        in_desc = rec.get("in_desc") or ""
-        out_desc = rec.get("out_desc") or ""
-
-        # Extra info per interface
-        dev_for_info = device if device != "External/Unknown" else None
-        in_info = self.get_extra_info(
-            rec.get("in_ip"),
-            dev_for_info,
-            in_iface if in_iface not in {"-", "(ingress)"} else None,
-        )
-        out_info = self.get_extra_info(
-            rec.get("out_ip"),
-            dev_for_info,
-            out_iface if out_iface not in {"-", "Connected / Target"} else None,
-        )
-
-        if in_info:
-            in_desc = f"{in_desc} [Info: {in_info}]" if in_desc else f"[Info: {in_info}]"
-        if out_info:
-            out_desc = f"{out_desc} [Info: {out_info}]" if out_desc else f"[Info: {out_info}]"
-
-        # Check addon subnet match on hop IP
-        addons = self.check_addon_subnet(ip)
-        if addons:
-            devs = sorted(list(set(d for _, d, _ in addons)))
-            dev_str = ", ".join(devs)
-            in_desc = f"{in_desc} [Sub: {dev_str}]" if in_desc else f"[Sub: {dev_str}]"
-
-        in_desc_show = in_desc or "-"
-        out_desc_show = out_desc or "-"
-
-        # Line 1: INBOUND interface
-        print(
-            f"{hop_no:>2}   {show_ip:<20} {device[:18]:<18} {'IN':<4} {in_iface[:18]:<18} "
-            f"{'-':<24} {in_zone[:14]:<14} {in_vrf[:10]:<10} {in_desc_show}"
-        )
-        # Line 2: OUTBOUND interface
-        print(
-            f"{'':>2}   {'':<20} {'':<18} {'OUT':<4} {out_iface[:18]:<18} "
-            f"{next_hop[:24]:<24} {out_zone[:14]:<14} {out_vrf[:10]:<10} {out_desc_show}"
-        )
-
-    def _display_hop(self, hop_no: int, ip: Optional[str]) -> None:
-        """Fallback single-hop display."""
-        if ip is None:
-            print(f"{hop_no:>2}   {'* * * (timeout)':<20}")
-            return
-        rec = self.resolve_path_interfaces([(hop_no, ip)])[0]
-        self._display_resolved_hop(rec)
-
-    def display_full_path_summary(
-        self,
-        resolved_hops: List[dict],
-        hops: List[Tuple[int, Optional[str]]],
-        destination_reached: bool,
-    ) -> None:
-        """Displays full path table, path flow, and traceroute summary."""
-        print("\n" + "=" * 150)
-        print("FULL END-TO-END PATH (INBOUND & OUTBOUND INTERFACES)")
-        print("=" * 150)
-        print(
-            f"{'No':>2}   {'IP Address':<20} {'Device Name':<18} {'Dir':<4} {'Interface':<18} "
-            f"{'Next Hop (In Int)':<24} {'Zone':<14} {'VRF':<10} {'Description'}"
-        )
-        print("-" * 150)
-        for rec in resolved_hops:
-            self._display_resolved_hop(rec)
-        print("-" * 150)
-
-        # Flow Diagram
-        print("\nPATH FLOW:")
-        flow_lines = self.format_path_flow(resolved_hops)
-        for line in flow_lines:
-            print(line)
-
-        print("\n" + "=" * 150)
-        print("SUMMARY")
-        print("=" * 150)
-        print(f"Hops recorded: {len(hops)}")
-        print(f"Destination reached: {'Yes' if destination_reached else 'No'}")
+        if device:
+            # Check for addon subnet match to append as extra info
+            addons = self.check_addon_subnet(ip)
+            extra = ""
+            if addons:
+                 # Join multiple matches if any
+                 # Format: [Sub: Dev1, Dev2]
+                 devs = sorted(list(set(d for _, d, _ in addons)))
+                 dev_str = ", ".join(devs)
+                 extra = f" [Sub: {dev_str}]"
+                 
+            info = self.get_extra_info(ip, device, iface)
+            if info:
+                extra += f" [Info: {info}]"
+            print(
+                f"{hop_no:>2}   {show_ip:<40}  {device:<20} {iface:<20} {zone:<15} {vrf:<15} {description}{extra}"
+            )
+        else:
+            # Check for addon subnet match if no device found
+            addons = self.check_addon_subnet(ip)
+            if addons:
+                for _net, dev_name, info in addons:
+                    # Format: Matches 10.x.x.x/24 (Behind dev) [Info]
+                    match_str = f"Matches {str(_net)} (Behind {dev_name}) [{info}]"
+                    print(f"{hop_no:>2}   {show_ip:<40}  {match_str}")
+            else:
+                print(f"{hop_no:>2}   {show_ip:<40}  External/Unknown")
 
     # ───── main trace routine ────────────────────────────────────────────────
     def trace_to_destination_streaming(
@@ -978,13 +404,13 @@ class CiscoTracerouteMapper:
         if description:
             title += f"  ({description})"
         print(title)
-
+        
         # Check addon info
         addon_data_list = self.check_addon_subnet(target_ip)
         if addon_data_list:
             for _net, dev, info in addon_data_list:
                 print(f"ℹ️  ADDON INFO: Matches {str(_net)} (Behind {dev}) [{info}]")
-
+            
         print("=" * 80)
 
         # pre-flight ping
@@ -993,77 +419,32 @@ class CiscoTracerouteMapper:
         else:
             print("⚠️  Ping unreachable, continuing anyway…")
 
-        print("-" * 150)
-        print(
-            f"{'No':>2}   {'IP Address':<20} {'Device Name':<18} {'Dir':<4} {'Interface':<18} "
-            f"{'Next Hop (In Int)':<24} {'Zone':<14} {'VRF':<10} {'Description'}"
-        )
-        print("-" * 150)
+        print("-" * 80)
+        print("-" * 80)
+        print(f"{'No':>2}   {'IP Address':<40}  {'Device Name':<20} {'Interface':<20} {'Zone':<15} {'VRF':<15} {'Description'}")
+        print("-" * 80)
+
 
         hops: List[Tuple[int, Optional[str]]] = []
         destination_reached = False
-        buffered_hop: Optional[Tuple[int, Optional[str]]] = None
-        prev_valid_hop: Optional[Tuple[int, str]] = None
 
         try:
             for hop_no, ip in self.execute_traceroute_streaming(target_ip):
                 hops.append((hop_no, ip))
-
-                if buffered_hop is not None:
-                    # Resolve buffered_hop using lookahead context
-                    sub_hops = []
-                    if prev_valid_hop:
-                        sub_hops.append(prev_valid_hop)
-                    sub_hops.append(buffered_hop)
-                    if ip is not None:
-                        sub_hops.append((hop_no, ip))
-
-                    resolved = self.resolve_path_interfaces(
-                        sub_hops, target_ip=target_ip
-                    )
-                    target_rec = next(
-                        (r for r in resolved if r["hop_no"] == buffered_hop[0]), None
-                    )
-                    if target_rec:
-                        self._display_resolved_hop(target_rec)
-                    if buffered_hop[1] is not None:
-                        prev_valid_hop = (buffered_hop[0], buffered_hop[1])
-
-                if ip is None:
-                    # Timeout hop: print immediately
-                    self._display_hop(hop_no, None)
-                    buffered_hop = None
-                else:
-                    buffered_hop = (hop_no, ip)
-
+                self._display_hop(hop_no, ip)
                 if ip == target_ip:
                     destination_reached = True
                     break
                 time.sleep(0.3)  # small pacing for readability
-
-            # Flush remaining buffered hop
-            if buffered_hop is not None:
-                sub_hops = []
-                if prev_valid_hop:
-                    sub_hops.append(prev_valid_hop)
-                sub_hops.append(buffered_hop)
-                resolved = self.resolve_path_interfaces(
-                    sub_hops, target_ip=target_ip
-                )
-                target_rec = next(
-                    (r for r in resolved if r["hop_no"] == buffered_hop[0]), None
-                )
-                if target_rec:
-                    self._display_resolved_hop(target_rec)
-
         except KeyboardInterrupt:
             print("\nInterrupted by user.")
-            if buffered_hop is not None:
-                self._display_hop(buffered_hop[0], buffered_hop[1])
 
-        # Full end-to-end path resolution & summary
-        full_resolved = self.resolve_path_interfaces(hops, target_ip=target_ip)
-        self.display_full_path_summary(full_resolved, hops, destination_reached)
+        # summary
+        print("\n" + "=" * 80)
+        print("SUMMARY")
+        print("=" * 80)
+        print(f"Hops recorded: {len(hops)}")
+        print(f"Destination reached: {'Yes' if destination_reached else 'No'}")
 
     # ───── wrappers for hostname/IP ───────────────────────────────────────────
     def trace_to_destination(self, target: str, description: str = "") -> None:
@@ -1577,21 +958,14 @@ class CiscoTracerouteMapper:
         
         for orig_target, ip in resolved_targets:
             print(f"\n► Target: {orig_target}")
-            hop_map = trace_results.get(ip, {})
-            target_hops = [(h, hop_map[h]) for h in sorted(hop_map.keys())]
-            target_resolved = {
-                r["hop_no"]: r for r in self.resolve_path_interfaces(target_hops, target_ip=ip)
-            }
-
+            
             # A. Verification Status
             matches = match_details.get(orig_target, [])
             if matches:
                 print(f"  ✓ VERIFIED: Found {len(matches)} monitored hop(s):")
                 for h, ip_str, dev, mtype in matches:
-                    r = target_resolved.get(h)
-                    in_out = f" [In: {r['in_iface']} | Out: {r['out_iface']}]" if r else ""
                     info_s = self._details_suffix(ip_str)
-                    print(f"    - Hop {h:<2}: {dev:<20}{in_out} ({ip_str}){info_s}")
+                    print(f"    - Hop {h:<2}: {dev:<20} ({ip_str}){info_s}")
             else:
                 if monitored_devices or manual_ips or manual_subnets:
                     print(f"  ❌ FAILURE: Did NOT pass through expected devices.")
@@ -1605,10 +979,8 @@ class CiscoTracerouteMapper:
                 for h, ip_str, dev in sightings:
                     # Mark if this was one of the verified ones
                     is_ver = " (Verified)" if any(m[1] == ip_str for m in matches) else ""
-                    r = target_resolved.get(h)
-                    in_out = f" [In: {r['in_iface']} | Out: {r['out_iface']}]" if r else ""
                     info_s = self._details_suffix(ip_str)
-                    print(f"    - Hop {h:<2}: {dev:<20}{in_out} ({ip_str}){is_ver}{info_s}")
+                    print(f"    - Hop {h:<2}: {dev:<20} ({ip_str}){is_ver}{info_s}")
 
     # ───── source ↔ destination (WAN aware) ──────────────────────────────────
     def _hop_device(self, ip: Optional[str]) -> Optional[str]:
@@ -1667,67 +1039,30 @@ class CiscoTracerouteMapper:
     def _print_combined_path(
         self, path: List[Tuple[str, Optional[str], str]]
     ) -> None:
-        """Prints stitched path rows with Inbound and Outbound interfaces."""
-        hop_items = [(idx + 1, ip) for idx, (_, ip, _) in enumerate(path) if ip is not None]
-        resolved_map = {}
-        if hop_items:
-            resolved_list = self.resolve_path_interfaces(hop_items)
-            for r in resolved_list:
-                resolved_map[r["hop_no"]] = r
-
+        """Prints stitched path rows: (segment, ip_or_None, note)."""
         print("-" * 150)
-        print(
-            f"{'#':>3}  {'Segment':<10} {'IP Address':<16} {'Device Name':<18} {'Dir':<4} "
-            f"{'Interface':<18} {'Next Hop (In Int)':<22} {'Zone':<12} {'VRF':<8} {'Description':<25} Note"
-        )
+        print(f"{'#':>3}  {'Segment':<10} {'IP Address':<16} {'Device Name':<25} "
+              f"{'Interface':<22} {'Zone':<12} {'Description':<30} Note")
         print("-" * 150)
         n = 0
-        resolved_for_flow = []
         for seg, ip, note in path:
             if seg == "WAN":
                 print(f"{'':>3}  {'':<10} {'≈' * 18}  {note}  {'≈' * 18}")
                 continue
             n += 1
             if ip is None:
-                print(f"{n:>3}  {seg:<10} {'*':<16} {'(timeout)':<18}")
+                print(f"{n:>3}  {seg:<10} {'*':<16} {'(timeout)':<25}")
                 continue
-            r = resolved_map.get(n)
-            dev, matched_iface, zone = self._hop_info(ip)
-            in_iface = r.get("in_iface") if r else "-"
-            out_iface = r.get("out_iface") if r else (matched_iface or "-")
-            next_hop = r.get("next_hop") if r else "-"
-
-            in_zone = r.get("in_zone") if r and r.get("in_zone") and r["in_zone"] != "-" else zone
-            out_zone = r.get("out_zone") if r and r.get("out_zone") and r["out_zone"] != "-" else zone
-            in_vrf = r.get("in_vrf", "-") if r else "-"
-            out_vrf = r.get("out_vrf", "-") if r else "-"
-
-            in_desc = r.get("in_desc") if r and r.get("in_desc") else self.get_iface_description(ip)
-            out_desc = r.get("out_desc") if r and r.get("out_desc") else self.get_iface_description(ip)
-
-            wan_note = "🌐 WAN router" if self._is_wan_router(self._hop_device(ip)) else ""
-            full_note = f"{note} {wan_note}".strip() if note else wan_note
-
-            # Line 1: INBOUND
-            print(
-                f"{n:>3}  {seg:<10} {ip:<16} {dev[:18]:<18} {'IN':<4} "
-                f"{in_iface[:18]:<18} {'-':<22} {in_zone[:12]:<12} {in_vrf[:8]:<8} {in_desc[:25]:<25} {full_note}"
-            )
-            # Line 2: OUTBOUND
-            print(
-                f"{'':>3}  {'':<10} {'':<16} {'':<18} {'OUT':<4} "
-                f"{out_iface[:18]:<18} {next_hop[:22]:<22} {out_zone[:12]:<12} {out_vrf[:8]:<8} {out_desc[:25]:<25}"
-            )
-            if r:
-                resolved_for_flow.append(r)
+            dev, iface, zone = self._hop_info(ip)
+            desc = self.get_iface_description(ip)
+            if self._is_wan_router(self._hop_device(ip)):
+                note = (note + " " if note else "") + "🌐 WAN router"
+            info = self.get_extra_info(ip)
+            if info:
+                note = (note + " " if note else "") + f"[Info: {info}]"
+            print(f"{n:>3}  {seg:<10} {ip:<16} {dev[:25]:<25} {iface[:22]:<22} "
+                  f"{zone[:12]:<12} {desc[:30]:<30} {note}")
         print("-" * 150)
-
-        # Flow Diagram
-        if resolved_for_flow:
-            print("\nPATH FLOW:")
-            for line in self.format_path_flow(resolved_for_flow):
-                print(line)
-            print("-" * 150)
 
     def trace_source_destination(self, source: str, destination: str) -> None:
         """

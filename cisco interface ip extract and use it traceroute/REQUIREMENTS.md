@@ -139,3 +139,52 @@ Or via unittest:
 ```bash
 python3 -m unittest "cisco interface ip extract and use it traceroute/test_cisco_extractor.py"
 ```
+
+---
+
+## 4. Requirements & Specifications: TraceINT Subnet-Based Inbound & Outbound Interface Traceroute Mapping (`TraceINT.py`)
+
+### Overview
+In traceroute results, previous versions only displayed a single interface column matching whichever IP responded to the probe (typically either the ingress or egress interface). 
+
+The enhanced engine (`TraceINT.py` / `TraceINTv3.11.py`) resolves and displays **both Inbound and Outbound interfaces** for each hop across the network path, connecting consecutive devices into an end-to-end full path.
+
+### Core Logic & Rules
+1. **Subnet-Based Interface Correlation**:
+   - Outbound interface on Device $N$ and Inbound interface on Device $N+1$ share the same point-to-point / transit subnet (e.g. `/30`, `/31`, `/29`, `/24`).
+   - The engine searches all interfaces of Device $N$ and Device $N+1$ to find the pair $(if_{out}, if_{in})$ residing in the same IP network.
+2. **Hop IP Ambiguity Resolution**:
+   - Whether a hop IP in traceroute responds with its ingress interface or egress interface, the opposite interface is automatically disambiguated by matching against adjacent hop links.
+3. **Target & Source Subnet Containment**:
+   - The first hop's Inbound interface is resolved by testing containment of the source IP.
+   - The last hop's Outbound interface is resolved by testing containment of the destination target IP.
+4. **Intermediate Timeout Resilience**:
+   - If a hop times out (`* * *`), adjacent devices are still evaluated for direct or transit link relationships.
+5. **Security Zone Transition Visibility**:
+   - If the Inbound interface and Outbound interface reside in different security zones (e.g. `Trust` and `Untrust`), the zone is clearly presented as `Trust -> Untrust`.
+6. **Live Lookahead Streaming**:
+   - During live traceroute execution, a 1-hop lookahead buffer resolves and displays both interfaces in real time as probes complete.
+7. **Full Path Flow Diagram**:
+   - At the completion of the trace, a visual flow diagram details every link, interface pair, and subnet along the end-to-end trajectory.
+8. **2-Line Hop Presentation (Individual Inbound & Outbound Descriptions)**:
+   - Each hop row is rendered across **2 distinct lines**:
+     - **Line 1 (IN)**: Displays `Dir=IN`, inbound interface name, inbound security zone, inbound VRF, and the inbound interface's description/info.
+     - **Line 2 (OUT)**: Displays `Dir=OUT`, outbound interface name, next-hop device/interface link, outbound security zone, outbound VRF, and the outbound interface's description/info.
+
+### Test Suite (`test_trace_int.py`)
+| Test Method | Description |
+| :--- | :--- |
+| `test_parse_ip_and_network` | Validates CIDR, space-separated masks, secondary IPs, plain IPs, and unassigned/dynamic strings |
+| `test_find_matching_subnet_interfaces` | Verifies point-to-point subnet matching between devices |
+| `test_find_interface_by_ip` | Verifies IP and subnet containment search on device interfaces |
+| `test_full_path_resolution` | Verifies end-to-end resolution of Inbound, Outbound, Next Hop, and Zone transitions |
+| `test_resolution_when_hop_ip_is_ingress_interface` | Verifies resolution when hop IP responds as ingress rather than egress |
+| `test_resolution_with_timeout_hop` | Verifies stability and resolution when intermediate hops time out |
+| `test_two_line_hop_descriptions` | Verifies individual inbound and outbound interface description extraction per hop |
+| `test_format_path_flow` | Verifies formatting of the visual link flow diagram |
+| `test_streaming_output_display` | Verifies 2-line streaming output headers, columns, and full path summary |
+
+Run via:
+```bash
+python3 -m unittest "cisco interface ip extract and use it traceroute/test_trace_int.py" -v
+```

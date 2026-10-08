@@ -510,14 +510,21 @@ class ModernPortfolioApp:
                 cell.config(bg=self.card_bg)
                 lbl_t.config(bg=self.card_bg, fg=self.text_muted)
                 lbl_v.config(bg=self.card_bg)
-        for tree in [getattr(self, "holdings_tree", None), getattr(self, "history_tree", None), getattr(self, "alloc_tree", None), getattr(self, "drip_tree", None)]:
+        for tree in [getattr(self, "holdings_tree", None), getattr(self, "history_tree", None), getattr(self, "alloc_tree", None), getattr(self, "drip_tree", None), getattr(self, "watchlist_tree", None)]:
             if tree:
                 tree.tag_configure("positive", foreground=self.green_color)
                 tree.tag_configure("negative", foreground=self.red_color)
                 tree.tag_configure("neutral", foreground=self.tree_fg)
+        if hasattr(self, "watchlist_tree"):
+            bg_hit = "#e6f4ea" if not self.dark_mode else "#183b27"
+            self.watchlist_tree.tag_configure("reached_positive", foreground=self.green_color, background=bg_hit, font=("Segoe UI", 9, "bold"))
+            self.watchlist_tree.tag_configure("reached_negative", foreground=self.red_color, background=bg_hit, font=("Segoe UI", 9, "bold"))
+            self.watchlist_tree.tag_configure("reached", foreground=self.green_color, background=bg_hit, font=("Segoe UI", 9, "bold"))
         self._update_filter_button_styles()
         self._refresh_holdings_table()
         self._refresh_analytics_tab()
+        if hasattr(self, "_refresh_watchlist_tab"):
+            self._refresh_watchlist_tab()
         if hasattr(self, "drip_canvas"):
             self._calc_drip_results()
         if hasattr(self, "chart_view"):
@@ -1146,7 +1153,7 @@ class ModernPortfolioApp:
             ]
             for col, heading_txt in fire_cols:
                 try:
-                    self.fire_holdings_tree.heading(col, text=heading_txt)
+                    self.fire_holdings_tree.heading(col, text=heading_txt, command=lambda c=col: self._sort_fire_holdings_by(c))
                 except Exception:
                     pass
         if hasattr(self, "fire_s2_box"):
@@ -3897,11 +3904,11 @@ class ModernPortfolioApp:
         )
         tree_scroll.config(command=self.fire_holdings_tree.yview)
 
-        self.fire_holdings_tree.heading("symbol", text=t("col_symbol"))
-        self.fire_holdings_tree.heading("name", text=t("col_name"))
-        self.fire_holdings_tree.heading("value", text=t("col_market_value"))
-        self.fire_holdings_tree.heading("weight", text=t("col_weight"))
-        self.fire_holdings_tree.heading("asset_class", text=t("lbl_holding_asset_class"))
+        self.fire_holdings_tree.heading("symbol", text=t("col_symbol"), command=lambda: self._sort_fire_holdings_by("symbol"))
+        self.fire_holdings_tree.heading("name", text=t("col_name"), command=lambda: self._sort_fire_holdings_by("name"))
+        self.fire_holdings_tree.heading("value", text=t("col_market_value"), command=lambda: self._sort_fire_holdings_by("value"))
+        self.fire_holdings_tree.heading("weight", text=t("col_weight"), command=lambda: self._sort_fire_holdings_by("weight"))
+        self.fire_holdings_tree.heading("asset_class", text=t("lbl_holding_asset_class"), command=lambda: self._sort_fire_holdings_by("asset_class"))
 
         self.fire_holdings_tree.column("symbol", width=75, anchor="center")
         self.fire_holdings_tree.column("name", width=120, anchor="w")
@@ -4337,6 +4344,41 @@ class ModernPortfolioApp:
         # Initial calculation
         self._refresh_fire_tab()
 
+    def _sort_fire_holdings_by(self, col: str):
+        """Sorts the Step 1 FIRE holdings table by clicked column header."""
+        if not hasattr(self, "fire_holdings_tree"):
+            return
+        if not hasattr(self, "_fire_sort_desc"):
+            self._fire_sort_desc = {}
+        desc = not self._fire_sort_desc.get(col, False)
+        self._fire_sort_desc[col] = desc
+
+        col_map = {"symbol": 0, "name": 1, "value": 2, "weight": 3, "asset_class": 4}
+        idx = col_map.get(col, 0)
+
+        items = self.fire_holdings_tree.get_children("")
+        data = []
+        for iid in items:
+            vals = self.fire_holdings_tree.item(iid, "values")
+            tags = self.fire_holdings_tree.item(iid, "tags")
+            data.append((vals, tags))
+
+        def parse_val(entry):
+            raw = str(entry[0][idx]).strip()
+            if col in ("value", "weight"):
+                clean = raw.replace("$", "").replace("%", "").replace(",", "").replace(" ", "")
+                try:
+                    return (0, float(clean))
+                except ValueError:
+                    return (1, raw)
+            return (0, raw.lower())
+
+        data.sort(key=parse_val, reverse=desc)
+        for iid in items:
+            self.fire_holdings_tree.delete(iid)
+        for vals, tags in data:
+            self.fire_holdings_tree.insert("", tk.END, values=vals, tags=tags)
+
     def _refresh_fire_tab(self):
         """Refreshes holding audit, gap calculations, and roadmap recommendations on tab_fire."""
         if not hasattr(self, "tab_fire") or not hasattr(self, "fire_holdings_tree"):
@@ -4352,14 +4394,24 @@ class ModernPortfolioApp:
         for item in self.fire_holdings_tree.get_children():
             self.fire_holdings_tree.delete(item)
 
-        total_shares_val = 0.0
-        parsed_holdings = []
+        aggregated_holdings: Dict[str, Dict[str, Any]] = {}
         for h in self.holdings:
+            raw_sym = (h.get("symbol") or "").strip()
+            if not raw_sym:
+                continue
+            sym_key = raw_sym.upper()
+
             c = (h.get("currency") or "USD").strip().upper()
-            shares = float(h.get("shares", 0.0))
-            price = float(h.get("current_price", h.get("price", 0.0)))
+            shares = float(h.get("shares", 0.0) or 0.0)
+            price = float(h.get("current_price", h.get("price", 0.0)) or 0.0)
             mv = shares * price
-            ad = float(h.get("annual_dividend", 0.0))
+            if mv <= 0.0 and h.get("market_value") is not None:
+                try:
+                    mv = float(str(h["market_value"]).replace("$", "").replace(",", "").strip())
+                except ValueError:
+                    pass
+
+            ad = float(h.get("annual_dividend", 0.0) or 0.0)
             mv_conv = self.converter.convert(mv, c, target_curr)
             ad_conv = self.converter.convert(ad, c, target_curr)
 
@@ -4372,12 +4424,47 @@ class ModernPortfolioApp:
             else:
                 cur_equity_val += mv_conv
 
-            parsed_holdings.append({
-                "symbol": (h.get("symbol") or "").strip(),
-                "name": (h.get("name") or "").strip(),
-                "value": mv_conv,
-                "aclass": aclass,
-            })
+            raw_name = (h.get("name") or "").strip()
+            if sym_key not in aggregated_holdings:
+                aggregated_holdings[sym_key] = {
+                    "symbol": raw_sym,
+                    "name": raw_name or raw_sym,
+                    "shares": shares,
+                    "value": mv_conv,
+                    "annual_dividend": ad_conv,
+                    "currency": target_curr,
+                    "aclass": aclass,
+                    "expense_ratio": h.get("expense_ratio"),
+                    "mer": h.get("mer"),
+                    "sector": h.get("sector"),
+                }
+            else:
+                agg = aggregated_holdings[sym_key]
+                agg["shares"] += shares
+                agg["value"] += mv_conv
+                agg["annual_dividend"] += ad_conv
+                cur_n = agg.get("name", "")
+                if (not cur_n or cur_n == agg["symbol"]) and raw_name:
+                    agg["name"] = raw_name
+                if aclass == "safe":
+                    agg["aclass"] = "safe"
+
+        # Calculate unit price for each aggregated holding
+        combined_holdings = []
+        for agg in aggregated_holdings.values():
+            if agg["value"] <= 0.001 and agg["shares"] <= 0.001:
+                continue
+            if agg["shares"] > 0:
+                agg["current_price"] = agg["value"] / agg["shares"]
+                agg["price"] = agg["current_price"]
+            else:
+                agg["current_price"] = 0.0
+                agg["price"] = 0.0
+            combined_holdings.append(agg)
+
+        # Sort by value descending so largest portfolio holdings appear at top
+        combined_holdings.sort(key=lambda x: x["value"], reverse=True)
+        self._last_combined_fire_holdings = combined_holdings
 
         # Add outside safe assets
         raw_outside = ""
@@ -4390,8 +4477,8 @@ class ModernPortfolioApp:
         total_effective_safe = cur_safe_val + outside_safe
         total_effective_wealth = cur_total_val + outside_safe
 
-        # Insert items into treeview
-        for ph in parsed_holdings:
+        # Insert aggregated items into treeview
+        for ph in combined_holdings:
             w_pct = (ph["value"] / cur_total_val * 100.0) if cur_total_val > 0 else 0.0
             tag = "safe_asset" if ph["aclass"] == "safe" else "equity_asset"
             aclass_label = t("col_class_safe") if ph["aclass"] == "safe" else t("col_class_equity")
@@ -4400,7 +4487,7 @@ class ModernPortfolioApp:
                 tk.END,
                 values=(
                     ph["symbol"],
-                    ph["name"][:18],
+                    ph["name"],
                     self.converter.format_money(ph["value"], target_curr),
                     f"{w_pct:.1f}%",
                     aclass_label,
@@ -4524,7 +4611,7 @@ class ModernPortfolioApp:
             essential_monthly_expense=ess_exp,
             discretionary_monthly_expense=disc_exp,
             current_cape=cape_val,
-            holdings=self.holdings,
+            holdings=combined_holdings,
         )
         self._last_fire_res = res
 
@@ -4698,7 +4785,8 @@ class ModernPortfolioApp:
 
         # Build holding-level target dictionary
         suggested_weights = {}
-        for h in self.holdings:
+        fire_holdings = getattr(self, "_last_combined_fire_holdings", self.holdings)
+        for h in fire_holdings:
             sym = (h.get("symbol") or "").strip().upper()
             aclass = self._get_holding_asset_class(h)
             if aclass == "safe":
@@ -5912,7 +6000,8 @@ class ModernPortfolioApp:
         cur_safe = float(res.get("current_safe_assets", 0.0))
         tot_p = float(res.get("current_portfolio_val", getattr(self, "_last_total_portfolio_wealth", 0.0)))
         if not d_data:
-            d_data = calc_deep_risk_diagnostic(self.holdings, cur_safe, tot_p, self.summary_currency)
+            fire_holdings = getattr(self, "_last_combined_fire_holdings", self.holdings)
+            d_data = calc_deep_risk_diagnostic(fire_holdings, cur_safe, tot_p, self.summary_currency)
 
         dlg = tk.Toplevel(self.root)
         dlg.title(t("dlg_deep_risk_title"))
@@ -6425,8 +6514,9 @@ class ModernPortfolioApp:
             sel_reg = region_map.get(reg_key, "Canada")
             sel_acct = acct_map.get(acct_key, "Taxable")
 
+            fire_holdings = getattr(self, "_last_combined_fire_holdings", self.holdings)
             f_res = calc_fee_and_tax_drag_autopsy(
-                holdings=self.holdings,
+                holdings=fire_holdings,
                 portfolio_val=tot_p,
                 annual_dividend=cur_div,
                 region=sel_reg,
@@ -6501,7 +6591,8 @@ class ModernPortfolioApp:
         reb_data = res.get("rebalance_5_25_data")
         tot_p = float(res.get("current_portfolio_val", getattr(self, "_last_total_portfolio_wealth", 0.0)))
         if not reb_data:
-            reb_data = calc_rebalancing_5_25_bands(self.holdings, target_weights=None, total_portfolio_val=tot_p)
+            fire_holdings = getattr(self, "_last_combined_fire_holdings", self.holdings)
+            reb_data = calc_rebalancing_5_25_bands(fire_holdings, target_weights=None, total_portfolio_val=tot_p)
 
         dlg = tk.Toplevel(self.root)
         dlg.title(t("dlg_rebalance_5_25_title"))
@@ -6657,7 +6748,8 @@ class ModernPortfolioApp:
             cur_age = int(res.get("current_age", getattr(self, "_last_current_age", 45)))
 
         tot_p = float(res.get("current_portfolio_val", getattr(self, "_last_total_portfolio_wealth", 0.0)))
-        simp_data = calc_simplicity_index(self.holdings, current_age=cur_age, total_portfolio_val=tot_p)
+        fire_holdings = getattr(self, "_last_combined_fire_holdings", self.holdings)
+        simp_data = calc_simplicity_index(fire_holdings, current_age=cur_age, total_portfolio_val=tot_p)
 
         dlg = tk.Toplevel(self.root)
         dlg.title(t("dlg_simplicity_title"))
@@ -12038,7 +12130,14 @@ class ModernPortfolioApp:
 
         self.watchlist_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        self.watchlist_tree.tag_configure("reached", foreground="#16a34a", font=("Segoe UI", 9, "bold"))
+        # Watchlist Row Color Tags: Gains, Losses, and Target Reached Alerts
+        bg_hit = "#e6f4ea" if not self.dark_mode else "#183b27"
+        self.watchlist_tree.tag_configure("positive", foreground=self.green_color, font=("Segoe UI", 9, "bold"))
+        self.watchlist_tree.tag_configure("negative", foreground=self.red_color, font=("Segoe UI", 9, "bold"))
+        self.watchlist_tree.tag_configure("neutral", foreground=self.text_dark)
+        self.watchlist_tree.tag_configure("reached_positive", foreground=self.green_color, background=bg_hit, font=("Segoe UI", 9, "bold"))
+        self.watchlist_tree.tag_configure("reached_negative", foreground=self.red_color, background=bg_hit, font=("Segoe UI", 9, "bold"))
+        self.watchlist_tree.tag_configure("reached", foreground=self.green_color, background=bg_hit, font=("Segoe UI", 9, "bold"))
         self.watchlist_tree.tag_configure("above", foreground=self.text_dark)
         self.watchlist_tree.tag_configure("normal", foreground=self.text_dark)
 
@@ -12157,6 +12256,13 @@ class ModernPortfolioApp:
 
         chg_val_str = f"{chg_val:+.2f}" if chg_val is not None else ""
         day_chg_full = f"{chg_val_str} ({chg_pct})" if chg_val_str else chg_pct
+        if chg_val is not None:
+            c_prefix = "🟢 ▲ " if float(chg_val) > 0 else ("🔴 ▼ " if float(chg_val) < 0 else "")
+            day_chg_full = f"{c_prefix}{day_chg_full}"
+        elif "+" in chg_pct:
+            day_chg_full = f"🟢 ▲ {day_chg_full}"
+        elif "-" in chg_pct and chg_pct != "-":
+            day_chg_full = f"🔴 ▼ {day_chg_full}"
 
         cur_lang = get_current_language()
         is_zh = cur_lang in ("zh_TW", "zh_CN")
@@ -12365,31 +12471,61 @@ class ModernPortfolioApp:
             if not last_updated_str:
                 last_updated_str = added_date if added_date else "-"
 
+            # Parse day change percentage & dollar value
+            c_flt = None
+            if day_change_pct is not None:
+                try:
+                    c_flt = float(day_change_pct)
+                except (ValueError, TypeError):
+                    pass
+            if c_flt is None and day_change_val is not None:
+                try:
+                    c_val = float(day_change_val)
+                    if curr_price > 0 and (curr_price - c_val) > 0:
+                        c_flt = (c_val / (curr_price - c_val)) * 100.0
+                    else:
+                        c_flt = c_val
+                except (ValueError, TypeError):
+                    pass
+
+            change_pct_str = "-"
+            if c_flt is not None:
+                change_pct_str = f"{c_flt:+.2f}%"
+
+            # Parse target price & distance
+            target_reached = False
             diff_str = "-"
             diff_val = 999999.0
             status_str = t("status_monitoring")
-            tag = "normal"
 
             if curr_price > 0 and tgt > 0:
                 diff_pct = ((curr_price - tgt) / tgt) * 100.0
                 diff_val = diff_pct
                 diff_str = f"{diff_pct:+.2f}%"
                 if curr_price <= tgt:
+                    target_reached = True
                     status_str = t("status_target_reached")
-                    tag = "reached"
                     target_reached_count += 1
-                else:
-                    tag = "above"
             elif tgt > 0:
                 status_str = t("status_monitoring")
 
-            change_pct_str = "-"
-            if day_change_pct is not None:
-                try:
-                    c_flt = float(day_change_pct)
-                    change_pct_str = f"{c_flt:+.2f}%"
-                except Exception:
-                    change_pct_str = str(day_change_pct)
+            # Determine colorful row tag based on price raise/drop and target status
+            if target_reached:
+                if c_flt is not None and c_flt > 0:
+                    tag = "reached_positive"
+                elif c_flt is not None and c_flt < 0:
+                    tag = "reached_negative"
+                else:
+                    tag = "reached"
+            else:
+                if c_flt is not None and c_flt > 0:
+                    tag = "positive"
+                elif c_flt is not None and c_flt < 0:
+                    tag = "negative"
+                elif curr_price > 0 and tgt > 0 and curr_price > tgt:
+                    tag = "above"
+                else:
+                    tag = "neutral"
 
             pe_display = f"{float(pe_val):.1f}" if pe_val is not None else "-"
             div_display = f"{float(div_yield_val):.2f}%" if div_yield_val is not None and float(div_yield_val) > 0 else "-"
@@ -12417,7 +12553,7 @@ class ModernPortfolioApp:
                 "current": curr_price,
                 "curr_display": curr_display,
                 "change_pct": change_pct_str,
-                "day_change_raw": float(day_change_pct) if day_change_pct is not None else -9999.0,
+                "day_change_raw": c_flt if c_flt is not None else -9999.0,
                 "target": tgt,
                 "tgt_display": tgt_display,
                 "diff": diff_str,
@@ -12526,7 +12662,9 @@ class ModernPortfolioApp:
 
         if hasattr(self, "lbl_watchlist_stats"):
             total_items = len(rows)
-            stats_txt = f"{t('tab_monitoring')}: {total_items}  |  {t('status_target_reached')}: {target_reached_count}"
+            gainers_count = sum(1 for r in rows if r["day_change_raw"] > 0)
+            losers_count = sum(1 for r in rows if -9990.0 < r["day_change_raw"] < 0)
+            stats_txt = f"{t('tab_monitoring')}: {total_items} (📈 {gainers_count}  📉 {losers_count})  |  {t('status_target_reached')}: {target_reached_count}"
             if getattr(self, "is_fetching", False):
                 stats_txt += f"  |  🔄 {t('msg_updating_background')}"
             self.lbl_watchlist_stats.config(text=stats_txt)
