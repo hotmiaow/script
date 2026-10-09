@@ -21,10 +21,37 @@ import unittest
 from contextlib import redirect_stdout
 from unittest.mock import patch
 
-from TraceINT import CiscoTracerouteMapper, parse_ip_and_network
+from TraceINT import (
+    CiscoTracerouteMapper,
+    parse_ip_and_network,
+    parse_transit_subnets,
+    TraceINTGUI,
+    TKINTER_AVAILABLE,
+)
 
 
 class TestTraceINTHelpers(unittest.TestCase):
+    def test_parse_transit_subnets(self):
+        # 1. Comma separated
+        self.assertEqual(parse_transit_subnets("30, 31, 29, 28"), {28, 29, 30, 31})
+        self.assertEqual(parse_transit_subnets("/30, /31, /29, /28"), {28, 29, 30, 31})
+
+        # 2. Range notation
+        self.assertEqual(parse_transit_subnets("28-31"), {28, 29, 30, 31})
+        self.assertEqual(parse_transit_subnets("/28-/31"), {28, 29, 30, 31})
+
+        # 3. Custom selection
+        self.assertEqual(parse_transit_subnets("30, 31"), {30, 31})
+        self.assertEqual(parse_transit_subnets("/29 /30"), {29, 30})
+
+        # 4. Iterables
+        self.assertEqual(parse_transit_subnets([30, 31]), {30, 31})
+        self.assertEqual(parse_transit_subnets({28, 29}), {28, 29})
+
+        # 5. Invalid input falls back to default {28, 29, 30, 31}
+        self.assertEqual(parse_transit_subnets(""), {28, 29, 30, 31})
+        self.assertEqual(parse_transit_subnets("invalid"), {28, 29, 30, 31})
+
     def test_parse_ip_and_network(self):
         # 1. Standard CIDR
         ip, net = parse_ip_and_network("10.1.1.1/24")
@@ -120,6 +147,48 @@ class TestSubnetInterfaceResolution(unittest.TestCase):
         # No direct link between R1 and R3
         match_13 = self.mapper.find_matching_subnet_interfaces("R1", "R3")
         self.assertIsNone(match_13)
+
+    def test_transit_subnets_focus_and_configurability(self):
+        # 1. Verify default transit subnets
+        self.assertEqual(self.mapper.transit_subnets, {28, 29, 30, 31})
+        self.assertEqual(self.mapper.get_transit_subnets_display(), "/28, /29, /30, /31")
+
+        # 2. Add devices D_A and D_B that only share a /24 subnet (e.g. Management LAN)
+        self._add_iface("D_A", "mgmt0", "10.88.88.1/24", "Mgmt", "default", "Management")
+        self._add_iface("D_B", "mgmt0", "10.88.88.2/24", "Mgmt", "default", "Management")
+
+        # Under default settings (focus on /30, /31, /29, /28), /24 is ignored for transit matching
+        match_ab_default = self.mapper.find_matching_subnet_interfaces("D_A", "D_B")
+        self.assertIsNone(match_ab_default)
+
+        # 3. Add a /30 link between D_A and D_B
+        self._add_iface("D_A", "Gi0/1", "10.77.77.1/30", "Transit", "default", "Transit link")
+        self._add_iface("D_B", "Gi0/1", "10.77.77.2/30", "Transit", "default", "Transit link")
+
+        # Now it must match the /30 link Gi0/1, NOT the /24 mgmt0 link
+        match_ab_with_p2p = self.mapper.find_matching_subnet_interfaces("D_A", "D_B")
+        self.assertIsNotNone(match_ab_with_p2p)
+        if_a, if_b = match_ab_with_p2p
+        self.assertEqual(if_a["iface"], "Gi0/1")
+        self.assertEqual(if_b["iface"], "Gi0/1")
+
+        # 4. Reconfigure transit subnets to allow /24
+        self.mapper.set_transit_subnets("24, 30")
+        self.assertEqual(self.mapper.transit_subnets, {24, 30})
+        self.assertEqual(self.mapper.get_transit_subnets_display(), "/24, /30")
+
+        # Remove the /30 link and verify /24 is now matched
+        self.mapper.device_interfaces["D_A"] = [
+            i for i in self.mapper.device_interfaces["D_A"] if i["iface"] != "Gi0/1"
+        ]
+        self.mapper.device_interfaces["D_B"] = [
+            i for i in self.mapper.device_interfaces["D_B"] if i["iface"] != "Gi0/1"
+        ]
+        match_ab_reconfig = self.mapper.find_matching_subnet_interfaces("D_A", "D_B")
+        self.assertIsNotNone(match_ab_reconfig)
+        if_a2, if_b2 = match_ab_reconfig
+        self.assertEqual(if_a2["iface"], "mgmt0")
+        self.assertEqual(if_b2["iface"], "mgmt0")
 
     def test_find_interface_by_ip(self):
         # Target in R3's port2 subnet (172.16.0.0/24)
@@ -347,6 +416,138 @@ class TestSubnetInterfaceResolution(unittest.TestCase):
         self.assertEqual(flow_output, expected)
 
 
+@unittest.skipUnless(TKINTER_AVAILABLE, "Tkinter is required for GUI tests")
+class TestTraceINTGUI(unittest.TestCase):
+    def setUp(self):
+        import tkinter as tk
+        self.root = tk.Tk()
+        self.mapper = CiscoTracerouteMapper()
+        self.gui = TraceINTGUI(self.root, mapper=self.mapper)
+
+    def tearDown(self):
+        self.root.destroy()
+
+    def test_gui_columns_and_treeview(self):
+        expected_cols = (
+            "hop",
+            "ip",
+            "device",
+            "dir",
+            "interface",
+            "next_hop",
+            "zone",
+            "vrf",
+            "description",
+            "extra_info",
+        )
+        self.assertEqual(self.gui.columns, expected_cols)
+        # Verify columns exist on the treeview
+        for col in expected_cols:
+            self.assertIn(col, self.gui.tree["columns"])
+
+    def test_column_width_adjustability(self):
+        # Test manual column width adjustment (dragging column separator)
+        self.gui.tree.column("description", width=450)
+        self.assertEqual(self.gui.tree.column("description", "width"), 450)
+
+        # Test reset column widths
+        self.gui.reset_column_widths()
+        self.assertEqual(self.gui.tree.column("description", "width"), 280)
+
+        # Test auto-fit columns with sample data
+        sample_hops = [
+            {
+                "hop_no": 1,
+                "ip": "10.0.0.1",
+                "device": "Core-SW",
+                "in_iface": "Vlan100",
+                "out_iface": "Gi1/0/1",
+                "zone": "Trust",
+                "next_hop": "Edge-FW:port1",
+                "in_desc": "User Access Segment with a particularly long text description",
+                "out_desc": "Uplink to Edge Firewall",
+            }
+        ]
+        self.gui._render_resolved_table(sample_hops, target_ip="10.0.0.2")
+        # Auto-fit should have adjusted the description column wider
+        w = self.gui.tree.column("description", "width")
+        self.assertGreater(w, 200)
+
+    def test_two_line_hop_rendering_in_table(self):
+        sample_hops = [
+            {
+                "hop_no": 1,
+                "ip": "10.0.0.1",
+                "device": "Core-SW",
+                "in_iface": "Vlan100",
+                "out_iface": "Gi1/0/1",
+                "zone": "Trust",
+                "next_hop": "Edge-FW:port1",
+                "in_desc": "User Access Segment",
+                "out_desc": "Uplink to Edge Firewall",
+            }
+        ]
+        self.gui._render_resolved_table(sample_hops, target_ip="10.0.0.1")
+        items = self.gui.tree.get_children()
+        # Should have 2 items (rows) for this hop: 1 IN, 1 OUT
+        self.assertEqual(len(items), 2)
+
+        # Row 1: IN
+        row1_vals = self.gui.tree.item(items[0], "values")
+        self.assertEqual(row1_vals[0], "1")
+        self.assertEqual(row1_vals[1], "10.0.0.1")
+        self.assertEqual(row1_vals[2], "Core-SW")
+        self.assertEqual(row1_vals[3], "IN")
+        self.assertEqual(row1_vals[4], "Vlan100")
+        self.assertEqual(row1_vals[8], "User Access Segment")
+
+        # Row 2: OUT
+        row2_vals = self.gui.tree.item(items[1], "values")
+        self.assertEqual(row2_vals[0], "")
+        self.assertEqual(row2_vals[3], "OUT")
+        self.assertEqual(row2_vals[4], "Gi1/0/1")
+        self.assertEqual(row2_vals[5], "Edge-FW:port1")
+        self.assertEqual(row2_vals[8], "Uplink to Edge Firewall")
+
+    def test_path_flow_rendering_in_gui(self):
+        sample_hops = [
+            {
+                "hop_no": 1,
+                "ip": "10.0.0.1",
+                "device": "Core-SW",
+                "in_iface": "Vlan100",
+                "out_iface": "Gi1/0/1",
+                "zone": "Trust",
+                "next_hop": "Edge-FW:port1",
+            },
+            {
+                "hop_no": 2,
+                "ip": "10.0.0.2",
+                "device": "Edge-FW",
+                "in_iface": "port1",
+                "out_iface": "Connected/Target",
+                "zone": "Untrust",
+                "next_hop": "Destination Reached",
+            },
+        ]
+        self.gui._render_path_flow(sample_hops)
+        flow_text = self.gui.flow_text.get("1.0", "end")
+        self.assertIn("PATH FLOW:", flow_text)
+        self.assertIn("Core-SW:Gi1/0/1 ⇄ Edge-FW:port1", flow_text)
+        self.assertIn("Destination Reached", flow_text)
+
+    def test_gui_transit_subnets_field(self):
+        # 1. Default transit subnets displayed
+        self.assertEqual(self.gui.transit_subnets_var.get(), "/28, /29, /30, /31")
+
+        # 2. Reconfigure via GUI variable and apply
+        self.gui.transit_subnets_var.set("30, 31")
+        self.gui._apply_settings_to_mapper()
+        self.assertEqual(self.gui.mapper.transit_subnets, {30, 31})
+        self.assertEqual(self.gui.transit_subnets_var.get(), "/30, /31")
+
+
 if __name__ == "__main__":
     unittest.main()
+
 

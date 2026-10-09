@@ -150,9 +150,14 @@ In traceroute results, previous versions only displayed a single interface colum
 The enhanced engine (`TraceINT.py` / `TraceINTv3.11.py`) resolves and displays **both Inbound and Outbound interfaces** for each hop across the network path, connecting consecutive devices into an end-to-end full path.
 
 ### Core Logic & Rules
-1. **Subnet-Based Interface Correlation**:
-   - Outbound interface on Device $N$ and Inbound interface on Device $N+1$ share the same point-to-point / transit subnet (e.g. `/30`, `/31`, `/29`, `/24`).
-   - The engine searches all interfaces of Device $N$ and Device $N+1$ to find the pair $(if_{out}, if_{in})$ residing in the same IP network.
+1. **Subnet-Based Interface Correlation (Transit Link Focus)**:
+   - Outbound interface on Device $N$ and Inbound interface on Device $N+1$ share a point-to-point or transit subnet.
+   - **Default Focused Transit Subnets**: Focuses strictly on `/30`, `/31`, `/29`, and `/28` subnets (prefix lengths: `31, 30, 29, 28`). Larger subnets (e.g. `/24`, `/16`, shared management/LAN subnets) are excluded from inter-device transit matching by default to prevent false-positive links.
+   - **Fully Configurable**:
+     - CLI option: `-p` / `--transit-subnets` (e.g. `--transit-subnets "30,31,29,28"` or `"--transit-subnets 28-31"`).
+     - Interactive menu: Option `6. Configure Traceroute Settings` allows editing transit subnets.
+     - GUI: Editable `Transit Subnets:` input field in the top settings panel.
+     - Flexible parsing: Accepts comma/space separated lists (`30, 31, 29, 28`), slash notation (`/30, /31, /29, /28`), range notation (`28-31`, `/28-/31`), or lists/sets.
 2. **Hop IP Ambiguity Resolution**:
    - Whether a hop IP in traceroute responds with its ingress interface or egress interface, the opposite interface is automatically disambiguated by matching against adjacent hop links.
 3. **Target & Source Subnet Containment**:
@@ -174,17 +179,58 @@ The enhanced engine (`TraceINT.py` / `TraceINTv3.11.py`) resolves and displays *
 ### Test Suite (`test_trace_int.py`)
 | Test Method | Description |
 | :--- | :--- |
+| `test_parse_transit_subnets` | Validates parsing comma lists, slash notation, ranges (`28-31`), iterables, and fallback |
 | `test_parse_ip_and_network` | Validates CIDR, space-separated masks, secondary IPs, plain IPs, and unassigned/dynamic strings |
 | `test_find_matching_subnet_interfaces` | Verifies point-to-point subnet matching between devices |
+| `test_transit_subnets_focus_and_configurability` | Verifies `/30, /31, /29, /28` focus (excluding `/24`), prioritization over shared LANs, and reconfigurability |
 | `test_find_interface_by_ip` | Verifies IP and subnet containment search on device interfaces |
 | `test_full_path_resolution` | Verifies end-to-end resolution of Inbound, Outbound, Next Hop, and Zone transitions |
 | `test_resolution_when_hop_ip_is_ingress_interface` | Verifies resolution when hop IP responds as ingress rather than egress |
 | `test_resolution_with_timeout_hop` | Verifies stability and resolution when intermediate hops time out |
 | `test_two_line_hop_descriptions` | Verifies individual inbound and outbound interface description extraction per hop |
 | `test_format_path_flow` | Verifies formatting of the visual link flow diagram |
+| `test_exact_path_flow_format` | Verifies exact matching of PATH FLOW diagram with link arrows and target endpoints |
 | `test_streaming_output_display` | Verifies 2-line streaming output headers, columns, and full path summary |
+| `test_gui_columns_and_treeview` | Verifies GUI Treeview initialization and 10 configured columns |
+| `test_column_width_adjustability` | Verifies manual dragging, programmatic resizing, auto-fit, and reset column widths |
+| `test_gui_transit_subnets_field` | Verifies GUI Transit Subnets setting display and real-time reconfigurability |
+| `test_two_line_hop_rendering_in_table` | Verifies 2-line hop rows (IN and OUT) rendered into GUI Treeview with tags |
+| `test_path_flow_rendering_in_gui` | Verifies PATH FLOW diagram rendered in GUI Text view |
 
 Run via:
 ```bash
 python3 -m unittest "cisco interface ip extract and use it traceroute/test_trace_int.py" -v
 ```
+
+---
+
+## 5. Requirements & Specifications: Graphical User Interface (`TraceINTGUI`)
+
+### Overview
+A native desktop GUI is provided directly in `TraceINT.py` (and `TraceINTv3.11.py`), requiring **zero external dependencies** (built strictly on Python standard library `tkinter` and `ttk`).
+
+### Core Features & Rules
+1. **Zero External Dependencies**:
+   - Uses exclusively `tkinter`, `tkinter.ttk`, `queue`, `threading`, and standard library utilities.
+   - Runs cleanly on any Python 3.8+ system without `pip install` prerequisites.
+2. **Adjustable Column Widths**:
+   - Built on `ttk.Treeview`. Users can click and drag the divider between any column headers to adjust column widths freely.
+   - Includes an **`↔ Auto-fit Column Widths`** button that dynamically measures text width and resizes all columns to fit their content perfectly.
+   - Includes a **`↺ Reset Column Widths`** button to restore preset defaults.
+   - Double-clicking any column header auto-fits that specific column.
+   - Right-click context menu provides quick auto-fit, reset, row copying, and export options.
+3. **2-Line Hop Path Table**:
+   - Renders both Inbound (`IN`) and Outbound (`OUT`) interfaces on adjacent rows for every hop with clear alternating visual tags.
+   - Displays all 10 columns: `#`, `IP Address`, `Device Name`, `Dir`, `Interface`, `Next Hop (In Int)`, `Zone`, `VRF`, `Description`, `Extra Info`.
+   - Distinguishes timeout hops and destination reached endpoints with dedicated styling.
+4. **Interactive PATH FLOW Diagram**:
+   - A dedicated tab displays the formatted ASCII link flow diagram connecting each device and link.
+   - Quick **`📋 Copy PATH FLOW`** and **`💾 Save Flow as Text`** buttons.
+5. **Non-Blocking Background Tracing & Cancellation**:
+   - Traces execute in a background thread with real-time thread-safe queue updates so the interface remains responsive.
+   - A **`⏹ Stop`** button allows instant termination of active traceroute subprocesses.
+6. **Launch Options**:
+   - CLI flag: `python3 TraceINT.py --gui` or `python3 TraceINT.py -g`
+   - Interactive console menu: Option `8. Launch GUI Interface`
+   - Programmatic: `from TraceINT import launch_gui; launch_gui()`
+

@@ -27,7 +27,17 @@ import subprocess
 import sys
 import time
 import concurrent.futures
-from typing import Dict, List, Optional, Tuple, Set
+import queue
+import threading
+from typing import Dict, List, Optional, Tuple, Set, Any
+
+try:
+    import tkinter as tk
+    from tkinter import ttk, filedialog, messagebox
+    import tkinter.font as tkfont
+    TKINTER_AVAILABLE = True
+except ImportError:
+    TKINTER_AVAILABLE = False
 
 # ──────────────────────────────────────────────────────────────────────────────
 # DNS helpers
@@ -102,6 +112,66 @@ def parse_ip_and_network(
             return None, None
 
 
+def parse_transit_subnets(spec: Any) -> Set[int]:
+    """
+    Parses prefix lengths from string, list, or set.
+    Supports formats like:
+      - '30, 31, 29, 28'
+      - '/30, /31, /29, /28'
+      - '28-31' or '/28-/31'
+      - [28, 29, 30, 31]
+    Returns a set of integers, e.g. {28, 29, 30, 31}.
+    """
+    if isinstance(spec, (set, list, tuple)):
+        result = set()
+        for x in spec:
+            try:
+                v = int(str(x).strip().lstrip("/"))
+                if 1 <= v <= 32:
+                    result.add(v)
+            except ValueError:
+                pass
+        return result or {28, 29, 30, 31}
+
+    if not isinstance(spec, str):
+        return {28, 29, 30, 31}
+
+    result = set()
+    cleaned = spec.strip()
+    range_match = re.match(r"^/?(\d+)\s*-\s*/?(\d+)$", cleaned)
+    if range_match:
+        start, end = int(range_match.group(1)), int(range_match.group(2))
+        if start > end:
+            start, end = end, start
+        for v in range(start, end + 1):
+            if 1 <= v <= 32:
+                result.add(v)
+        return result or {28, 29, 30, 31}
+
+    tokens = re.split(r"[,;\s]+", cleaned)
+    for token in tokens:
+        token = token.strip().lstrip("/")
+        if not token:
+            continue
+        sub_range = re.match(r"^(\d+)-(\d+)$", token)
+        if sub_range:
+            start, end = int(sub_range.group(1)), int(sub_range.group(2))
+            if start > end:
+                start, end = end, start
+            for v in range(start, end + 1):
+                if 1 <= v <= 32:
+                    result.add(v)
+            continue
+        try:
+            val = int(token)
+            if 1 <= val <= 32:
+                result.add(val)
+        except ValueError:
+            pass
+
+    return result or {28, 29, 30, 31}
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Core class
 # ──────────────────────────────────────────────────────────────────────────────
@@ -123,11 +193,23 @@ class CiscoTracerouteMapper:
         self.max_retries: int = 2
         # Device-name keyword identifying WAN routers (case-insensitive)
         self.wan_keyword: str = "wanr"
+        # Allowed transit subnet prefix lengths for inter-device link matching (default: /30, /31, /29, /28)
+        self.transit_subnets: Set[int] = {28, 29, 30, 31}
         # Addon subnets: list of (network_obj, behind_device_str, info_str)
         self.addon_subnets: List[Tuple[ipaddress.IPv4Network, str, str]] = []
         # Additional interface info (same columns as inventory + 'info')
         self.extra_info_by_ip: Dict[str, List[str]] = {}
         self.extra_info_by_iface: Dict[Tuple[str, str], List[str]] = {}
+
+    def set_transit_subnets(self, spec: Any) -> None:
+        """Configures allowed subnet prefix lengths for inter-device link matching."""
+        self.transit_subnets = parse_transit_subnets(spec)
+
+    def get_transit_subnets_display(self) -> str:
+        """Returns readable string of transit subnets, e.g. '/28, /29, /30, /31'."""
+        if not self.transit_subnets:
+            return "(none)"
+        return ", ".join(f"/{p}" for p in sorted(self.transit_subnets))
 
     # ───── CSV loader ────────────────────────────────────────────────────────
     def load_csv_data(self) -> bool:
@@ -349,7 +431,11 @@ class CiscoTracerouteMapper:
         return None
 
     def execute_traceroute_streaming(
-        self, target_ip: str, source_ip: Optional[str] = None
+        self,
+        target_ip: str,
+        source_ip: Optional[str] = None,
+        stop_event: Optional[threading.Event] = None,
+        proc_callback: Optional[Any] = None,
     ):
         """
         Generator yielding (hop_no, ip_or_None) in real time.
@@ -380,6 +466,8 @@ class CiscoTracerouteMapper:
                 bufsize=1,
                 universal_newlines=True,
             )
+            if proc_callback:
+                proc_callback(proc)
         except FileNotFoundError:
             print("Traceroute executable not found on this system.")
             return
@@ -388,6 +476,13 @@ class CiscoTracerouteMapper:
             return
 
         while True:
+            if stop_event and stop_event.is_set():
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+                break
+
             line = proc.stdout.readline()
             if not line:
                 if proc.poll() is not None:
@@ -399,7 +494,13 @@ class CiscoTracerouteMapper:
                 hop_no, ip, _ = parsed
                 yield hop_no, ip
 
-        proc.wait(timeout=10)
+        try:
+            proc.wait(timeout=2)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
 
     # ───── subnet-based path interface resolution ─────────────────────────────
     def find_matching_subnet_interfaces(
@@ -408,6 +509,7 @@ class CiscoTracerouteMapper:
         """
         Finds an interface on dev1 (outbound) and an interface on dev2 (inbound)
         that reside in the same subnet / IP network.
+        Focuses on configured transit subnets (default: /30, /31, /29, /28).
         Returns (iface_dev1_dict, iface_dev2_dict) or None.
         """
         if not dev1 or not dev2 or dev1 == dev2:
@@ -418,20 +520,29 @@ class CiscoTracerouteMapper:
         if not ifs1 or not ifs2:
             return None
 
+        allowed_prefixes = self.transit_subnets or {28, 29, 30, 31}
         best_match = None
         best_score = -1
 
         for if1 in ifs1:
-            ip1_str = if1.get("ip")
             net1 = if1.get("network")
+            if net1 and net1.prefixlen not in allowed_prefixes and net1.prefixlen != 32:
+                # if1 is explicitly in a non-transit subnet (e.g. /24, /16)
+                continue
+
+            ip1_str = if1.get("ip")
             try:
                 ip1_obj = ipaddress.ip_address(ip1_str) if ip1_str else None
             except ValueError:
                 ip1_obj = None
 
             for if2 in ifs2:
-                ip2_str = if2.get("ip")
                 net2 = if2.get("network")
+                if net2 and net2.prefixlen not in allowed_prefixes and net2.prefixlen != 32:
+                    # if2 is explicitly in a non-transit subnet (e.g. /24, /16)
+                    continue
+
+                ip2_str = if2.get("ip")
                 try:
                     ip2_obj = ipaddress.ip_address(ip2_str) if ip2_str else None
                 except ValueError:
@@ -439,8 +550,13 @@ class CiscoTracerouteMapper:
 
                 score = -1
 
-                # 1. Exact network match (both have network, prefixlen < 32 and > 0)
-                if net1 and net2 and 0 < net1.prefixlen < 32 and 0 < net2.prefixlen < 32:
+                # 1. Exact network match (both have network, prefixlen in allowed transit subnets)
+                if (
+                    net1
+                    and net2
+                    and net1.prefixlen in allowed_prefixes
+                    and net2.prefixlen in allowed_prefixes
+                ):
                     if net1 == net2:
                         score = 200 + net1.prefixlen
                     elif ip2_obj and ip2_obj in net1:
@@ -448,17 +564,17 @@ class CiscoTracerouteMapper:
                     elif ip1_obj and ip1_obj in net2:
                         score = 150 + net2.prefixlen
 
-                # 2. One has network, one has IP
-                elif net1 and 0 < net1.prefixlen < 32 and ip2_obj:
+                # 2. One has network in allowed transit subnets, one has IP
+                elif net1 and net1.prefixlen in allowed_prefixes and ip2_obj:
                     if ip2_obj in net1:
                         score = 150 + net1.prefixlen
-                elif net2 and 0 < net2.prefixlen < 32 and ip1_obj:
+                elif net2 and net2.prefixlen in allowed_prefixes and ip1_obj:
                     if ip1_obj in net2:
                         score = 150 + net2.prefixlen
 
-                # 3. Neither has network, check point-to-point /30, /31, etc.
+                # 3. Neither has network or networks don't match, test point-to-point subnets in allowed prefixes
                 elif ip1_obj and ip2_obj:
-                    for prefix in [31, 30, 29, 28, 24]:
+                    for prefix in sorted(allowed_prefixes, reverse=True):
                         try:
                             test_net = ipaddress.ip_network(f"{ip1_str}/{prefix}", strict=False)
                             if ip2_obj in test_net:
@@ -1878,6 +1994,12 @@ class CiscoTracerouteMapper:
             new_kw = input(f"WAN router keyword [{self.wan_keyword}]: ").strip()
             if new_kw:
                 self.wan_keyword = new_kw
+
+            new_subnets = input(
+                f"Transit subnets (e.g. 30,31,29,28 or 28-31) [{self.get_transit_subnets_display()}]: "
+            ).strip()
+            if new_subnets:
+                self.set_transit_subnets(new_subnets)
         except ValueError:
             print("Invalid entry – settings unchanged.")
         print("Settings now:")
@@ -1885,6 +2007,7 @@ class CiscoTracerouteMapper:
         print(f"  timeout  = {self.timeout_base}s")
         print(f"  retries  = {self.max_retries}")
         print(f"  wan kw   = {self.wan_keyword}")
+        print(f"  transit  = {self.get_transit_subnets_display()}")
 
     def interactive_menu(self) -> None:
         while True:
@@ -1899,9 +2022,10 @@ class CiscoTracerouteMapper:
             print("5. Trace Source ↔ Destination (WAN-aware combined path)")
             print("6. Configure Traceroute Settings")
             print(f"7. Toggle DNS Resolution (Current: {dns_state})")
-            print("8. Exit")
+            print("8. Launch GUI Interface")
+            print("9. Exit")
             print("-" * 80)
-            choice = input("Select option (1-8): ").strip()
+            choice = input("Select option (1-9): ").strip()
 
             if choice == "1":
                 self.display_device_inventory()
@@ -1929,11 +2053,976 @@ class CiscoTracerouteMapper:
                 self.resolve_dns = not self.resolve_dns
                 print(f"DNS Resolution is now { 'ON' if self.resolve_dns else 'OFF' }")
             elif choice == "8":
+                launch_gui(mapper=self)
+            elif choice == "9":
                 print("Good-bye!")
                 break
             else:
                 print("Invalid selection.")
             input("\nPress Enter to continue…")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# GUI Interface (Tkinter & TTK - Standard Library Only)
+# ──────────────────────────────────────────────────────────────────────────────
+class TraceINTGUI:
+    """
+    Graphical User Interface for Cisco Network Traceroute Mapper.
+    Uses Python standard library (tkinter & ttk) with zero external dependencies.
+    Provides resizable columns, live updates, 2-line hop tables, and PATH FLOW diagrams.
+    """
+
+    def __init__(self, root: Any, mapper: Optional[CiscoTracerouteMapper] = None):
+        if not TKINTER_AVAILABLE:
+            raise RuntimeError("Tkinter is not available in this Python installation.")
+
+        self.root = root
+        self.root.title("Cisco Network Traceroute Mapper (TraceINT GUI)")
+        self.root.geometry("1240x820")
+        self.root.minsize(920, 600)
+
+        # Apply ttk theme if available
+        style = ttk.Style(self.root)
+        available_themes = style.theme_names()
+        for preferred in ("clam", "vista", "alt", "default"):
+            if preferred in available_themes:
+                try:
+                    style.theme_use(preferred)
+                except Exception:
+                    pass
+                break
+
+        self.mapper = mapper if mapper is not None else CiscoTracerouteMapper()
+        self.queue = queue.Queue()
+        self.stop_event = threading.Event()
+        self.is_tracing = False
+        self.active_proc = None
+        self.last_resolved_hops = []
+
+        self._init_variables()
+        self._build_ui()
+        self._bind_events()
+        self.load_inventory()
+
+        # Start periodic queue polling
+        self.root.after(50, self._process_queue)
+
+    def _init_variables(self) -> None:
+        self.target_var = tk.StringVar()
+        self.source_var = tk.StringVar()
+        self.csv_var = tk.StringVar(value=self.mapper.csv_file or "network_interfaces.csv")
+        self.extra_info_var = tk.StringVar(value="additional_int_info.csv")
+        self.wan_var = tk.StringVar(value=self.mapper.wan_keyword or "wanr")
+        self.max_hops_var = tk.StringVar(value=str(self.mapper.max_hops or 30))
+        self.timeout_var = tk.StringVar(value=str(self.mapper.timeout_base or 2))
+        self.dns_var = tk.BooleanVar(value=self.mapper.resolve_dns)
+        self.transit_subnets_var = tk.StringVar(value=self.mapper.get_transit_subnets_display())
+        self.status_var = tk.StringVar(value="Ready")
+        self.stats_var = tk.StringVar(value="Inventory: 0 devices")
+
+        # Column definitions: (default_width, min_width, stretch_boolean)
+        self.columns = (
+            "hop",
+            "ip",
+            "device",
+            "dir",
+            "interface",
+            "next_hop",
+            "zone",
+            "vrf",
+            "description",
+            "extra_info",
+        )
+        self.col_titles = {
+            "hop": "No",
+            "ip": "IP Address",
+            "device": "Device Name",
+            "dir": "Dir",
+            "interface": "Interface",
+            "next_hop": "Next Hop (In Int)",
+            "zone": "Zone",
+            "vrf": "VRF",
+            "description": "Description",
+            "extra_info": "Extra Info",
+        }
+        self.default_col_widths = {
+            "hop": (50, 35, False),
+            "ip": (145, 80, False),
+            "device": (150, 80, False),
+            "dir": (55, 40, False),
+            "interface": (130, 70, False),
+            "next_hop": (180, 90, False),
+            "zone": (120, 60, False),
+            "vrf": (80, 50, False),
+            "description": (280, 100, True),
+            "extra_info": (180, 80, False),
+        }
+
+    def _build_ui(self) -> None:
+        main_container = ttk.Frame(self.root, padding="8 8 8 6")
+        main_container.pack(fill="both", expand=True)
+
+        # Top Control & Settings Panel
+        self._build_input_panel(main_container)
+
+        # Center Notebook: Table, Path Flow, Console Log
+        self._build_notebook(main_container)
+
+        # Bottom Status Bar
+        self._build_status_bar(main_container)
+
+    def _build_input_panel(self, parent: ttk.Frame) -> None:
+        input_frame = ttk.LabelFrame(parent, text=" Traceroute Target & Settings ", padding="10 8 10 8")
+        input_frame.pack(fill="x", padx=2, pady=(0, 6))
+
+        # Row 1: Target and Source inputs
+        row1 = ttk.Frame(input_frame)
+        row1.pack(fill="x", pady=2)
+
+        ttk.Label(row1, text="Target (IP / Host):", font=("TkDefaultFont", 9, "bold")).pack(side="left", padx=(0, 4))
+        self.target_entry = ttk.Entry(row1, textvariable=self.target_var, width=24)
+        self.target_entry.pack(side="left", padx=(0, 16))
+        self.target_entry.focus_set()
+
+        ttk.Label(row1, text="Source (Optional / WAN):").pack(side="left", padx=(0, 4))
+        self.source_entry = ttk.Entry(row1, textvariable=self.source_var, width=22)
+        self.source_entry.pack(side="left", padx=(0, 16))
+
+        ttk.Label(row1, text="WAN Keyword:").pack(side="left", padx=(0, 4))
+        ttk.Entry(row1, textvariable=self.wan_var, width=8).pack(side="left", padx=(0, 16))
+
+        ttk.Label(row1, text="Max Hops:").pack(side="left", padx=(0, 4))
+        ttk.Spinbox(row1, from_=1, to=255, textvariable=self.max_hops_var, width=4).pack(side="left", padx=(0, 12))
+
+        ttk.Label(row1, text="Timeout (s):").pack(side="left", padx=(0, 4))
+        ttk.Spinbox(row1, from_=1, to=30, textvariable=self.timeout_var, width=4).pack(side="left", padx=(0, 12))
+
+        ttk.Checkbutton(row1, text="Resolve DNS", variable=self.dns_var).pack(side="left")
+
+        # Row 2: CSV Paths & Transit Subnets
+        row2 = ttk.Frame(input_frame)
+        row2.pack(fill="x", pady=(6, 2))
+
+        ttk.Label(row2, text="Inventory CSV:").pack(side="left", padx=(0, 4))
+        ttk.Entry(row2, textvariable=self.csv_var, width=26).pack(side="left", padx=(0, 4))
+        ttk.Button(row2, text="Browse…", width=8, command=self.browse_inventory_csv).pack(side="left", padx=(0, 12))
+
+        ttk.Label(row2, text="Extra Info CSV:").pack(side="left", padx=(0, 4))
+        ttk.Entry(row2, textvariable=self.extra_info_var, width=26).pack(side="left", padx=(0, 4))
+        ttk.Button(row2, text="Browse…", width=8, command=self.browse_extra_info_csv).pack(side="left", padx=(0, 12))
+
+        ttk.Label(row2, text="Transit Subnets:").pack(side="left", padx=(0, 4))
+        ttk.Entry(row2, textvariable=self.transit_subnets_var, width=16).pack(side="left", padx=(0, 12))
+
+        ttk.Button(row2, text="🔄 Reload CSV", command=self.load_inventory).pack(side="left")
+
+        # Row 3: Action Buttons
+        row3 = ttk.Frame(input_frame)
+        row3.pack(fill="x", pady=(8, 2))
+
+        self.btn_start = ttk.Button(row3, text="▶ Start Trace", width=14, command=self.start_trace)
+        self.btn_start.pack(side="left", padx=(0, 8))
+
+        self.btn_wan = ttk.Button(
+            row3, text="⇄ Source ↔ Dest WAN Trace", width=26, command=self.start_wan_trace
+        )
+        self.btn_wan.pack(side="left", padx=(0, 8))
+
+        self.btn_stop = ttk.Button(row3, text="⏹ Stop", width=10, command=self.stop_trace, state="disabled")
+        self.btn_stop.pack(side="left", padx=(0, 8))
+
+        ttk.Button(row3, text="🧹 Clear Results", width=14, command=self.clear_results).pack(side="left", padx=(0, 8))
+
+    def _build_notebook(self, parent: ttk.Frame) -> None:
+        self.notebook = ttk.Notebook(parent)
+        self.notebook.pack(fill="both", expand=True, padx=2, pady=2)
+
+        # Tab 1: Full Path Table
+        self.tab_table = ttk.Frame(self.notebook, padding=4)
+        self.notebook.add(self.tab_table, text=" 📊 Full Path Table (In/Out Interfaces) ")
+        self._build_table_tab(self.tab_table)
+
+        # Tab 2: Path Flow Diagram
+        self.tab_flow = ttk.Frame(self.notebook, padding=4)
+        self.notebook.add(self.tab_flow, text=" 🗺️ Path Flow Diagram ")
+        self._build_flow_tab(self.tab_flow)
+
+        # Tab 3: Console Log
+        self.tab_log = ttk.Frame(self.notebook, padding=4)
+        self.notebook.add(self.tab_log, text=" 📝 Live Console Log ")
+        self._build_console_tab(self.tab_log)
+
+    def _build_table_tab(self, parent: ttk.Frame) -> None:
+        # Table Toolbar with column adjustment controls
+        toolbar = ttk.Frame(parent)
+        toolbar.pack(fill="x", pady=(2, 4))
+
+        ttk.Button(toolbar, text="↔ Auto-fit Column Widths", command=self.autofit_columns).pack(side="left", padx=(0, 6))
+        ttk.Button(toolbar, text="↺ Reset Column Widths", command=self.reset_column_widths).pack(side="left", padx=(0, 6))
+        ttk.Button(toolbar, text="📋 Copy Selected Rows", command=self.copy_selected_rows).pack(side="left", padx=(0, 6))
+        ttk.Button(toolbar, text="💾 Export Table to CSV…", command=self.export_table_csv).pack(side="left", padx=(0, 12))
+
+        ttk.Label(
+            toolbar,
+            text="💡 Tip: Drag column headers to adjust widths manually. Double-click a header to auto-fit.",
+            foreground="#555555",
+            font=("TkDefaultFont", 8),
+        ).pack(side="left")
+
+        # Treeview Container
+        tree_frame = ttk.Frame(parent)
+        tree_frame.pack(fill="both", expand=True)
+
+        self.tree = ttk.Treeview(
+            tree_frame,
+            columns=self.columns,
+            show="headings",
+            selectmode="extended",
+        )
+
+        # Configure columns with resizable/draggable widths
+        for col in self.columns:
+            w, min_w, stretch = self.default_col_widths[col]
+            title = self.col_titles[col]
+            self.tree.heading(col, text=title)
+            self.tree.column(col, width=w, minwidth=min_w, stretch=stretch)
+
+        # Scrollbars
+        vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
+        hsb = ttk.Scrollbar(tree_frame, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+
+        tree_frame.grid_rowconfigure(0, weight=1)
+        tree_frame.grid_columnconfigure(0, weight=1)
+
+        # Tags styling
+        self.tree.tag_configure("in_row", background="#f5f7fa")
+        self.tree.tag_configure("out_row", background="#ffffff")
+        self.tree.tag_configure("timeout_row", background="#fff9db", foreground="#856404")
+        self.tree.tag_configure("target_row", background="#e6fcf5", foreground="#0b7285")
+
+    def _build_flow_tab(self, parent: ttk.Frame) -> None:
+        toolbar = ttk.Frame(parent)
+        toolbar.pack(fill="x", pady=(2, 4))
+
+        ttk.Button(toolbar, text="📋 Copy PATH FLOW", command=self.copy_path_flow).pack(side="left", padx=(0, 6))
+        ttk.Button(toolbar, text="💾 Save Flow as Text…", command=self.save_path_flow).pack(side="left")
+
+        flow_frame = ttk.Frame(parent)
+        flow_frame.pack(fill="both", expand=True)
+
+        self.flow_text = tk.Text(
+            flow_frame,
+            wrap="none",
+            font=("TkFixedFont", 10),
+            bg="#fcfdfe",
+            fg="#212529",
+            padx=10,
+            pady=8,
+        )
+        flow_vsb = ttk.Scrollbar(flow_frame, orient="vertical", command=self.flow_text.yview)
+        flow_hsb = ttk.Scrollbar(flow_frame, orient="horizontal", command=self.flow_text.xview)
+        self.flow_text.configure(yscrollcommand=flow_vsb.set, xscrollcommand=flow_hsb.set)
+
+        self.flow_text.grid(row=0, column=0, sticky="nsew")
+        flow_vsb.grid(row=0, column=1, sticky="ns")
+        flow_hsb.grid(row=1, column=0, sticky="ew")
+
+        flow_frame.grid_rowconfigure(0, weight=1)
+        flow_frame.grid_columnconfigure(0, weight=1)
+
+        self.flow_text.insert("end", "(No traceroute run yet. Enter a target and click Start Trace)\n")
+
+    def _build_console_tab(self, parent: ttk.Frame) -> None:
+        toolbar = ttk.Frame(parent)
+        toolbar.pack(fill="x", pady=(2, 4))
+
+        ttk.Button(toolbar, text="📋 Copy Log", command=self.copy_log).pack(side="left", padx=(0, 6))
+        ttk.Button(toolbar, text="🧹 Clear Log", command=self.clear_log).pack(side="left")
+
+        log_frame = ttk.Frame(parent)
+        log_frame.pack(fill="both", expand=True)
+
+        self.log_text = tk.Text(
+            log_frame,
+            wrap="none",
+            font=("TkFixedFont", 9),
+            bg="#1e1e1e",
+            fg="#d4d4d4",
+            insertbackground="#ffffff",
+            padx=8,
+            pady=6,
+        )
+        log_vsb = ttk.Scrollbar(log_frame, orient="vertical", command=self.log_text.yview)
+        log_hsb = ttk.Scrollbar(log_frame, orient="horizontal", command=self.log_text.xview)
+        self.log_text.configure(yscrollcommand=log_vsb.set, xscrollcommand=log_hsb.set)
+
+        self.log_text.grid(row=0, column=0, sticky="nsew")
+        log_vsb.grid(row=0, column=1, sticky="ns")
+        log_hsb.grid(row=1, column=0, sticky="ew")
+
+        log_frame.grid_rowconfigure(0, weight=1)
+        log_frame.grid_columnconfigure(0, weight=1)
+
+    def _build_status_bar(self, parent: ttk.Frame) -> None:
+        status_frame = ttk.Frame(parent, padding="2 4 2 2")
+        status_frame.pack(fill="x", pady=(4, 0))
+
+        self.status_label = ttk.Label(status_frame, textvariable=self.status_var, relief="sunken", anchor="w")
+        self.status_label.pack(side="left", fill="x", expand=True, padx=(0, 6))
+
+        self.progress = ttk.Progressbar(status_frame, orient="horizontal", length=180)
+        self.progress.pack(side="left", padx=(0, 6))
+
+        self.stats_label = ttk.Label(status_frame, textvariable=self.stats_var, relief="sunken", anchor="e", width=36)
+        self.stats_label.pack(side="right")
+
+    def _bind_events(self) -> None:
+        self.target_entry.bind("<Return>", lambda _e: self.start_trace())
+        self.source_entry.bind("<Return>", lambda _e: self.start_wan_trace())
+
+        # Header double click to auto-fit clicked column
+        self.tree.bind("<Double-1>", self._on_tree_double_click)
+
+        # Context menu on right click
+        self.tree.bind("<Button-3>", self._show_tree_context_menu)
+
+    def _on_tree_double_click(self, event: Any) -> None:
+        region = self.tree.identify_region(event.x, event.y)
+        if region == "heading":
+            col_id = self.tree.identify_column(event.x)
+            if col_id:
+                try:
+                    idx = int(col_id.replace("#", "")) - 1
+                    if 0 <= idx < len(self.columns):
+                        self.autofit_single_column(self.columns[idx])
+                except ValueError:
+                    pass
+
+    def _show_tree_context_menu(self, event: Any) -> None:
+        menu = tk.Menu(self.root, tearoff=0)
+        col_id = self.tree.identify_column(event.x)
+        if col_id:
+            try:
+                idx = int(col_id.replace("#", "")) - 1
+                if 0 <= idx < len(self.columns):
+                    target_col = self.columns[idx]
+                    col_title = self.col_titles.get(target_col, target_col)
+                    menu.add_command(
+                        label=f"Auto-fit Column '{col_title}'",
+                        command=lambda: self.autofit_single_column(target_col),
+                    )
+            except ValueError:
+                pass
+
+        menu.add_command(label="Auto-fit All Column Widths", command=self.autofit_columns)
+        menu.add_command(label="Reset Column Widths", command=self.reset_column_widths)
+        menu.add_separator()
+        menu.add_command(label="Copy Selected Rows", command=self.copy_selected_rows)
+        menu.add_command(label="Export Table to CSV…", command=self.export_table_csv)
+
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    # ───── Column Width Adjustments ───────────────────────────────────────────
+    def autofit_single_column(self, col: str) -> None:
+        """Measures heading and cell text to auto-fit a specific column width."""
+        try:
+            font = tkfont.nametofont("TkDefaultFont")
+        except Exception:
+            font = tkfont.Font(family="TkDefaultFont")
+
+        heading_text = self.tree.heading(col, "text")
+        max_w = font.measure(heading_text) + 28
+        min_w = self.default_col_widths.get(col, (100, 40, False))[1]
+
+        for item in self.tree.get_children():
+            val = str(self.tree.set(item, col))
+            if val:
+                w = font.measure(val) + 20
+                if w > max_w:
+                    max_w = w
+
+        max_w = min(max_w, 650)
+        self.tree.column(col, width=max(max_w, min_w))
+
+    def autofit_columns(self) -> None:
+        """Automatically adjusts every column's width to fit contents and headings."""
+        for col in self.columns:
+            self.autofit_single_column(col)
+
+    def reset_column_widths(self) -> None:
+        """Resets all column widths to their initial default values."""
+        for col, (w, min_w, stretch) in self.default_col_widths.items():
+            self.tree.column(col, width=w, minwidth=min_w, stretch=stretch)
+
+    # ───── CSV / Inventory Loading ───────────────────────────────────────────
+    def browse_inventory_csv(self) -> None:
+        filename = filedialog.askopenfilename(
+            title="Select Network Interfaces CSV",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+        )
+        if filename:
+            self.csv_var.set(filename)
+            self.load_inventory()
+
+    def browse_extra_info_csv(self) -> None:
+        filename = filedialog.askopenfilename(
+            title="Select Additional Interface Info CSV",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+        )
+        if filename:
+            self.extra_info_var.set(filename)
+            self.load_inventory()
+
+    def load_inventory(self) -> None:
+        csv_path = self.csv_var.get().strip()
+        extra_path = self.extra_info_var.get().strip() or None
+
+        self.mapper.csv_file = csv_path
+        if not os.path.exists(csv_path):
+            self.stats_var.set(f"Inventory file not found: {os.path.basename(csv_path)}")
+            self.log_message(f"⚠️ Inventory file not found: {csv_path}")
+            return
+
+        loaded = self.mapper.load_csv_data()
+        self.mapper.load_addon_subnets()
+        self.mapper.load_additional_int_info(extra_path)
+
+        dev_count = len(self.mapper.device_interfaces)
+        iface_count = sum(len(ifs) for ifs in self.mapper.device_interfaces.values())
+
+        if loaded:
+            self.stats_var.set(f"Inventory: {dev_count} devices, {iface_count} interfaces")
+            self.log_message(f"✓ Inventory loaded: {dev_count} devices, {iface_count} interfaces from {csv_path}")
+        else:
+            self.stats_var.set("Failed to load inventory CSV")
+            self.log_message(f"❌ Failed to parse inventory CSV: {csv_path}")
+
+    def _apply_settings_to_mapper(self) -> None:
+        try:
+            self.mapper.max_hops = max(1, int(self.max_hops_var.get().strip()))
+        except ValueError:
+            self.mapper.max_hops = 30
+
+        try:
+            self.mapper.timeout_base = max(1, int(self.timeout_var.get().strip()))
+        except ValueError:
+            self.mapper.timeout_base = 2
+
+        self.mapper.wan_keyword = self.wan_var.get().strip() or "wanr"
+        self.mapper.resolve_dns = bool(self.dns_var.get())
+
+        subnets_spec = self.transit_subnets_var.get().strip()
+        if subnets_spec:
+            self.mapper.set_transit_subnets(subnets_spec)
+            self.transit_subnets_var.set(self.mapper.get_transit_subnets_display())
+
+    # ───── Tracing Execution ──────────────────────────────────────────────────
+    def start_trace(self) -> None:
+        target = self.target_var.get().strip()
+        if not target:
+            messagebox.showwarning("Missing Target", "Please enter a Destination IP or Hostname.")
+            return
+
+        source = self.source_var.get().strip() or None
+        self._apply_settings_to_mapper()
+
+        self.is_tracing = True
+        self.stop_event.clear()
+        self.btn_start.config(state="disabled")
+        self.btn_wan.config(state="disabled")
+        self.btn_stop.config(state="normal")
+        self.progress.config(mode="indeterminate")
+        self.progress.start(10)
+        self.status_var.set(f"Starting traceroute to {target}…")
+
+        self.clear_results(keep_inputs=True)
+        self.log_message(f"=== Starting Traceroute to {target} ===")
+        if source:
+            self.log_message(f"Source specified: {source}")
+
+        t = threading.Thread(
+            target=self._worker_single_trace,
+            args=(target, source),
+            daemon=True,
+        )
+        t.start()
+
+    def start_wan_trace(self) -> None:
+        src = self.source_var.get().strip()
+        dst = self.target_var.get().strip()
+        if not src or not dst:
+            messagebox.showwarning(
+                "Source and Destination Required",
+                "Both Source and Destination must be entered for WAN-aware trace.",
+            )
+            return
+
+        self._apply_settings_to_mapper()
+
+        self.is_tracing = True
+        self.stop_event.clear()
+        self.btn_start.config(state="disabled")
+        self.btn_wan.config(state="disabled")
+        self.btn_stop.config(state="normal")
+        self.progress.config(mode="indeterminate")
+        self.progress.start(10)
+        self.status_var.set(f"Starting WAN-aware trace: {src} ↔ {dst}…")
+
+        self.clear_results(keep_inputs=True)
+        self.log_message(f"=== Starting WAN-Aware Trace: {src} ↔ {dst} ===")
+
+        t = threading.Thread(
+            target=self._worker_wan_trace,
+            args=(src, dst),
+            daemon=True,
+        )
+        t.start()
+
+    def stop_trace(self) -> None:
+        if self.is_tracing:
+            self.stop_event.set()
+            if self.active_proc and self.active_proc.poll() is None:
+                try:
+                    self.active_proc.terminate()
+                except Exception:
+                    pass
+            self.status_var.set("Stopping trace…")
+            self.log_message("⏹ Trace stop requested by user.")
+
+    def clear_results(self, keep_inputs: bool = False) -> None:
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+
+        self.flow_text.delete("1.0", "end")
+        self.flow_text.insert("end", "(No traceroute run yet. Enter a target and click Start Trace)\n")
+
+        if not keep_inputs:
+            self.target_var.set("")
+            self.source_var.set("")
+            self.clear_log()
+            self.status_var.set("Ready")
+            self.progress.stop()
+            self.progress.config(mode="determinate", value=0)
+
+    # ───── Worker Threads ────────────────────────────────────────────────────
+    def _worker_single_trace(self, target: str, source: Optional[str]) -> None:
+        start_time = time.time()
+        try:
+            self.queue.put(("status", f"Resolving target {target}…"))
+            target_ip = resolve_target(target)
+            self.queue.put(("log", f"✓ Resolved target {target} → {target_ip}"))
+
+            source_ip = None
+            if source:
+                self.queue.put(("status", f"Resolving source {source}…"))
+                source_ip = resolve_target(source)
+                self.queue.put(("log", f"✓ Resolved source {source} → {source_ip}"))
+
+            # Addon subnet notification
+            for _net, dev, info in self.mapper.check_addon_subnet(target_ip):
+                self.queue.put(("log", f"ℹ️ ADDON INFO: Matches {str(_net)} (Behind {dev}) [{info}]"))
+
+            # Connectivity ping
+            self.queue.put(("status", f"Testing ping reachability to {target_ip}…"))
+            if self.mapper._test_connectivity(target_ip):
+                self.queue.put(("log", f"✓ Ping reachable to {target_ip}"))
+            else:
+                self.queue.put(("log", f"⚠️ Ping unreachable to {target_ip}, continuing anyway…"))
+
+            # Streaming trace
+            self.queue.put(("status", f"Tracing hops to {target_ip}…"))
+            hops: List[Tuple[int, Optional[str]]] = []
+            dest_reached = False
+
+            def proc_cb(p: Any) -> None:
+                self.active_proc = p
+
+            for hop_no, ip in self.mapper.execute_traceroute_streaming(
+                target_ip,
+                source_ip=source_ip,
+                stop_event=self.stop_event,
+                proc_callback=proc_cb,
+            ):
+                if self.stop_event.is_set():
+                    break
+                hops.append((hop_no, ip))
+                self.queue.put(("hop_streaming", hop_no, ip))
+                if ip == target_ip:
+                    dest_reached = True
+                    break
+
+            elapsed = time.time() - start_time
+            if self.stop_event.is_set():
+                self.queue.put(("log", f"⏹ Traceroute stopped by user after {elapsed:.1f}s."))
+            else:
+                self.queue.put(("log", f"✓ Traceroute complete in {elapsed:.1f}s ({len(hops)} hops)."))
+
+            # Resolve full path interfaces & subnets
+            self.queue.put(("status", "Resolving interfaces and subnets…"))
+            resolved = self.mapper.resolve_path_interfaces(
+                hops, target_ip=target_ip, source_ip=source_ip
+            )
+            self.queue.put(("trace_done", resolved, target_ip, dest_reached, elapsed))
+
+        except Exception as exc:
+            self.queue.put(("error", str(exc)))
+        finally:
+            self.active_proc = None
+
+    def _worker_wan_trace(self, source: str, destination: str) -> None:
+        start_time = time.time()
+        try:
+            self.queue.put(("status", f"Resolving source {source} & target {destination}…"))
+            src_ip = resolve_target(source)
+            dst_ip = resolve_target(destination)
+            self.queue.put(("log", f"✓ Source {source} → {src_ip}"))
+            self.queue.put(("log", f"✓ Destination {destination} → {dst_ip}"))
+
+            if src_ip == dst_ip:
+                self.queue.put(("error", "Source and Destination resolve to the same IP."))
+                return
+
+            def proc_cb(p: Any) -> None:
+                self.active_proc = p
+
+            self.queue.put(("status", f"Tracing path to source {src_ip}…"))
+            src_hops: List[Tuple[int, Optional[str]]] = []
+            for hop_no, ip in self.mapper.execute_traceroute_streaming(
+                src_ip, stop_event=self.stop_event, proc_callback=proc_cb
+            ):
+                if self.stop_event.is_set():
+                    break
+                src_hops.append((hop_no, ip))
+                self.queue.put(("log", f"Src Hop {hop_no}: {ip or '* * *'}"))
+
+            self.queue.put(("status", f"Tracing path to destination {dst_ip}…"))
+            dst_hops: List[Tuple[int, Optional[str]]] = []
+            for hop_no, ip in self.mapper.execute_traceroute_streaming(
+                dst_ip, stop_event=self.stop_event, proc_callback=proc_cb
+            ):
+                if self.stop_event.is_set():
+                    break
+                dst_hops.append((hop_no, ip))
+                self.queue.put(("log", f"Dst Hop {hop_no}: {ip or '* * *'}"))
+
+            # WAN router stitch
+            resolved_src = self.mapper.resolve_path_interfaces(src_hops, target_ip=src_ip)
+            resolved_dst = self.mapper.resolve_path_interfaces(dst_hops, target_ip=dst_ip)
+
+            wan_kw = self.mapper.wan_keyword.lower()
+            src_wan_idx = None
+            for idx, r in enumerate(resolved_src):
+                dev = (r.get("device") or "").lower()
+                if wan_kw in dev:
+                    src_wan_idx = idx
+                    break
+
+            dst_wan_idx = None
+            for idx, r in enumerate(resolved_dst):
+                dev = (r.get("device") or "").lower()
+                if wan_kw in dev:
+                    dst_wan_idx = idx
+                    break
+
+            stitched_hops = []
+            if src_wan_idx is not None and dst_wan_idx is not None:
+                self.queue.put(("log", f"✓ Found WAN routers on both traces. Stitching paths…"))
+                # Reverse source side up to wan router
+                src_segment = list(reversed(resolved_src[: src_wan_idx + 1]))
+                dst_segment = resolved_dst[dst_wan_idx:]
+                for s in src_segment:
+                    stitched_hops.append((len(stitched_hops) + 1, s.get("ip")))
+                for d in dst_segment:
+                    stitched_hops.append((len(stitched_hops) + 1, d.get("ip")))
+            else:
+                self.queue.put(("log", "ℹ️ WAN router keyword not found on both paths; showing destination trace."))
+                stitched_hops = dst_hops
+
+            resolved = self.mapper.resolve_path_interfaces(
+                stitched_hops, target_ip=dst_ip, source_ip=src_ip
+            )
+            elapsed = time.time() - start_time
+            self.queue.put(("wan_done", resolved, dst_ip, elapsed))
+
+        except Exception as exc:
+            self.queue.put(("error", str(exc)))
+        finally:
+            self.active_proc = None
+
+    # ───── Queue Processing & UI Updates ─────────────────────────────────────
+    def _process_queue(self) -> None:
+        try:
+            while True:
+                msg = self.queue.get_nowait()
+                msg_type = msg[0]
+
+                if msg_type == "status":
+                    self.status_var.set(msg[1])
+
+                elif msg_type == "log":
+                    self.log_message(msg[1])
+
+                elif msg_type == "hop_streaming":
+                    hop_no, ip = msg[1], msg[2]
+                    ip_disp = ip if ip else "* * * (timeout)"
+                    self.status_var.set(f"Hop {hop_no}: {ip_disp}")
+                    self.log_message(f"Hop {hop_no:>2}: {ip_disp}")
+
+                elif msg_type == "trace_done":
+                    resolved, target_ip, dest_reached, elapsed = msg[1], msg[2], msg[3], msg[4]
+                    self.last_resolved_hops = resolved
+                    self._render_resolved_table(resolved, target_ip)
+                    self._render_path_flow(resolved)
+                    dest_str = "Yes" if dest_reached else "No"
+                    self.status_var.set(
+                        f"Finished in {elapsed:.1f}s | Hops: {len(resolved)} | Destination reached: {dest_str}"
+                    )
+                    self.log_message(f"=== Path resolution complete. Destination reached: {dest_str} ===")
+                    self._finish_tracing()
+
+                elif msg_type == "wan_done":
+                    resolved, target_ip, elapsed = msg[1], msg[2], msg[3]
+                    self.last_resolved_hops = resolved
+                    self._render_resolved_table(resolved, target_ip)
+                    self._render_path_flow(resolved)
+                    self.status_var.set(f"WAN path finished in {elapsed:.1f}s | Hops: {len(resolved)}")
+                    self.log_message("=== WAN Source ↔ Destination path complete ===")
+                    self._finish_tracing()
+
+                elif msg_type == "error":
+                    err_msg = msg[1]
+                    self.log_message(f"❌ Error: {err_msg}")
+                    self.status_var.set(f"Error: {err_msg}")
+                    messagebox.showerror("Traceroute Error", err_msg)
+                    self._finish_tracing()
+
+        except queue.Empty:
+            pass
+
+        self.root.after(50, self._process_queue)
+
+    def _finish_tracing(self) -> None:
+        self.is_tracing = False
+        self.progress.stop()
+        self.progress.config(mode="determinate", value=100)
+        self.btn_start.config(state="normal")
+        self.btn_wan.config(state="normal")
+        self.btn_stop.config(state="disabled")
+
+    def _render_resolved_table(self, resolved_hops: List[dict], target_ip: str) -> None:
+        for item in self.tree.get_children():
+            self.tree.delete(item)
+
+        for rec in resolved_hops:
+            hop_no = rec.get("hop_no", "")
+            ip = rec.get("ip", "")
+            is_timeout = rec.get("is_timeout", False)
+
+            if is_timeout or not ip:
+                self.tree.insert(
+                    "",
+                    "end",
+                    values=(
+                        hop_no,
+                        "* * * (timeout)",
+                        "-",
+                        "-",
+                        "-",
+                        "-",
+                        "-",
+                        "-",
+                        "Request timed out",
+                        "-",
+                    ),
+                    tags=("timeout_row",),
+                )
+                continue
+
+            ptr = get_reverse_dns(ip) if self.mapper.resolve_dns else None
+            show_ip = f"{ip} ({ptr})" if ptr else ip
+            dev = rec.get("device") or "External/Unknown"
+            in_if = rec.get("in_iface") or "-"
+            out_if = rec.get("out_iface") or "-"
+            next_hop = rec.get("next_hop") or "-"
+            in_zone = rec.get("in_zone") or "-"
+            out_zone = rec.get("out_zone") or "-"
+            in_vrf = rec.get("in_vrf") or "-"
+            out_vrf = rec.get("out_vrf") or "-"
+            in_desc = rec.get("in_desc") or ""
+            out_desc = rec.get("out_desc") or ""
+
+            dev_for_info = dev if dev != "External/Unknown" else None
+            in_info = self.mapper.get_extra_info(rec.get("in_ip"), dev_for_info, in_if)
+            out_info = self.mapper.get_extra_info(rec.get("out_ip"), dev_for_info, out_if)
+
+            # Line 1: INBOUND
+            self.tree.insert(
+                "",
+                "end",
+                values=(
+                    hop_no,
+                    show_ip,
+                    dev,
+                    "IN",
+                    in_if,
+                    "-",
+                    in_zone,
+                    in_vrf,
+                    in_desc,
+                    in_info,
+                ),
+                tags=("in_row",),
+            )
+
+            # Line 2: OUTBOUND
+            is_dest = (
+                "Destination Reached" in next_hop
+                or ip == target_ip
+                or out_if in {"Connected / Target", "Connected/Target"}
+            )
+            out_tags = ("target_row", "out_row") if is_dest else ("out_row",)
+            self.tree.insert(
+                "",
+                "end",
+                values=(
+                    "",
+                    "",
+                    "",
+                    "OUT",
+                    out_if,
+                    next_hop,
+                    out_zone,
+                    out_vrf,
+                    out_desc,
+                    out_info,
+                ),
+                tags=out_tags,
+            )
+
+        # Auto-fit columns to newly loaded data
+        self.autofit_columns()
+
+    def _render_path_flow(self, resolved_hops: List[dict]) -> None:
+        self.flow_text.delete("1.0", "end")
+        flow_lines = self.mapper.format_path_flow(resolved_hops)
+        self.flow_text.insert("end", "PATH FLOW:\n")
+        for line in flow_lines:
+            self.flow_text.insert("end", line + "\n")
+
+    # ───── Clipboard & Export Helpers ─────────────────────────────────────────
+    def copy_selected_rows(self) -> None:
+        selected = self.tree.selection()
+        if not selected:
+            messagebox.showinfo("Selection Required", "Please select one or more rows to copy.")
+            return
+
+        rows = []
+        for item in selected:
+            vals = [str(self.tree.set(item, col)) for col in self.columns]
+            rows.append("\t".join(vals))
+
+        text_to_copy = "\n".join(rows)
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text_to_copy)
+        self.status_var.set(f"Copied {len(selected)} row(s) to clipboard.")
+
+    def export_table_csv(self) -> None:
+        path = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+            title="Export Traceroute Table to CSV",
+        )
+        if not path:
+            return
+
+        try:
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                writer = csv.writer(f)
+                headers = [self.col_titles[c] for c in self.columns]
+                writer.writerow(headers)
+                for item in self.tree.get_children():
+                    writer.writerow([self.tree.set(item, col) for col in self.columns])
+            messagebox.showinfo("Export Successful", f"Table exported to:\n{path}")
+        except Exception as exc:
+            messagebox.showerror("Export Failed", f"Could not write CSV file:\n{exc}")
+
+    def copy_path_flow(self) -> None:
+        text = self.flow_text.get("1.0", "end-1c")
+        if text.strip():
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+            self.status_var.set("PATH FLOW copied to clipboard.")
+            messagebox.showinfo("Copied", "PATH FLOW diagram copied to clipboard!")
+
+    def save_path_flow(self) -> None:
+        path = filedialog.asksaveasfilename(
+            defaultextension=".txt",
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+            title="Save PATH FLOW as Text",
+        )
+        if not path:
+            return
+
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(self.flow_text.get("1.0", "end-1c"))
+            messagebox.showinfo("Saved", f"PATH FLOW saved to:\n{path}")
+        except Exception as exc:
+            messagebox.showerror("Save Failed", f"Could not save file:\n{exc}")
+
+    def copy_log(self) -> None:
+        log_content = self.log_text.get("1.0", "end-1c")
+        if log_content.strip():
+            self.root.clipboard_clear()
+            self.root.clipboard_append(log_content)
+            messagebox.showinfo("Copied", "Log content copied to clipboard!")
+
+    def clear_log(self) -> None:
+        self.log_text.delete("1.0", "end")
+
+    def log_message(self, msg: str) -> None:
+        timestamp = time.strftime("%H:%M:%S")
+        self.log_text.insert("end", f"[{timestamp}] {msg}\n")
+        self.log_text.see("end")
+
+
+def launch_gui(
+    csv_file: str = "network_interfaces.csv",
+    extra_info: Optional[str] = None,
+    wan_keyword: str = "wanr",
+    resolve_dns: bool = False,
+    transit_subnets: Optional[str] = None,
+    mapper: Optional[CiscoTracerouteMapper] = None,
+) -> None:
+    """Launches the Tkinter Graphical User Interface."""
+    if not TKINTER_AVAILABLE:
+        print("Error: Tkinter is not installed or not available in this Python environment.")
+        return
+
+    root = tk.Tk()
+    app = TraceINTGUI(root, mapper=mapper)
+    if mapper is None:
+        app.csv_var.set(csv_file)
+        if extra_info:
+            app.extra_info_var.set(extra_info)
+        app.wan_var.set(wan_keyword)
+        app.dns_var.set(resolve_dns)
+        if transit_subnets:
+            app.transit_subnets_var.set(transit_subnets)
+            app.mapper.set_transit_subnets(transit_subnets)
+        app.load_inventory()
+    elif transit_subnets:
+        app.transit_subnets_var.set(transit_subnets)
+        app.mapper.set_transit_subnets(transit_subnets)
+    root.mainloop()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1947,6 +3036,18 @@ def main() -> None:
         "targets",
         nargs="*",
         help="Destination IP(s) or hostname(s). If omitted the interactive menu starts.",
+    )
+    parser.add_argument(
+        "-g",
+        "--gui",
+        action="store_true",
+        help="Launch Graphical User Interface (Tkinter)",
+    )
+    parser.add_argument(
+        "-p",
+        "--transit-subnets",
+        default="30,31,29,28",
+        help="Allowed prefix lengths for inter-device transit/link matching (default: %(default)s, e.g. '30,31,29,28' or '28-31')",
     )
     parser.add_argument(
         "-f",
@@ -1991,6 +3092,17 @@ def main() -> None:
     if bool(args.source) != bool(args.destination):
         parser.error("--source and --destination must be used together")
 
+    # Check GUI flag first
+    if args.gui:
+        launch_gui(
+            csv_file=args.csv,
+            extra_info=args.extra_info,
+            wan_keyword=args.wan_keyword,
+            resolve_dns=args.resolve_dns,
+            transit_subnets=args.transit_subnets,
+        )
+        return
+
     # 1. Instantiate & Load Data
     mapper = CiscoTracerouteMapper(csv_file=args.csv)
     if not mapper.load_csv_data():
@@ -2001,28 +3113,23 @@ def main() -> None:
     # 2. Check Arguments
     mapper.resolve_dns = args.resolve_dns  # Apply argument
     mapper.wan_keyword = args.wan_keyword
+    mapper.set_transit_subnets(args.transit_subnets)
 
     if args.source and args.destination:
         mapper.trace_source_destination(args.source, args.destination)
     elif args.targets:  # non-interactive
-
         if args.compare and len(args.targets) > 1:
             mapper.compare_traces(args.targets)
         elif len(args.targets) > 1:
-            # Default behavior for multiple targets: Verification Mode
-            # Use targets as both Destinations and Manual IPs
             destinations = args.targets
             monitored_devices = set()
             manual_ips = set(args.targets)
             manual_subnets = []
-            
             print(f"Running batch verification for {len(destinations)} targets...")
             mapper.run_verification_batch(destinations, monitored_devices, manual_ips, manual_subnets)
         else:
-            # Single target
             if args.compare:
                  print("Info: --compare requires multiple targets. Running standard trace.")
-
             for tgt in args.targets:
                 print("\n" + "=" * 100)
                 mapper.trace_to_destination(tgt)
@@ -2032,3 +3139,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
