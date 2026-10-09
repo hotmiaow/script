@@ -511,3 +511,516 @@ def draw_fee_tax_trajectory_chart(
     # Portfolio
     canvas.create_rectangle(leg_x + 245, leg_y - 4, leg_x + 255, leg_y + 4, fill=c_port, outline="")
     canvas.create_text(leg_x + 259, leg_y, text="Actual Portfolio", font=("Segoe UI", 7, "bold"), fill=c_port, anchor="w")
+
+
+# =============================================================================
+# WILLIAM J. BERNSTEIN RETIREMENT & FIRE GRAPHICS ENGINE
+# =============================================================================
+
+def _get_canvas_dims(canvas: tk.Canvas, def_w: int = 420, def_h: int = 48) -> Tuple[int, int]:
+    """Safely extracts integer width and height from tk.Canvas or test mock."""
+    try:
+        w_raw = canvas.winfo_width()
+        w = int(w_raw) if not isinstance(w_raw, (MagicMock if "MagicMock" in globals() else ())) else 0
+    except (ValueError, TypeError, Exception):
+        w = 0
+    if w < 50:
+        try:
+            w = int(canvas.winfo_fpixels(canvas.cget("width")))
+        except Exception:
+            w = def_w
+        if w < 50:
+            w = def_w
+
+    try:
+        h_raw = canvas.winfo_height()
+        h = int(h_raw) if not isinstance(h_raw, (MagicMock if "MagicMock" in globals() else ())) else 0
+    except (ValueError, TypeError, Exception):
+        h = 0
+    if h < 20:
+        try:
+            h = int(canvas.winfo_fpixels(canvas.cget("height")))
+        except Exception:
+            h = def_h
+        if h < 20:
+            h = def_h
+    return w, h
+
+
+def draw_fire_asset_ratio_bar(
+    canvas: tk.Canvas,
+    equity_val: float,
+    safe_val: float,
+    currency_prefix: str = "$",
+    dark_mode: bool = False,
+) -> None:
+    """
+    Renders a 2-segment horizontal asset allocation bar gauge:
+    Growth Equity vs. Safe Liability Buffer.
+    """
+    canvas.delete("all")
+    w, h = _get_canvas_dims(canvas, def_w=420, def_h=44)
+
+    theme = ChartTheme.DARK if dark_mode else ChartTheme.LIGHT
+    canvas.configure(bg=theme["bg"])
+
+    total = max(0.0, equity_val + safe_val)
+    margin_x = 10
+    bar_y0 = 20
+    bar_h = 16
+    bar_y1 = bar_y0 + bar_h
+    plot_w = max(20, w - (margin_x * 2))
+
+    if total <= 0:
+        canvas.create_text(
+            w / 2, h / 2,
+            text="No asset data available",
+            font=("Segoe UI", 8),
+            fill=theme["muted"],
+        )
+        return
+
+    eq_pct = (equity_val / total) * 100.0 if total > 0 else 0.0
+    safe_pct = (safe_val / total) * 100.0 if total > 0 else 0.0
+    eq_w = max(0.0, min(float(plot_w), float(plot_w) * (equity_val / total)))
+    safe_w = float(plot_w) - eq_w
+
+    c_equity = "#1a73e8" if not dark_mode else "#8ab4f8"
+    c_safe = "#0f9d58" if not dark_mode else "#81c995"
+    track_bg = "#e8eaed" if not dark_mode else "#2d3342"
+
+    # Header labels
+    canvas.create_text(
+        margin_x, 10,
+        text=f"📈 Equity: {currency_prefix}{equity_val:,.0f} ({eq_pct:.1f}%)",
+        font=("Segoe UI", 8, "bold"),
+        fill=c_equity,
+        anchor="w",
+    )
+    canvas.create_text(
+        w - margin_x, 10,
+        text=f"🛡️ Safe: {currency_prefix}{safe_val:,.0f} ({safe_pct:.1f}%)",
+        font=("Segoe UI", 8, "bold"),
+        fill=c_safe,
+        anchor="e",
+    )
+
+    # Background track
+    canvas.create_rectangle(
+        margin_x, bar_y0, margin_x + plot_w, bar_y1,
+        fill=track_bg, outline="", width=0,
+    )
+
+    # Equity bar segment
+    if eq_w > 0:
+        canvas.create_rectangle(
+            margin_x, bar_y0, margin_x + eq_w, bar_y1,
+            fill=c_equity, outline="", width=0,
+        )
+
+    # Safe bar segment
+    if safe_w > 0:
+        canvas.create_rectangle(
+            margin_x + eq_w, bar_y0, margin_x + plot_w, bar_y1,
+            fill=c_safe, outline="", width=0,
+        )
+
+    # Dividing separator
+    if eq_w > 0 and safe_w > 0:
+        canvas.create_line(
+            margin_x + eq_w, bar_y0, margin_x + eq_w, bar_y1,
+            fill="#ffffff" if not dark_mode else "#1e222d",
+            width=2,
+        )
+
+
+def draw_fire_timeline_bar(
+    canvas: tk.Canvas,
+    cur_age: int,
+    ret_age: int,
+    life_exp: int,
+    dark_mode: bool = False,
+) -> None:
+    """
+    Renders a life cycle timeline from Current Age -> Retirement Age -> Life Horizon.
+    """
+    canvas.delete("all")
+    w, h = _get_canvas_dims(canvas, def_w=420, def_h=48)
+
+    theme = ChartTheme.DARK if dark_mode else ChartTheme.LIGHT
+    canvas.configure(bg=theme["bg"])
+
+    # Ensure valid ordering
+    cur_age = max(18, min(100, int(cur_age)))
+    ret_age = max(cur_age, min(105, int(ret_age)))
+    life_exp = max(ret_age + 1, min(120, int(life_exp)))
+
+    total_span = max(1, life_exp - cur_age)
+
+    margin_x = 24
+    plot_w = max(20, w - (margin_x * 2))
+    bar_y0 = 18
+    bar_h = 14
+    bar_y1 = bar_y0 + bar_h
+
+    yrs_to_ret = max(0, ret_age - cur_age)
+    ret_dur = max(0, life_exp - ret_age)
+
+    accum_w = (yrs_to_ret / total_span) * plot_w
+    dist_w = plot_w - accum_w
+
+    c_accum = "#1a73e8" if not dark_mode else "#8ab4f8"
+    c_dist = "#0f9d58" if not dark_mode else "#81c995"
+    track_bg = "#e8eaed" if not dark_mode else "#2d3342"
+
+    # Base track
+    canvas.create_rectangle(
+        margin_x, bar_y0, margin_x + plot_w, bar_y1,
+        fill=track_bg, outline="", width=0,
+    )
+
+    # Draw segments
+    if accum_w > 0:
+        canvas.create_rectangle(
+            margin_x, bar_y0, margin_x + accum_w, bar_y1,
+            fill=c_accum, outline="", width=0,
+        )
+    if dist_w > 0:
+        canvas.create_rectangle(
+            margin_x + accum_w, bar_y0, margin_x + plot_w, bar_y1,
+            fill=c_dist, outline="", width=0,
+        )
+
+    # Dividing separator
+    if accum_w > 0 and dist_w > 0:
+        canvas.create_line(
+            margin_x + accum_w, bar_y0 - 2, margin_x + accum_w, bar_y1 + 2,
+            fill="#ffffff" if not dark_mode else "#1e222d",
+            width=2,
+        )
+
+    # Markers and Pins
+    # Pin 1: Current Age
+    canvas.create_text(
+        margin_x, 9,
+        text=f"● Age {cur_age} (Now)",
+        font=("Segoe UI", 7, "bold"),
+        fill=theme["fg"],
+        anchor="center",
+    )
+
+    # Pin 2: Retirement FIRE Age
+    ret_x = margin_x + accum_w
+    ret_anchor = "center"
+    if ret_x < margin_x + 35:
+        ret_anchor = "w"
+    elif ret_x > margin_x + plot_w - 35:
+        ret_anchor = "e"
+
+    canvas.create_text(
+        ret_x, 9,
+        text=f"★ Age {ret_age} (FIRE)",
+        font=("Segoe UI", 7, "bold"),
+        fill=c_dist,
+        anchor=ret_anchor,
+    )
+
+    # Pin 3: Horizon
+    canvas.create_text(
+        margin_x + plot_w, 9,
+        text=f"🏁 Age {life_exp}",
+        font=("Segoe UI", 7, "bold"),
+        fill=theme["muted"],
+        anchor="center",
+    )
+
+    # Phase labels under the bar
+    if accum_w > 50:
+        canvas.create_text(
+            margin_x + accum_w / 2, bar_y1 + 8,
+            text=f"⏳ {yrs_to_ret}y Accumulation",
+            font=("Segoe UI", 7),
+            fill=c_accum,
+            anchor="center",
+        )
+    if dist_w > 50:
+        canvas.create_text(
+            margin_x + accum_w + dist_w / 2, bar_y1 + 8,
+            text=f"🏖️ {ret_dur}y Distribution",
+            font=("Segoe UI", 7),
+            fill=c_dist,
+            anchor="center",
+        )
+
+
+def draw_fire_comparison_gauge(
+    canvas: tk.Canvas,
+    current_val: float,
+    target_val: float,
+    label_cur: str = "Current",
+    label_tgt: str = "Target",
+    unit_prefix: str = "$",
+    projection_note: str = "",
+    dark_mode: bool = False,
+) -> None:
+    """
+    Renders a high-clarity horizontal target vs current comparison gauge bar:
+    Shows current progress, gap / surplus, and projection note.
+    """
+    canvas.delete("all")
+    w, h = _get_canvas_dims(canvas, def_w=420, def_h=44)
+
+    theme = ChartTheme.DARK if dark_mode else ChartTheme.LIGHT
+    canvas.configure(bg=theme["bg"])
+
+    margin_x = 8
+    plot_w = max(20, w - (margin_x * 2))
+    bar_y0 = 17
+    bar_h = 14
+    bar_y1 = bar_y0 + bar_h
+
+    track_bg = "#e8eaed" if not dark_mode else "#2d3342"
+    c_success = "#0f9d58" if not dark_mode else "#81c995"
+    c_blue = "#1a73e8" if not dark_mode else "#8ab4f8"
+    c_amber = "#f29900" if not dark_mode else "#fdd663"
+    c_red_gap = "#ea4335" if not dark_mode else "#f28b82"
+
+    cov_ratio = (current_val / target_val) if target_val > 0 else (1.0 if current_val >= 0 else 0.0)
+    cov_pct = cov_ratio * 100.0
+
+    # Header labels
+    cur_text = f"{label_cur}: {unit_prefix}{current_val:,.0f} ({cov_pct:.1f}%)"
+    tgt_text = f"{label_tgt}: {unit_prefix}{target_val:,.0f}"
+
+    header_col = c_success if cov_ratio >= 1.0 else (c_amber if cov_ratio >= 0.75 else theme["fg"])
+    canvas.create_text(
+        margin_x, 8,
+        text=cur_text,
+        font=("Segoe UI", 8, "bold"),
+        fill=header_col,
+        anchor="w",
+    )
+    canvas.create_text(
+        w - margin_x, 8,
+        text=tgt_text,
+        font=("Segoe UI", 7, "bold"),
+        fill=theme["muted"],
+        anchor="e",
+    )
+
+    # Base track
+    canvas.create_rectangle(
+        margin_x, bar_y0, margin_x + plot_w, bar_y1,
+        fill=track_bg, outline="", width=0,
+    )
+
+    if target_val <= 0 and current_val <= 0:
+        pass
+    elif cov_ratio >= 1.0:
+        # Met or exceeded target
+        canvas.create_rectangle(
+            margin_x, bar_y0, margin_x + plot_w, bar_y1,
+            fill=c_success, outline="", width=0,
+        )
+        surplus = current_val - target_val
+        surplus_txt = f"✓ Target Met (+{unit_prefix}{surplus:,.0f} Surplus)" if surplus > 0 else "✓ Target Met (100%)"
+        canvas.create_text(
+            margin_x + plot_w / 2, bar_y0 + bar_h / 2,
+            text=surplus_txt,
+            font=("Segoe UI", 7, "bold"),
+            fill="#ffffff",
+            anchor="center",
+        )
+    else:
+        # Partial progress
+        fill_w = max(0.0, min(float(plot_w), float(plot_w) * cov_ratio))
+        fill_col = c_blue if cov_ratio >= 0.5 else c_amber
+
+        if fill_w > 0:
+            canvas.create_rectangle(
+                margin_x, bar_y0, margin_x + fill_w, bar_y1,
+                fill=fill_col, outline="", width=0,
+            )
+
+        # Remaining shortfall segment in shaded red
+        gap_val = target_val - current_val
+        gap_w = float(plot_w) - fill_w
+        gap_bg = "#fce8e6" if not dark_mode else "#3c2020"
+        if gap_w > 0:
+            canvas.create_rectangle(
+                margin_x + fill_w, bar_y0, margin_x + plot_w, bar_y1,
+                fill=gap_bg, outline=c_red_gap, width=1,
+            )
+
+        # Percentage or gap text inside
+        if fill_w > 45:
+            canvas.create_text(
+                margin_x + fill_w / 2, bar_y0 + bar_h / 2,
+                text=f"{cov_pct:.1f}%",
+                font=("Segoe UI", 7, "bold"),
+                fill="#ffffff",
+                anchor="center",
+            )
+        if gap_w > 65:
+            canvas.create_text(
+                margin_x + fill_w + gap_w / 2, bar_y0 + bar_h / 2,
+                text=f"Gap: -{unit_prefix}{gap_val:,.0f}",
+                font=("Segoe UI", 7, "bold"),
+                fill=c_red_gap,
+                anchor="center",
+            )
+
+    # Sub-footer note / projection
+    if projection_note:
+        canvas.create_text(
+            margin_x, bar_y1 + 8,
+            text=projection_note,
+            font=("Segoe UI", 7),
+            fill=theme["muted"],
+            anchor="w",
+        )
+
+
+def draw_fire_burn_meter(
+    canvas: tk.Canvas,
+    burn_rate_pct: float,
+    dark_mode: bool = False,
+) -> None:
+    """
+    Renders a 3-zone Bernstein Burn Rate corridor meter:
+    - Zone 1: 0.0% ~ 2.0% (Green: Safe & Abundant)
+    - Zone 2: 2.0% ~ 3.5% (Yellow: Sustainable Bernstein SWR Corridor)
+    - Zone 3: 3.5% ~ 6.0%+ (Red: Fritz Over-Burn Danger)
+    With pointer pin and current burn rate label.
+    """
+    canvas.delete("all")
+    w, h = _get_canvas_dims(canvas, def_w=420, def_h=48)
+
+    theme = ChartTheme.DARK if dark_mode else ChartTheme.LIGHT
+    canvas.configure(bg=theme["bg"])
+
+    margin_x = 20
+    plot_w = max(20, w - (margin_x * 2))
+    bar_y0 = 18
+    bar_h = 12
+    bar_y1 = bar_y0 + bar_h
+
+    # Max scale: 6.0%
+    max_scale = 6.0
+    z1_w = (2.0 / max_scale) * plot_w
+    z2_w = (1.5 / max_scale) * plot_w
+    z3_w = plot_w - z1_w - z2_w
+
+    c_z1 = "#0f9d58" if not dark_mode else "#81c995"
+    c_z2 = "#fbbc04" if not dark_mode else "#fdd663"
+    c_z3 = "#ea4335" if not dark_mode else "#f28b82"
+
+    # Draw 3 color zones
+    canvas.create_rectangle(margin_x, bar_y0, margin_x + z1_w, bar_y1, fill=c_z1, outline="", width=0)
+    canvas.create_rectangle(margin_x + z1_w, bar_y0, margin_x + z1_w + z2_w, bar_y1, fill=c_z2, outline="", width=0)
+    canvas.create_rectangle(margin_x + z1_w + z2_w, bar_y0, margin_x + plot_w, bar_y1, fill=c_z3, outline="", width=0)
+
+    # Dividing lines between zones
+    canvas.create_line(margin_x + z1_w, bar_y0 - 2, margin_x + z1_w, bar_y1 + 2, fill="#ffffff" if not dark_mode else "#1e222d", width=2)
+    canvas.create_line(margin_x + z1_w + z2_w, bar_y0 - 2, margin_x + z1_w + z2_w, bar_y1 + 2, fill="#ffffff" if not dark_mode else "#1e222d", width=2)
+
+    # Zone annotations below bar
+    canvas.create_text(margin_x + z1_w / 2, bar_y1 + 8, text="<2.0% Safe", font=("Segoe UI", 7), fill=c_z1, anchor="center")
+    canvas.create_text(margin_x + z1_w + z2_w / 2, bar_y1 + 8, text="2.0-3.5% SWR", font=("Segoe UI", 7), fill=c_z2, anchor="center")
+    canvas.create_text(margin_x + z1_w + z2_w + z3_w / 2, bar_y1 + 8, text=">3.5% Fritz Warning", font=("Segoe UI", 7), fill=c_z3, anchor="center")
+
+    # Current rate needle pointer
+    rate_clamped = max(0.0, min(max_scale, burn_rate_pct))
+    needle_x = margin_x + (rate_clamped / max_scale) * plot_w
+
+    if burn_rate_pct < 2.0:
+        pin_col = c_z1
+        status_txt = "Safe"
+    elif burn_rate_pct <= 3.5:
+        pin_col = c_z2
+        status_txt = "Sustainable"
+    else:
+        pin_col = c_z3
+        status_txt = "Over-Burn"
+
+    # Draw pointer marker (triangle) above the bar
+    canvas.create_polygon(
+        needle_x, bar_y0 - 1,
+        needle_x - 5, bar_y0 - 7,
+        needle_x + 5, bar_y0 - 7,
+        fill=pin_col, outline=theme["fg"], width=1,
+    )
+
+    # Pointer text badge
+    anchor = "center"
+    if needle_x < margin_x + 40:
+        anchor = "w"
+    elif needle_x > margin_x + plot_w - 40:
+        anchor = "e"
+
+    canvas.create_text(
+        needle_x, bar_y0 - 11,
+        text=f"Current: {burn_rate_pct:.2f}% ({status_txt})",
+        font=("Segoe UI", 7, "bold"),
+        fill=pin_col,
+        anchor=anchor,
+    )
+
+
+def draw_fire_floor_coverage_bar(
+    canvas: tk.Canvas,
+    ess_cov_pct: float,
+    disc_cov_pct: float,
+    dark_mode: bool = False,
+) -> None:
+    """
+    Renders visual coverage of Essential Living Floor vs Discretionary buffer.
+    """
+    canvas.delete("all")
+    w, h = _get_canvas_dims(canvas, def_w=420, def_h=36)
+
+    theme = ChartTheme.DARK if dark_mode else ChartTheme.LIGHT
+    canvas.configure(bg=theme["bg"])
+
+    margin_x = 8
+    plot_w = max(20, w - (margin_x * 2))
+    bar_y0 = 15
+    bar_h = 12
+    bar_y1 = bar_y0 + bar_h
+
+    track_bg = "#e8eaed" if not dark_mode else "#2d3342"
+    c_safe = "#0f9d58" if not dark_mode else "#81c995"
+    c_warn = "#ea4335" if not dark_mode else "#f28b82"
+    c_blue = "#1a73e8" if not dark_mode else "#8ab4f8"
+
+    # Header label
+    ess_col = c_safe if ess_cov_pct >= 100.0 else c_warn
+    canvas.create_text(
+        margin_x, 7,
+        text=f"🔒 Essential Floor: {ess_cov_pct:.1f}% Covered",
+        font=("Segoe UI", 7, "bold"),
+        fill=ess_col,
+        anchor="w",
+    )
+    canvas.create_text(
+        w - margin_x, 7,
+        text=f"🎉 Discretionary Buffer: {disc_cov_pct:.1f}%",
+        font=("Segoe UI", 7, "bold"),
+        fill=c_blue,
+        anchor="e",
+    )
+
+    # Base track
+    canvas.create_rectangle(
+        margin_x, bar_y0, margin_x + plot_w, bar_y1,
+        fill=track_bg, outline="", width=0,
+    )
+
+    # Floor fill up to 100%
+    ess_ratio = min(1.0, max(0.0, ess_cov_pct / 100.0))
+    fill_w = plot_w * ess_ratio
+    if fill_w > 0:
+        canvas.create_rectangle(
+            margin_x, bar_y0, margin_x + fill_w, bar_y1,
+            fill=ess_col, outline="", width=0,
+        )

@@ -66,7 +66,17 @@ from financial_calc import (
     get_preset_display_name as get_allocation_preset_display_name,
     get_etf_option_label,
 )
-from chart_canvas import draw_donut_chart, draw_drip_growth_chart, draw_fee_tax_trajectory_chart, ChartTheme
+from chart_canvas import (
+    draw_donut_chart,
+    draw_drip_growth_chart,
+    draw_fee_tax_trajectory_chart,
+    draw_fire_asset_ratio_bar,
+    draw_fire_timeline_bar,
+    draw_fire_comparison_gauge,
+    draw_fire_burn_meter,
+    draw_fire_floor_coverage_bar,
+    ChartTheme,
+)
 from report_generator import generate_html_report, generate_period_earnings_report_html
 from currency_converter import get_currency_converter
 from chart_view import GoogleFinanceChartView
@@ -529,6 +539,8 @@ class ModernPortfolioApp:
             self._calc_drip_results()
         if hasattr(self, "chart_view"):
             self.chart_view.update_portfolio(self.current_portfolio, self.summary_currency)
+        if hasattr(self, "_refresh_fire_tab"):
+            self._refresh_fire_tab()
         self._set_status(f"Switched to {'Dark' if self.dark_mode else 'Light'} theme.")
 
     # -------------------------------------------------------------
@@ -3922,6 +3934,14 @@ class ModernPortfolioApp:
         self.fire_holdings_tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         tree_scroll.pack(side=tk.RIGHT, fill=tk.Y)
 
+        self.canvas_fire_asset_split = tk.Canvas(
+            self.fire_s1_box,
+            height=46,
+            highlightthickness=0,
+            bg=self.card_bg,
+        )
+        self.canvas_fire_asset_split.pack(fill=tk.X, pady=(6, 2))
+
         # STEP 2: Age, Retirement Timeline & Strategy
         self.fire_s2_box = tk.LabelFrame(
             left_col,
@@ -4000,6 +4020,14 @@ class ModernPortfolioApp:
 
         self.fire_timeline_lbl = tk.Label(self.fire_s2_box, text="", font=("Segoe UI", 9, "bold"), fg="#1a73e8" if not self.dark_mode else "#8ab4f8")
         self.fire_timeline_lbl.pack(anchor="w", pady=(2, 0))
+
+        self.canvas_fire_timeline = tk.Canvas(
+            self.fire_s2_box,
+            height=48,
+            highlightthickness=0,
+            bg=self.card_bg,
+        )
+        self.canvas_fire_timeline.pack(fill=tk.X, pady=(4, 2))
 
         # STEP 3: Living Expenses & Guaranteed Pension
         self.fire_s3_box = tk.LabelFrame(
@@ -4191,6 +4219,14 @@ class ModernPortfolioApp:
         self.lbl_safe_gap_val = tk.Label(self.card_safe_gap, text="-", font=("Segoe UI", 11, "bold"), fg=self.text_dark, bg=self.card_bg)
         self.lbl_safe_gap_val.pack(anchor="w", pady=1)
 
+        self.canvas_safe_gap = tk.Canvas(
+            self.card_safe_gap,
+            height=46,
+            highlightthickness=0,
+            bg=self.card_bg,
+        )
+        self.canvas_safe_gap.pack(fill=tk.X, pady=(2, 2))
+
         self.lbl_safe_gap_status = tk.Label(self.card_safe_gap, text="-", font=("Segoe UI", 8), bg=self.card_bg)
         self.lbl_safe_gap_status.pack(anchor="w")
 
@@ -4238,6 +4274,14 @@ class ModernPortfolioApp:
         self.lbl_div_gap_val = tk.Label(self.card_div_gap, text="-", font=("Segoe UI", 11, "bold"), fg=self.text_dark, bg=self.card_bg)
         self.lbl_div_gap_val.pack(anchor="w", pady=1)
 
+        self.canvas_div_gap = tk.Canvas(
+            self.card_div_gap,
+            height=46,
+            highlightthickness=0,
+            bg=self.card_bg,
+        )
+        self.canvas_div_gap.pack(fill=tk.X, pady=(2, 2))
+
         self.lbl_div_gap_status = tk.Label(self.card_div_gap, text="-", font=("Segoe UI", 8), bg=self.card_bg)
         self.lbl_div_gap_status.pack(anchor="w")
 
@@ -4249,6 +4293,14 @@ class ModernPortfolioApp:
         self.lbl_fire_cap_title.pack(anchor="w")
         self.lbl_cap_gap_val = tk.Label(self.card_cap_gap, text="-", font=("Segoe UI", 11, "bold"), fg=self.text_dark, bg=self.card_bg)
         self.lbl_cap_gap_val.pack(anchor="w", pady=1)
+
+        self.canvas_cap_gap = tk.Canvas(
+            self.card_cap_gap,
+            height=46,
+            highlightthickness=0,
+            bg=self.card_bg,
+        )
+        self.canvas_cap_gap.pack(fill=tk.X, pady=(2, 2))
 
         self.lbl_cap_gap_status = tk.Label(self.card_cap_gap, text="-", font=("Segoe UI", 8), bg=self.card_bg)
         self.lbl_cap_gap_status.pack(anchor="w")
@@ -4316,6 +4368,14 @@ class ModernPortfolioApp:
         self.lbl_fire_rle_summary = tk.Label(self.fire_burn_banner, text="", font=("Segoe UI", 8))
         self.lbl_fire_rle_summary.pack(anchor="w", pady=(1, 0))
 
+        self.canvas_burn_meter = tk.Canvas(
+            self.fire_burn_banner,
+            height=46,
+            highlightthickness=0,
+            bg=self.card_bg,
+        )
+        self.canvas_burn_meter.pack(fill=tk.X, pady=(4, 2))
+
         # Essential Floor Coverage indicator
         self.fire_floor_banner = tk.Frame(self.fire_s5_box, bd=1, relief="solid", padx=10, pady=5)
         self.fire_floor_banner.pack(fill=tk.X, pady=(0, 6))
@@ -4325,6 +4385,14 @@ class ModernPortfolioApp:
 
         self.lbl_fire_disc_badge = tk.Label(self.fire_floor_banner, text="", font=("Segoe UI", 8))
         self.lbl_fire_disc_badge.pack(anchor="w", pady=(1, 0))
+
+        self.canvas_floor_cov = tk.Canvas(
+            self.fire_floor_banner,
+            height=34,
+            highlightthickness=0,
+            bg=self.card_bg,
+        )
+        self.canvas_floor_cov.pack(fill=tk.X, pady=(3, 1))
 
         # Action Checklist & Master Guidance
         self.fire_checklist_box = tk.Frame(self.fire_s5_box, bg="#f8f9fa" if not self.dark_mode else "#252830", bd=1, relief="solid", padx=8, pady=6)
@@ -4506,6 +4574,14 @@ class ModernPortfolioApp:
             f"{t('fire_audit_passive_div', val=self.converter.format_money(cur_ann_div, target_curr), yld=div_yld_pct)}"
         )
         self.fire_audit_summary_lbl.config(text=summary_audit_str)
+        if hasattr(self, "canvas_fire_asset_split"):
+            draw_fire_asset_ratio_bar(
+                self.canvas_fire_asset_split,
+                equity_val=cur_equity_val,
+                safe_val=total_effective_safe,
+                currency_prefix=self.converter.get_symbol(target_curr),
+                dark_mode=self.dark_mode,
+            )
 
         # Parse inputs
         try:
@@ -4620,6 +4696,14 @@ class ModernPortfolioApp:
         self.fire_timeline_lbl.config(
             text=t("fire_timeline_status", years=years_to_retire, dur=ret_duration)
         )
+        if hasattr(self, "canvas_fire_timeline"):
+            draw_fire_timeline_bar(
+                self.canvas_fire_timeline,
+                cur_age=cur_age,
+                ret_age=ret_age,
+                life_exp=life_exp,
+                dark_mode=self.dark_mode,
+            )
 
         # Update Gap Cards
         safe_gap = res["safe_asset_gap"]
@@ -4640,6 +4724,21 @@ class ModernPortfolioApp:
                 text=t("fire_safe_gap_full_detail", target=lm_target, surplus=surplus),
                 fg="#188038",
             )
+        if hasattr(self, "canvas_safe_gap"):
+            safe_note = (
+                f"🛡️ {t('lbl_safe_years')}: {total_effective_safe / (lm_target / s_yrs):.1f} of {s_yrs:.0f} yrs"
+                if (lm_target > 0 and s_yrs > 0) else ""
+            )
+            draw_fire_comparison_gauge(
+                self.canvas_safe_gap,
+                current_val=total_effective_safe,
+                target_val=lm_target,
+                label_cur=t("lbl_cur_safe"),
+                label_tgt=f"{s_yrs:.0f}y " + t("lbl_safe_buffer_target"),
+                unit_prefix=self.converter.get_symbol(target_curr),
+                projection_note=safe_note,
+                dark_mode=self.dark_mode,
+            )
 
         # Div gap
         div_gap_ann = res["dividend_gap_annual"]
@@ -4659,6 +4758,22 @@ class ModernPortfolioApp:
                 text=t("fire_div_gap_full_detail", div=cur_ann_div, rle=rle_ann),
                 fg="#188038",
             )
+        if hasattr(self, "canvas_div_gap"):
+            div_note = (
+                f"📈 Crossover in {years_cross:.1f} yrs @ {div_g*100.0:.1f}% growth"
+                if (div_gap_ann > 0 and years_cross < 90)
+                else ("✓ Full Dividend Freedom Achieved" if div_gap_ann <= 0 else "")
+            )
+            draw_fire_comparison_gauge(
+                self.canvas_div_gap,
+                current_val=cur_ann_div,
+                target_val=rle_ann,
+                label_cur=t("lbl_cur_div"),
+                label_tgt=t("lbl_rle_target"),
+                unit_prefix=self.converter.get_symbol(target_curr),
+                projection_note=div_note,
+                dark_mode=self.dark_mode,
+            )
 
         # Capital gap
         cap_32 = res["bernstein_swr_32_target"]
@@ -4677,6 +4792,22 @@ class ModernPortfolioApp:
             self.lbl_cap_gap_status.config(
                 text=t("fire_cap_gap_full_detail", wealth=total_effective_wealth, target=cap_32),
                 fg="#188038",
+            )
+        if hasattr(self, "canvas_cap_gap"):
+            cap_note = (
+                f"💰 Monthly Savings Needed: {self.converter.format_money(savings_needed, target_curr)}/mo"
+                if (cap_gap > 0 and savings_needed > 0)
+                else ("✓ Bernstein SWR Capital Goal Reached" if cap_gap <= 0 else "")
+            )
+            draw_fire_comparison_gauge(
+                self.canvas_cap_gap,
+                current_val=total_effective_wealth,
+                target_val=cap_32,
+                label_cur=t("lbl_cur_wealth"),
+                label_tgt=t("lbl_cap_32_target"),
+                unit_prefix=self.converter.get_symbol(target_curr),
+                projection_note=cap_note,
+                dark_mode=self.dark_mode,
             )
 
         # Update CAPE Dynamic SWR Card
@@ -4731,6 +4862,12 @@ class ModernPortfolioApp:
             bg=badge_bg,
             fg=self.text_dark,
         )
+        if hasattr(self, "canvas_burn_meter"):
+            draw_fire_burn_meter(
+                self.canvas_burn_meter,
+                burn_rate_pct=burn_rate,
+                dark_mode=self.dark_mode,
+            )
 
         # Essential floor banner
         if hasattr(self, "fire_floor_banner"):
@@ -4756,6 +4893,13 @@ class ModernPortfolioApp:
                 bg=floor_bg,
                 fg=self.text_dark,
             )
+            if hasattr(self, "canvas_floor_cov"):
+                draw_fire_floor_coverage_bar(
+                    self.canvas_floor_cov,
+                    ess_cov_pct=ess_cov,
+                    disc_cov_pct=disc_cov,
+                    dark_mode=self.dark_mode,
+                )
 
         # Checklist & Master Guidance text
         chk_1 = t("fire_checklist_item1_pass") if safe_gap == 0 else t("fire_checklist_item1_fail", gap=safe_gap)

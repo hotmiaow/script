@@ -2017,6 +2017,7 @@ class TestEnhancementsAndImprovements(unittest.TestCase):
         import web_server
         port = web_server.start_server(port=9876)
         self.assertTrue(web_server.is_running())
+        web_server.stop_server()
     def test_holding_edit_and_currency_preservation(self):
         import csv_manager
         temp_csv = os.path.join(os.path.dirname(__file__), "test_temp_edit_port.csv")
@@ -4471,6 +4472,378 @@ class TestBernsteinPhase3Upgrades(unittest.TestCase):
         self.assertEqual(inserted_rows["wl_TSLA"]["tags"], ("negative",))
         # MSFT target reached & rose -> reached_positive tag
         self.assertEqual(inserted_rows["wl_MSFT"]["tags"], ("reached_positive",))
+
+
+class TestFireChartRenderers(unittest.TestCase):
+    """Unit tests for William J. Bernstein FIRE chart and gauge rendering engines."""
+
+    def setUp(self):
+        from unittest.mock import MagicMock, patch
+        self.canvas = MagicMock()
+        self.canvas.winfo_width.return_value = 400
+        self.canvas.winfo_height.return_value = 50
+
+    def test_draw_fire_asset_ratio_bar_zero(self):
+        from chart_canvas import draw_fire_asset_ratio_bar
+        draw_fire_asset_ratio_bar(self.canvas, equity_val=0.0, safe_val=0.0)
+        self.canvas.delete.assert_called_with("all")
+        self.canvas.create_text.assert_called()
+        args, kwargs = self.canvas.create_text.call_args
+        self.assertIn("No asset data", kwargs.get("text", ""))
+
+    def test_draw_fire_asset_ratio_bar_normal(self):
+        from chart_canvas import draw_fire_asset_ratio_bar
+        draw_fire_asset_ratio_bar(self.canvas, equity_val=750000.0, safe_val=250000.0, currency_prefix="$", dark_mode=False)
+        self.canvas.delete.assert_called_with("all")
+        # Ensure rectangles for track and segments were drawn
+        self.assertGreaterEqual(self.canvas.create_rectangle.call_count, 3)
+        # Ensure texts for equity and safe percentages were rendered
+        text_calls = [k.get("text", "") for _, k in self.canvas.create_text.call_args_list]
+        self.assertTrue(any("Equity:" in t and "75.0%" in t for t in text_calls))
+        self.assertTrue(any("Safe:" in t and "25.0%" in t for t in text_calls))
+
+    def test_draw_fire_asset_ratio_bar_dark_mode(self):
+        from chart_canvas import draw_fire_asset_ratio_bar
+        draw_fire_asset_ratio_bar(self.canvas, equity_val=600000.0, safe_val=400000.0, currency_prefix="$", dark_mode=True)
+        self.canvas.configure.assert_called_with(bg="#1e222d")
+
+    def test_draw_fire_timeline_bar_normal(self):
+        from chart_canvas import draw_fire_timeline_bar
+        draw_fire_timeline_bar(self.canvas, cur_age=45, ret_age=60, life_exp=90, dark_mode=False)
+        self.canvas.delete.assert_called_with("all")
+        self.assertGreaterEqual(self.canvas.create_rectangle.call_count, 2)
+        text_calls = [k.get("text", "") for _, k in self.canvas.create_text.call_args_list]
+        self.assertTrue(any("Age 45" in t for t in text_calls))
+        self.assertTrue(any("Age 60" in t for t in text_calls))
+        self.assertTrue(any("Age 90" in t for t in text_calls))
+        self.assertTrue(any("Accumulation" in t for t in text_calls))
+        self.assertTrue(any("Distribution" in t for t in text_calls))
+
+    def test_draw_fire_timeline_bar_already_retired(self):
+        from chart_canvas import draw_fire_timeline_bar
+        # cur_age == ret_age
+        draw_fire_timeline_bar(self.canvas, cur_age=65, ret_age=65, life_exp=95, dark_mode=True)
+        self.canvas.delete.assert_called_with("all")
+        self.assertGreaterEqual(self.canvas.create_rectangle.call_count, 1)
+
+    def test_draw_fire_comparison_gauge_shortfall(self):
+        from chart_canvas import draw_fire_comparison_gauge
+        draw_fire_comparison_gauge(
+            self.canvas,
+            current_val=100000.0,
+            target_val=250000.0,
+            label_cur="Current Safe",
+            label_tgt="25y Buffer",
+            unit_prefix="$",
+            projection_note="Covers 10.0 of 25.0 yrs",
+            dark_mode=False,
+        )
+        self.canvas.delete.assert_called_with("all")
+        text_calls = [k.get("text", "") for _, k in self.canvas.create_text.call_args_list]
+        self.assertTrue(any("Current Safe: $100,000 (40.0%)" in t for t in text_calls))
+        self.assertTrue(any("25y Buffer: $250,000" in t for t in text_calls))
+        self.assertTrue(any("Gap: -$150,000" in t for t in text_calls))
+        self.assertTrue(any("Covers 10.0 of 25.0 yrs" in t for t in text_calls))
+
+    def test_draw_fire_comparison_gauge_target_met(self):
+        from chart_canvas import draw_fire_comparison_gauge
+        draw_fire_comparison_gauge(
+            self.canvas,
+            current_val=300000.0,
+            target_val=250000.0,
+            label_cur="Current Safe",
+            label_tgt="Target",
+            unit_prefix="$",
+            projection_note="✓ Surplus",
+            dark_mode=True,
+        )
+        text_calls = [k.get("text", "") for _, k in self.canvas.create_text.call_args_list]
+        self.assertTrue(any("Target Met" in t and "+$50,000 Surplus" in t for t in text_calls))
+
+    def test_draw_fire_comparison_gauge_zero_target(self):
+        from chart_canvas import draw_fire_comparison_gauge
+        draw_fire_comparison_gauge(
+            self.canvas,
+            current_val=0.0,
+            target_val=0.0,
+            label_cur="Current",
+            label_tgt="Target",
+            dark_mode=False,
+        )
+        self.canvas.delete.assert_called_with("all")
+
+    def test_draw_fire_burn_meter(self):
+        from chart_canvas import draw_fire_burn_meter
+        # Test Green Zone (<2.0%)
+        draw_fire_burn_meter(self.canvas, burn_rate_pct=1.85, dark_mode=False)
+        self.canvas.create_polygon.assert_called()
+        text_calls = [k.get("text", "") for _, k in self.canvas.create_text.call_args_list]
+        self.assertTrue(any("1.85% (Safe)" in t for t in text_calls))
+
+        # Test Yellow Zone (2.0 - 3.5%)
+        self.canvas.reset_mock()
+        draw_fire_burn_meter(self.canvas, burn_rate_pct=3.10, dark_mode=True)
+        text_calls_yellow = [k.get("text", "") for _, k in self.canvas.create_text.call_args_list]
+        self.assertTrue(any("3.10% (Sustainable)" in t for t in text_calls_yellow))
+
+        # Test Red Zone (>3.5%)
+        self.canvas.reset_mock()
+        draw_fire_burn_meter(self.canvas, burn_rate_pct=4.80, dark_mode=False)
+        text_calls_red = [k.get("text", "") for _, k in self.canvas.create_text.call_args_list]
+        self.assertTrue(any("4.80% (Over-Burn)" in t for t in text_calls_red))
+
+    def test_draw_fire_floor_coverage_bar(self):
+        from chart_canvas import draw_fire_floor_coverage_bar
+        draw_fire_floor_coverage_bar(self.canvas, ess_cov_pct=100.0, disc_cov_pct=85.0, dark_mode=False)
+        self.canvas.delete.assert_called_with("all")
+        text_calls = [k.get("text", "") for _, k in self.canvas.create_text.call_args_list]
+        self.assertTrue(any("Essential Floor: 100.0% Covered" in t for t in text_calls))
+        self.assertTrue(any("Discretionary Buffer: 85.0%" in t for t in text_calls))
+
+    def test_fire_tab_refresh_invokes_all_canvases(self):
+        import main_gui
+        from unittest.mock import MagicMock, patch
+
+        app = MagicMock()
+        app.dark_mode = False
+        app.summary_currency = "USD"
+        app.converter = MagicMock()
+        app.converter.convert.side_effect = lambda v, f, t: float(v)
+        app.converter.format_money.side_effect = lambda v, c: f"${float(v):,.0f}"
+        app.converter.get_symbol.return_value = "$"
+        app._get_holding_asset_class.return_value = "equity"
+
+        app.tab_fire = MagicMock()
+        app.fire_holdings_tree = MagicMock()
+        app.fire_holdings_tree.get_children.return_value = []
+        app.holdings = [
+            {"symbol": "VOO", "shares": 100, "price": 400.0, "currency": "USD", "annual_dividend": 600.0},
+        ]
+        app.fire_outside_safe_entry = MagicMock()
+        app.fire_outside_safe_entry.get.return_value = "50000.0"
+
+        app.fire_age_spin = MagicMock()
+        app.fire_age_spin.get.return_value = "45"
+        app.fire_retire_age_spin = MagicMock()
+        app.fire_retire_age_spin.get.return_value = "60"
+        app.fire_horizon_spin = MagicMock()
+        app.fire_horizon_spin.get.return_value = "90"
+        app.fire_safe_years_combo = MagicMock()
+        app.fire_safe_years_combo.get.return_value = "25"
+        app.fire_exp_entry = MagicMock()
+        app.fire_exp_entry.get.return_value = "4000.0"
+        app.fire_ess_exp_entry = MagicMock()
+        app.fire_ess_exp_entry.get.return_value = "2800.0"
+        app.fire_disc_exp_entry = MagicMock()
+        app.fire_disc_exp_entry.get.return_value = "1200.0"
+        app.fire_pension_entry = MagicMock()
+        app.fire_pension_entry.get.return_value = "15000.0"
+        app.fire_savings_entry = MagicMock()
+        app.fire_savings_entry.get.return_value = "1000.0"
+        app.fire_growth_entry = MagicMock()
+        app.fire_growth_entry.get.return_value = "5.0"
+        app.fire_cape_spin = MagicMock()
+        app.fire_cape_spin.get.return_value = "34.0"
+        app.fire_delay_pension_var = MagicMock()
+        app.fire_delay_pension_var.get.return_value = True
+
+        app.fire_timeline_lbl = MagicMock()
+        app.lbl_safe_gap_val = MagicMock()
+        app.lbl_safe_gap_status = MagicMock()
+        app.lbl_div_gap_val = MagicMock()
+        app.lbl_div_gap_status = MagicMock()
+        app.lbl_cap_gap_val = MagicMock()
+        app.lbl_cap_gap_status = MagicMock()
+        app.fire_burn_banner = MagicMock()
+        app.lbl_fire_burn_badge = MagicMock()
+        app.lbl_fire_rle_summary = MagicMock()
+        app.fire_floor_banner = MagicMock()
+        app.lbl_fire_floor_badge = MagicMock()
+        app.lbl_fire_disc_badge = MagicMock()
+        app.lbl_fire_checklist = MagicMock()
+        app.fire_audit_summary_lbl = MagicMock()
+
+        # Canvas mock instances
+        app.canvas_fire_asset_split = MagicMock()
+        app.canvas_fire_timeline = MagicMock()
+        app.canvas_safe_gap = MagicMock()
+        app.canvas_div_gap = MagicMock()
+        app.canvas_cap_gap = MagicMock()
+        app.canvas_burn_meter = MagicMock()
+        app.canvas_floor_cov = MagicMock()
+
+        with patch("main_gui.save_settings"), patch("main_gui.load_settings", return_value={}):
+            main_gui.ModernPortfolioApp._refresh_fire_tab(app)
+
+        # Verify all canvas renderers were invoked
+        app.canvas_fire_asset_split.delete.assert_called_with("all")
+        app.canvas_fire_timeline.delete.assert_called_with("all")
+        app.canvas_safe_gap.delete.assert_called_with("all")
+        app.canvas_div_gap.delete.assert_called_with("all")
+        app.canvas_cap_gap.delete.assert_called_with("all")
+        app.canvas_burn_meter.delete.assert_called_with("all")
+        app.canvas_floor_cov.delete.assert_called_with("all")
+
+
+class TestMobileWebServerAndDeviceDetection(unittest.TestCase):
+    """Unit tests for mobile web server, auto-device detection, and PWA endpoints."""
+
+    def test_parse_device_info(self):
+        from web_server import parse_device_info
+
+        # iPhone
+        iphone_ua = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148 Safari/604.1"
+        res_iphone = parse_device_info(iphone_ua)
+        self.assertEqual(res_iphone["device_type"], "iphone")
+        self.assertTrue(res_iphone["is_touch"])
+        self.assertIn("iPhone", res_iphone["device_name"])
+
+        # iPad
+        ipad_ua = "Mozilla/5.0 (iPad; CPU OS 17_2 like Mac OS X) AppleWebKit/605.1.15 Mobile/15E148 Safari/604.1"
+        res_ipad = parse_device_info(ipad_ua)
+        self.assertEqual(res_ipad["device_type"], "ipad")
+        self.assertTrue(res_ipad["is_touch"])
+        self.assertIn("iPad", res_ipad["device_name"])
+
+        # Windows PC
+        win_ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36"
+        res_win = parse_device_info(win_ua)
+        self.assertEqual(res_win["device_type"], "windows")
+        self.assertFalse(res_win["is_touch"])
+
+        # Mac Desktop
+        mac_ua = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Safari/605.1.15"
+        res_mac = parse_device_info(mac_ua)
+        self.assertEqual(res_mac["device_type"], "mac")
+        self.assertFalse(res_mac["is_touch"])
+
+    def test_web_server_endpoints(self):
+        import urllib.request
+        import json
+        import time
+        import web_server
+
+        web_server.stop_server()
+        port = web_server.start_server(port=9920, host="127.0.0.1")
+        time.sleep(0.05)
+        base_url = f"http://127.0.0.1:{port}"
+
+        try:
+            # 1. Test HTML root (PWA tags & touch controls present)
+            with urllib.request.urlopen(f"{base_url}/") as resp:
+                self.assertEqual(resp.status, 200)
+                html = resp.read().decode("utf-8")
+                self.assertIn("apple-mobile-web-app-capable", html)
+                self.assertIn("manifest.json", html)
+                self.assertIn("G_Finance", html)
+                self.assertIn("bottom-tab-bar", html)
+
+            # 2. Test PWA Manifest
+            with urllib.request.urlopen(f"{base_url}/manifest.json") as resp:
+                self.assertEqual(resp.status, 200)
+                manifest = json.loads(resp.read().decode("utf-8"))
+                self.assertEqual(manifest["display"], "standalone")
+                self.assertEqual(manifest["short_name"], "G_Finance")
+
+            # 3. Test Service Worker
+            with urllib.request.urlopen(f"{base_url}/sw.js") as resp:
+                self.assertEqual(resp.status, 200)
+                sw_content = resp.read().decode("utf-8")
+                self.assertIn("CACHE_NAME", sw_content)
+
+            # 4. Test Device Detection API with custom iPhone header
+            req = urllib.request.Request(
+                f"{base_url}/api/device",
+                headers={"User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)"}
+            )
+            with urllib.request.urlopen(req) as resp:
+                self.assertEqual(resp.status, 200)
+                dev_data = json.loads(resp.read().decode("utf-8"))
+                self.assertEqual(dev_data["device_type"], "iphone")
+                self.assertTrue(dev_data["is_touch"])
+
+            # 5. Test Portfolio API
+            with urllib.request.urlopen(f"{base_url}/api/portfolio?currency=USD") as resp:
+                self.assertEqual(resp.status, 200)
+                p_data = json.loads(resp.read().decode("utf-8"))
+                self.assertIn("total_value", p_data)
+                self.assertIn("holdings", p_data)
+                self.assertIn("equity_assets", p_data)
+                self.assertIn("safe_assets", p_data)
+
+            # 6. Test FIRE Metrics API
+            with urllib.request.urlopen(f"{base_url}/api/fire?currency=USD") as resp:
+                self.assertEqual(resp.status, 200)
+                f_data = json.loads(resp.read().decode("utf-8"))
+                self.assertIn("safe_asset_gap", f_data)
+                self.assertIn("burn_rate_pct", f_data)
+                self.assertIn("dividend_gap_annual", f_data)
+
+            # 7. Test Data Health Check API
+            with urllib.request.urlopen(f"{base_url}/api/health") as resp:
+                self.assertEqual(resp.status, 200)
+                h_data = json.loads(resp.read().decode("utf-8"))
+                self.assertIn("healthy", h_data)
+                self.assertIn("issues", h_data)
+
+            # 8. Test Data Repair API
+            repair_req = urllib.request.Request(f"{base_url}/api/repair", data=b"", method="POST")
+            with urllib.request.urlopen(repair_req) as resp:
+                self.assertEqual(resp.status, 200)
+                r_data = json.loads(resp.read().decode("utf-8"))
+                self.assertEqual(r_data.get("status"), "success")
+
+            # 9. Test HTML Financial Report API
+            with urllib.request.urlopen(f"{base_url}/api/report?currency=USD") as resp:
+                self.assertEqual(resp.status, 200)
+                rep_html = resp.read().decode("utf-8")
+                self.assertIn("Portfolio Executive Report", rep_html)
+
+            # 10. Test CSV Export API
+            with urllib.request.urlopen(f"{base_url}/api/export/csv") as resp:
+                self.assertEqual(resp.status, 200)
+                csv_data = resp.read().decode("utf-8")
+                self.assertIn("Symbol", csv_data)
+
+            # 11. Test JSON Backup API
+            with urllib.request.urlopen(f"{base_url}/api/export/json") as resp:
+                self.assertEqual(resp.status, 200)
+                b_data = json.loads(resp.read().decode("utf-8"))
+                self.assertIn("portfolio", b_data)
+                self.assertIn("watchlist", b_data)
+
+        finally:
+            web_server.stop_server()
+
+    def test_cli_argument_defaults(self):
+        import argparse
+        parser = argparse.ArgumentParser()
+        parser.add_argument("command", nargs="?", default="view")
+        parser.add_argument("--port", type=int, default=8765)
+        parser.add_argument("--host", type=str, default="0.0.0.0")
+        parser.add_argument("--view", dest="auto_view", action="store_true", default=True)
+        parser.add_argument("--no-view", "--headless", dest="auto_view", action="store_false")
+
+        # Default run: python3 web_server.py
+        args1 = parser.parse_args([])
+        self.assertTrue(args1.auto_view)
+        self.assertEqual(args1.command, "view")
+
+        # Explicit view: python3 web_server.py view
+        args2 = parser.parse_args(["view"])
+        self.assertTrue(args2.auto_view)
+
+        # Explicit flag: python3 web_server.py --view
+        args3 = parser.parse_args(["--view"])
+        self.assertTrue(args3.auto_view)
+
+        # Opt-out: python3 web_server.py --no-view
+        args4 = parser.parse_args(["--no-view"])
+        self.assertFalse(args4.auto_view)
+
+        # Opt-out headless: python3 web_server.py --headless
+        args5 = parser.parse_args(["--headless"])
+        self.assertFalse(args5.auto_view)
 
 
 if __name__ == "__main__":
