@@ -2,3 +2,7 @@
 .DS_Store
 *.pyc
 __pycache__/
+*.mp4
+*.webm
+*.mkv
+*.mp3

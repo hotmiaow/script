@@ -1,0 +1,1332 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>kaf-cli 繁體中文電子書轉換器 (Web 版)</title>
+    <style>
+        :root {
+            --bg-color: #121418;
+            --card-bg: #1c1f26;
+            --card-sub-bg: #14171d;
+            --border-color: #2e3440;
+            --text-color: #e5e9f0;
+            --text-muted: #8892b0;
+            --primary: #3b82f6;
+            --primary-hover: #2563eb;
+            --success: #10b981;
+            --danger: #ef4444;
+            --radius: 8px;
+            --input-bg: #14171d;
+            --input-text: #ffffff;
+            --btn-bg: #282e3a;
+            --btn-hover: #353d4d;
+            --quick-btn-bg: #242933;
+            --log-bg: #0d1117;
+            --log-color: #58a6ff;
+            --dropzone-bg: rgba(255, 255, 255, 0.02);
+            --modal-overlay: rgba(0, 0, 0, 0.75);
+            --step-card-bg: rgba(28, 31, 38, 0.7);
+            --step-card-title: #e5e9f0;
+            --step-card-desc: #8892b0;
+            --header-title: #ffffff;
+            --guide-bg: linear-gradient(90deg, rgba(14, 165, 233, 0.12) 0%, rgba(99, 102, 241, 0.08) 100%);
+            --guide-border: rgba(56, 189, 248, 0.35);
+            --guide-text: #cbd5e1;
+            --gemma-report-bg: #0f172a;
+        }
+
+        [data-theme="light"] {
+            --bg-color: #f1f5f9;
+            --card-bg: #ffffff;
+            --card-sub-bg: #f8fafc;
+            --border-color: #cbd5e1;
+            --text-color: #1e293b;
+            --text-muted: #64748b;
+            --primary: #2563eb;
+            --primary-hover: #1d4ed8;
+            --success: #059669;
+            --danger: #dc2626;
+            --input-bg: #ffffff;
+            --input-text: #0f172a;
+            --btn-bg: #f1f5f9;
+            --btn-hover: #e2e8f0;
+            --quick-btn-bg: #f8fafc;
+            --log-bg: #1e293b;
+            --log-color: #93c5fd;
+            --dropzone-bg: rgba(241, 245, 249, 0.6);
+            --modal-overlay: rgba(15, 23, 42, 0.65);
+            --step-card-bg: #f8fafc;
+            --step-card-title: #0f172a;
+            --step-card-desc: #64748b;
+            --header-title: #0f172a;
+            --guide-bg: linear-gradient(90deg, rgba(219, 234, 254, 0.7) 0%, rgba(224, 231, 255, 0.6) 100%);
+            --guide-border: rgba(37, 99, 235, 0.3);
+            --guide-text: #334155;
+            --gemma-report-bg: #f8fafc;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang TC", "Microsoft JhengHei", "Noto Sans TC", sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            margin: 0;
+            padding: 20px;
+            display: flex;
+            justify-content: center;
+            transition: background-color 0.25s, color 0.25s;
+        }
+        .container {
+            width: 100%;
+            max-width: 960px;
+        }
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid var(--border-color);
+            padding-bottom: 15px;
+            margin-bottom: 20px;
+        }
+        .header-title h1 {
+            margin: 0;
+            font-size: 22px;
+            color: var(--header-title);
+        }
+        .header-title h1 span {
+            color: var(--primary);
+        }
+        .header-title p {
+            margin: 4px 0 0 0;
+            font-size: 13px;
+            color: var(--text-muted);
+        }
+        .theme-toggle-btn {
+            background: var(--card-bg);
+            border: 1px solid var(--border-color);
+            color: var(--text-color);
+            padding: 6px 12px;
+            border-radius: 20px;
+            font-size: 13px;
+            font-weight: 600;
+            cursor: pointer;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.05);
+            transition: all 0.2s ease;
+        }
+        .theme-toggle-btn:hover {
+            border-color: var(--primary);
+            background: var(--btn-hover);
+        }
+        .badge-status {
+            background: rgba(16, 185, 129, 0.15);
+            color: var(--success);
+            padding: 6px 12px;
+            border-radius: 20px;
+            font-size: 13px;
+            font-weight: bold;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .badge-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: currentColor;
+        }
+        .tabs {
+            display: flex;
+            gap: 4px;
+            margin-bottom: 15px;
+            border-bottom: 1px solid var(--border-color);
+            overflow-x: auto;
+        }
+        .tab-btn {
+            background: none;
+            border: none;
+            color: var(--text-muted);
+            padding: 10px 18px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 500;
+            border-bottom: 2px solid transparent;
+            transition: all 0.2s;
+        }
+        .tab-btn.active {
+            color: var(--primary);
+            border-bottom-color: var(--primary);
+            font-weight: bold;
+        }
+        .tab-btn:hover:not(.active) {
+            color: var(--text-color);
+        }
+        .tab-content {
+            display: none;
+        }
+        .tab-content.active {
+            display: block;
+        }
+        .card {
+            background: var(--card-bg);
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius);
+            padding: 20px;
+            margin-bottom: 20px;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.04);
+            transition: background-color 0.25s, border-color 0.25s;
+        }
+        .card-title {
+            margin-top: 0;
+            font-size: 16px;
+            color: var(--primary);
+            margin-bottom: 16px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .form-row {
+            display: flex;
+            gap: 16px;
+            margin-bottom: 14px;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+        .form-group {
+            flex: 1;
+            min-width: 220px;
+        }
+        .form-group label {
+            display: block;
+            margin-bottom: 6px;
+            font-size: 13px;
+            color: var(--text-muted);
+        }
+        input[type="text"], input[type="number"], select, textarea {
+            width: 100%;
+            box-sizing: border-box;
+            background: var(--input-bg);
+            border: 1px solid var(--border-color);
+            color: var(--input-text);
+            padding: 8px 12px;
+            border-radius: 6px;
+            font-size: 14px;
+            transition: background-color 0.2s, border-color 0.2s, color 0.2s;
+        }
+        input:focus, select:focus, textarea:focus {
+            outline: none;
+            border-color: var(--primary);
+        }
+        .dropzone {
+            border: 2px dashed var(--border-color);
+            border-radius: var(--radius);
+            padding: 30px;
+            text-align: center;
+            cursor: pointer;
+            background: var(--dropzone-bg);
+            transition: all 0.2s;
+        }
+        .dropzone:hover {
+            border-color: var(--primary);
+            background: rgba(59, 130, 246, 0.08);
+        }
+        .btn {
+            background: var(--btn-bg);
+            color: var(--text-color);
+            border: 1px solid var(--border-color);
+            padding: 8px 16px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-weight: 500;
+            transition: background 0.2s, border-color 0.2s;
+        }
+        .btn:hover {
+            background: var(--btn-hover);
+        }
+        .btn-primary {
+            background: var(--primary);
+            border-color: var(--primary);
+            color: #fff;
+            font-weight: bold;
+        }
+        .btn-primary:hover {
+            background: var(--primary-hover);
+        }
+        .btn-large {
+            padding: 12px 28px;
+            font-size: 16px;
+            border-radius: 8px;
+        }
+        .btn-group {
+            display: flex;
+            gap: 6px;
+        }
+        .quick-btn {
+            padding: 4px 8px;
+            font-size: 12px;
+            background: var(--quick-btn-bg);
+            border: 1px solid var(--border-color);
+            color: var(--text-muted);
+            border-radius: 4px;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        .quick-btn:hover {
+            color: var(--text-color);
+            border-color: var(--primary);
+        }
+        .log-box {
+            background: var(--log-bg);
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius);
+            padding: 12px;
+            font-family: monospace;
+            font-size: 12px;
+            height: 250px;
+            overflow-y: auto;
+            color: var(--log-color);
+            white-space: pre-wrap;
+            margin-top: 10px;
+        }
+        .progress-bar {
+            height: 8px;
+            background: var(--border-color);
+            border-radius: 4px;
+            overflow: hidden;
+            margin-top: 10px;
+        }
+        .progress-fill {
+            height: 100%;
+            background: var(--primary);
+            width: 0%;
+            transition: width 0.3s;
+        }
+        .download-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 10px 14px;
+            background: var(--card-sub-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            margin-top: 8px;
+        }
+        /* 彈出視窗 */
+        .modal {
+            display: none;
+            position: fixed;
+            top: 0; left: 0; width: 100%; height: 100%;
+            background: var(--modal-overlay);
+            justify-content: center;
+            align-items: center;
+            z-index: 1000;
+        }
+        .modal-content {
+            background: var(--card-bg);
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius);
+            width: 90%;
+            max-width: 680px;
+            max-height: 80vh;
+            display: flex;
+            flex-direction: column;
+            padding: 20px;
+        }
+        .modal-body {
+            overflow-y: auto;
+            flex: 1;
+            margin-top: 10px;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 13px;
+        }
+        th, td {
+            padding: 8px 10px;
+            border-bottom: 1px solid var(--border-color);
+            text-align: left;
+        }
+        th {
+            background: var(--card-sub-bg);
+            color: var(--text-muted);
+        }
+        /* 4 階段 Pipeline 指示列樣式 */
+        .pipeline-stepper {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 8px;
+            margin-bottom: 16px;
+        }
+        @media (max-width: 860px) {
+            .pipeline-stepper {
+                grid-template-columns: repeat(2, 1fr);
+            }
+        }
+        @media (max-width: 480px) {
+            .pipeline-stepper {
+                grid-template-columns: 1fr;
+            }
+        }
+        .step-card {
+            background: var(--step-card-bg);
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius);
+            padding: 8px 10px;
+            transition: all 0.25s ease;
+            position: relative;
+        }
+        .step-card.active {
+            border-color: var(--primary);
+            background: rgba(59, 130, 246, 0.12);
+            box-shadow: 0 0 12px rgba(59, 130, 246, 0.25);
+        }
+        .step-card.completed {
+            border-color: var(--success);
+            background: rgba(16, 185, 129, 0.1);
+        }
+        .step-card-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-size: 11px;
+            font-weight: bold;
+            color: var(--text-muted);
+            margin-bottom: 4px;
+        }
+        .step-card.active .step-card-header {
+            color: var(--primary);
+        }
+        .step-card.completed .step-card-header {
+            color: var(--success);
+        }
+        .step-card-title {
+            font-size: 13px;
+            font-weight: bold;
+            color: var(--step-card-title);
+            margin-bottom: 4px;
+        }
+        .step-card.active .step-card-title {
+            color: var(--primary);
+        }
+        .step-card-desc {
+            font-size: 11px;
+            color: var(--step-card-desc);
+            line-height: 1.4;
+        }
+        .step-badge {
+            font-size: 10px;
+            padding: 2px 6px;
+            border-radius: 10px;
+            background: rgba(125, 125, 125, 0.12);
+        }
+        .guide-banner {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            background: var(--guide-bg);
+            border: 1px solid var(--guide-border);
+            border-radius: var(--radius);
+            padding: 10px 16px;
+            margin-bottom: 16px;
+            font-size: 13px;
+            flex-wrap: wrap;
+        }
+        .guide-step {
+            color: var(--guide-text);
+        }
+        .guide-step b {
+            color: var(--primary);
+        }
+        .guide-arrow {
+            color: var(--text-muted);
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+    <header>
+        <div class="header-title">
+            <h1><span>kaf-cli</span> 繁體中文電子書轉換器</h1>
+            <p>快速將 TXT 文字小說轉換為高畫質 EPUB / MOBI / AZW3 電子書</p>
+        </div>
+        <div style="display: flex; align-items: center; gap: 10px;">
+            <button id="themeToggleBtn" class="theme-toggle-btn" onclick="toggleTheme()" title="切換淺色/深色主題">
+                <span id="themeIcon">☀️</span>
+                <span id="themeText">切換淺色</span>
+            </button>
+            <div id="statusBadge" class="badge-status">
+                <span class="badge-dot"></span>
+                <span id="statusText">檢測中...</span>
+            </div>
+        </div>
+    </header>
+
+    <!-- 4 階段 Pipeline 流程導引指示列 -->
+    <div class="pipeline-stepper" id="pipelineStepper">
+        <div class="step-card" id="stepCard1">
+            <div class="step-card-header">
+                <span>步驟 1/4</span>
+                <span class="step-badge" id="stepBadge1">等待中</span>
+            </div>
+            <div class="step-card-title">🧹 文本排版預處理</div>
+            <div class="step-card-desc">短行硬換行拼接 / 斷句還原 / 空格清理</div>
+        </div>
+        <div class="step-card" id="stepCard2">
+            <div class="step-card-header">
+                <span>步驟 2/4</span>
+                <span class="step-badge" id="stepBadge2">等待中</span>
+            </div>
+            <div class="step-card-title">🤖 AI 語意增強</div>
+            <div class="step-card-desc">Gemma 2 去重 / 時序重排 / 人物導讀</div>
+        </div>
+        <div class="step-card" id="stepCard3">
+            <div class="step-card-header">
+                <span>步驟 3/4</span>
+                <span class="step-badge" id="stepBadge3">等待中</span>
+            </div>
+            <div class="step-card-title">🔍 章節匹配檢驗</div>
+            <div class="step-card-desc">自動正則探測 / 多層目錄熔合驗證</div>
+        </div>
+        <div class="step-card" id="stepCard4">
+            <div class="step-card-header">
+                <span>步驟 4/4</span>
+                <span class="step-badge" id="stepBadge4">等待中</span>
+            </div>
+            <div class="step-card-title">📖 正體與電子書編譯</div>
+            <div class="step-card-desc">s2tw 正體化 / 樣式套用 / 電子書生成</div>
+        </div>
+    </div>
+
+    <div class="tabs">
+        <button class="tab-btn active" onclick="switchTab(0)">📚 檔案與轉換</button>
+        <button class="tab-btn" onclick="switchTab(1)">📐 排版與版面</button>
+        <button class="tab-btn" onclick="switchTab(2)">🔍 章節與分卷匹配</button>
+        <button class="tab-btn" onclick="switchTab(3)">🎨 封面設定</button>
+        <button class="tab-btn" onclick="switchTab(4)">🖋️ 自訂 CSS 樣式</button>
+        <button class="tab-btn" onclick="switchTab(5)">🤖 Gemma 2 文本與角色</button>
+        <button class="tab-btn" onclick="switchTab(6)">💻 即時日誌與下載</button>
+    </div>
+
+    <!-- TAB 1: 檔案與轉換 -->
+    <div class="tab-content active" id="tab0">
+        <!-- 🚀 3 步極速使用指南 Banner -->
+        <div class="guide-banner">
+            <span style="color:#38bdf8; font-weight:bold;">🚀 極速使用指南:</span>
+            <span class="guide-step"><b>第 1 步:</b> 選取或拖入小說 TXT</span>
+            <span class="guide-arrow">➜</span>
+            <span class="guide-step"><b>第 2 步:</b> 系統自動偵測最佳規則</span>
+            <span class="guide-arrow">➜</span>
+            <span class="guide-step"><b>第 3 步:</b> 點擊下方「🚀 開始轉換電子書」</span>
+        </div>
+
+        <div class="card">
+            <h3 class="card-title">1. 選取或上傳書籍檔案 (TXT / PDF)</h3>
+            <div class="dropzone" id="dropzone" onclick="document.getElementById('fileInput').click()">
+                <p style="font-size: 16px; margin: 0 0 8px 0;">📂 點擊選取或拖曳書籍檔案至此 (支援 .txt 與 .pdf)</p>
+                <p style="font-size: 12px; color: var(--text-muted); margin: 0;">支援小說、故事、通用非小說、人文社科、商業與技術文檔，自動解析書名與作者</p>
+                <input type="file" id="fileInput" accept=".txt,.pdf" style="display:none" onchange="handleFileSelect(event)">
+            </div>
+            <div id="fileInfo" style="display:none; margin-top: 14px; padding: 12px; background: var(--card-sub-bg); border: 1px solid var(--border-color); border-radius: 6px;">
+                <div class="form-row">
+                    <div class="form-group">
+                        <label>書籍名稱 (-bookname):</label>
+                        <input type="text" id="booknameInput">
+                    </div>
+                    <div class="form-group">
+                        <label>書籍作者 (-author):</label>
+                        <input type="text" id="authorInput" value="YSTYLE">
+                    </div>
+                </div>
+                <div id="detectBanner" style="display:none; margin-top: 10px; padding: 10px 14px; background: rgba(59, 130, 246, 0.15); border: 1px solid rgba(59, 130, 246, 0.3); border-radius: 6px; font-size: 13px; color: #93c5fd;"></div>
+            </div>
+        </div>
+
+        <div class="card">
+            <h3 class="card-title">2. 輸出格式與書籍核心選項</h3>
+            <div class="form-row">
+                <div class="form-group">
+                    <label>書籍類型 (Book Type):</label>
+                    <select id="bookTypeSelect">
+                        <option value="auto" selected>自動識別書籍類型 (推薦)</option>
+                        <option value="story">小說 / 故事 (Story / Fiction)</option>
+                        <option value="general">通用書籍 / 人文社科 / 商業 (General Non-Fiction)</option>
+                        <option value="technical">技術手冊 / 學術文檔 (Technical / Academic)</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>PDF 處理模式 (PDF Engine):</label>
+                    <select id="pdfModeSelect">
+                        <option value="auto" selected>自動推薦 (技術書高保真，小說重排)</option>
+                        <option value="direct_epub">直轉 EPUB (高保真排版，完整保留代碼/表格/插圖)</option>
+                        <option value="novel_txt">小說文字精排 (轉純文字後以 kaf-cli 重排)</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>輸出書籍格式 (-format):</label>
+                    <select id="formatSelect">
+                        <option value="all">全部生成 (ALL: EPUB + MOBI + AZW3)</option>
+                        <option value="epub" selected>僅 EPUB (.epub)</option>
+                        <option value="mobi">僅 MOBI (.mobi - 需 kindlegen)</option>
+                        <option value="azw3">僅 AZW3 (.azw3)</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>內文簡繁轉換:</label>
+                    <select id="zhSelect">
+                        <option value="s2tw" selected>簡體轉臺灣正體 (s2tw, 推薦)</option>
+                        <option value="s2hk">簡體轉香港繁體 (s2hk)</option>
+                        <option value="s2t">簡體轉標準繁體 (s2t)</option>
+                        <option value="none">不轉換 (保持原文)</option>
+                    </select>
+                </div>
+            </div>
+            <div style="margin-top: 14px; display: flex; flex-direction: column; gap: 8px;">
+                <div style="padding: 10px 12px; background: rgba(163, 230, 53, 0.08); border: 1px solid rgba(163, 230, 53, 0.25); border-radius: 6px;">
+                    <label style="display: flex; align-items: center; gap: 8px; color: #a3e635; font-weight: bold; cursor: pointer; font-size: 13px;">
+                        <input type="checkbox" id="chkRemoveHardBreaks" checked> 🧹 智慧修復短行硬換行（自動拼接斷句、修復每行過短與破碎段落）
+                    </label>
+                </div>
+                <div style="padding: 10px 12px; background: rgba(56, 189, 248, 0.08); border: 1px solid rgba(56, 189, 248, 0.25); border-radius: 6px;">
+                    <label style="display: flex; align-items: center; gap: 8px; color: #38bdf8; font-weight: bold; cursor: pointer; font-size: 13px;">
+                        <input type="checkbox" id="chkGemmaPipeline" checked> 🤖 轉換前啟用 Embedding Gemma 2 智慧文本重排與知識導讀注入 (小說人物 / 通用書籍概念)
+                    </label>
+                </div>
+                <div style="padding: 10px 12px; background: rgba(168, 85, 247, 0.08); border: 1px solid rgba(168, 85, 247, 0.25); border-radius: 6px;">
+                    <label style="display: flex; align-items: center; gap: 8px; color: #c084fc; font-weight: bold; cursor: pointer; font-size: 13px;">
+                        <input type="checkbox" id="chkEnableMath" checked> 📐 支援 LaTeX 數學公式 (Pandoc MathML 矢量渲染，適用技術手冊與學術論文)
+                    </label>
+                </div>
+            </div>
+        </div>
+
+        <div style="text-align: center; margin-top: 25px;">
+            <button class="btn btn-primary btn-large" id="btnStart" onclick="startConvert()">🚀 開始轉換電子書</button>
+        </div>
+    </div>
+
+    <!-- TAB 2: 排版與版面 -->
+    <div class="tab-content" id="tab1">
+        <div class="card">
+            <h3 class="card-title">排版樣式與字型設定</h3>
+            <div class="form-row">
+                <div class="form-group">
+                    <label>標題對齊方式 (-align):</label>
+                    <select id="alignSelect">
+                        <option value="center" selected>居中 (center)</option>
+                        <option value="left">靠左 (left)</option>
+                        <option value="right">靠右 (right)</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>書籍語言標籤 (-lang):</label>
+                    <select id="langSelect">
+                        <option value="zh-TW" selected>zh-TW (臺灣正體)</option>
+                        <option value="zh-HK">zh-HK (香港繁體)</option>
+                        <option value="zh">zh (中文)</option>
+                        <option value="en">en (English)</option>
+                        <option value="ja">ja (日本語)</option>
+                    </select>
+                </div>
+            </div>
+
+            <div class="form-row">
+                <div class="form-group">
+                    <label>段落首行縮排字數 (-indent):</label>
+                    <input type="number" id="indentInput" value="2" min="0" max="8">
+                </div>
+                <div class="form-group">
+                    <label>章節序號分離顯示:</label>
+                    <label style="display: flex; align-items: center; gap: 8px; margin-top: 8px;">
+                        <input type="checkbox" id="chkSepChap" checked> 序號單獨成行顯示 (-separate-chapter-number)
+                    </label>
+                </div>
+            </div>
+
+            <div class="form-row">
+                <div class="form-group">
+                    <label>段落間距 (-bottom):</label>
+                    <input type="text" id="bottomInput" value="1em">
+                    <div class="btn-group" style="margin-top: 6px;">
+                        <button class="quick-btn" onclick="document.getElementById('bottomInput').value='0.5em'">0.5em</button>
+                        <button class="quick-btn" onclick="document.getElementById('bottomInput').value='1em'">1em</button>
+                        <button class="quick-btn" onclick="document.getElementById('bottomInput').value='1.5em'">1.5em</button>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label>行間距/行高 (-line-height):</label>
+                    <input type="text" id="lineHeightInput" value="1.85">
+                    <div class="btn-group" style="margin-top: 6px;">
+                        <button class="quick-btn" onclick="document.getElementById('lineHeightInput').value='1.5rem'">1.5rem</button>
+                        <button class="quick-btn" onclick="document.getElementById('lineHeightInput').value='1.75'">1.75</button>
+                        <button class="quick-btn" onclick="document.getElementById('lineHeightInput').value='1.85'">1.85</button>
+                        <button class="quick-btn" onclick="document.getElementById('lineHeightInput').value='2.0'">2.0</button>
+                    </div>
+                </div>
+            </div>
+
+            <div class="form-row">
+                <div class="form-group">
+                    <label><input type="checkbox" id="chkTips"> 在電子書結尾添加本軟體說明與教學 (-tips)</label>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- TAB 3: 章節與分卷 -->
+    <div class="tab-content" id="tab2">
+        <div class="card">
+            <h3 class="card-title">章節與分卷匹配正則規則</h3>
+            <div class="form-group" style="margin-bottom: 14px;">
+                <label>章節匹配正則表達式 (-match):</label>
+                <input type="text" id="matchInput" placeholder="留空自動識別；例: 第.{1,8}[章節回]">
+                <div class="btn-group" style="margin-top: 6px; flex-wrap: wrap;">
+                    <button class="quick-btn" onclick="document.getElementById('matchInput').value=''">自動識別</button>
+                    <button class="quick-btn" onclick="document.getElementById('matchInput').value='^第[0-9一二三四五六七八九十百千零〇两 ]+[章回节節集]'">標準中文章節</button>
+                    <button class="quick-btn" onclick="document.getElementById('matchInput').value='第[0-9一二三四五六七八九十百千零〇两 ]+[章回节節]';document.getElementById('maxLenInput').value='60';">天涯行內章節 (第X章)</button>
+                    <button class="quick-btn" onclick="document.getElementById('matchInput').value='^[0-9]+\\s*楼'">天涯/貼吧樓層 (X 樓)</button>
+                    <button class="quick-btn" onclick="document.getElementById('matchInput').value='^[一二三四五六七八九十]+[、\\.]'">中文大寫序號 (一、二、)</button>
+                    <button class="quick-btn" onclick="document.getElementById('matchInput').value='^作者:.+?日期:';document.getElementById('maxLenInput').value='60';">論壇發帖 (作者+日期)</button>
+                    <button class="quick-btn" onclick="document.getElementById('matchInput').value='Chapter\\s+\\d+'">Chapter N</button>
+                </div>
+            </div>
+
+            <div class="form-group" style="margin-bottom: 14px;">
+                <label><input type="checkbox" id="chkVolume" checked> 啟用分卷識別 (-volume-match)</label>
+                <input type="text" id="volumeInput" value="^第[0-9一二三四五六七八九十零〇百千两 ]+[卷部]" style="margin-top: 6px;">
+            </div>
+
+            <div class="form-group" style="margin-bottom: 14px;">
+                <label>排除無效標題正則 (-exclude):</label>
+                <input type="text" id="excludeInput" value="^第[0-9一二三四五六七八九十零〇百千两 ]+(部門|部队|部属|部分|部件|部落|部.*：$)">
+            </div>
+
+            <div class="form-row">
+                <div class="form-group">
+                    <label>標題最大字數 (-max):</label>
+                    <input type="number" id="maxLenInput" value="35" min="10" max="100">
+                </div>
+                <div class="form-group">
+                    <label>未知章節名稱 (-unknow-title):</label>
+                    <input type="text" id="unknowTitleInput" value="章節正文">
+                </div>
+            </div>
+
+            <div style="display: flex; gap: 10px; margin-top: 10px;">
+                <button class="btn" onclick="testChapterMatch()">🔍 即時測試章節匹配 (目錄預覽)</button>
+                <button class="btn" style="background: #3f6212; border-color: #65a30d;" onclick="testUnwrapPreview()">🧹 測試硬換行修復效果 (段落預覽)</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- TAB 4: 封面 -->
+    <div class="tab-content" id="tab3">
+        <div class="card">
+            <h3 class="card-title">封面設定模式 (-cover)</h3>
+            <div style="margin-bottom: 12px;">
+                <label><input type="radio" name="coverMode" value="auto" checked onchange="toggleCoverMode()"> 自動模式: 偵測小說同目錄下的 cover.png 或 cover.jpg</label>
+            </div>
+            <div style="margin-bottom: 12px;">
+                <label><input type="radio" name="coverMode" value="orly" onchange="toggleCoverMode()"> Orly 經典動物封面（本地智慧自適應排版、長標題不截斷）</label>
+                <div id="orlyOptions" style="display:none; margin-left: 20px; margin-top: 8px;">
+                    <div class="form-row">
+                        <div class="form-group">
+                            <label>封面主題色 (例: #2b579a 或 1-16):</label>
+                            <input type="text" id="orlyColorInput" placeholder="留空隨機">
+                        </div>
+                        <div class="form-group">
+                            <label>動物圖案 (0-41):</label>
+                            <input type="number" id="orlyIdxInput" value="-1" min="-1" max="41">
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- TAB 5: 自訂 CSS -->
+    <div class="tab-content" id="tab4">
+        <div class="card">
+            <h3 class="card-title">電子書自訂 CSS 樣式</h3>
+            <div class="form-group" style="margin-bottom: 10px;">
+                <label>選擇預設樣式範本:</label>
+                <select id="cssPresetSelect" onchange="applyCssPreset()">
+                    <option value="臺灣典雅實體書 (Classic Book)">臺灣典雅實體書 (Classic Book)</option>
+                    <option value="護眼柔和深色模式 (Dark / Night Mode)">護眼柔和深色模式 (Dark / Night Mode)</option>
+                    <option value="文青直排直書 (Vertical Reading)">文青直排直書 (Vertical Reading)</option>
+                    <option value="極簡無襯線現代風 (Modern Clean)">極簡無襯線現代風 (Modern Clean)</option>
+                    <option value="預設樣式 (Kaf 預設)">原版 kaf-cli 預設樣式</option>
+                </select>
+            </div>
+            <textarea id="cssTextarea" rows="12" style="font-family: monospace; font-size: 13px;"></textarea>
+        </div>
+    </div>
+
+    <!-- TAB 6: Gemma 2 文本與角色 -->
+    <div class="tab-content" id="tab5">
+        <div class="card">
+            <h3 class="card-title">🤖 Embedding Gemma 2 智慧文本重排與登場人物/世界觀導讀</h3>
+            <p style="font-size: 13px; color: var(--text-muted); margin-top: 0;">
+                運用 Google DeepMind 開源之 Embedding Gemma 2 向量模型，自動比對清理論壇重複貼文、過濾水帖雜訊、修復時序錯亂，並萃取登場角色與世界觀！
+            </p>
+
+            <div class="form-row">
+                <div class="form-group">
+                    <label>向量運算後端:</label>
+                    <select id="gemmaBackendSelect" onchange="toggleGemmaInputs()">
+                        <option value="fast_local" selected>內建繁簡感知語意引擎 (免設定、離線即開即用)</option>
+                        <option value="ollama">Ollama 本機服務 (google/embeddinggemma-2)</option>
+                        <option value="transformers">HuggingFace (SentenceTransformers)</option>
+                        <option value="api">自訂 OpenAI 相容 API (/v1/embeddings)</option>
+                    </select>
+                </div>
+                <div class="form-group" id="gemmaUrlGroup" style="display:none;">
+                    <label>服務端點網址:</label>
+                    <input type="text" id="gemmaUrlInput" value="http://localhost:11434">
+                </div>
+                <div class="form-group">
+                    <label>模型名稱:</label>
+                    <input type="text" id="gemmaModelInput" value="google/embeddinggemma-2">
+                </div>
+            </div>
+
+            <div style="display: flex; gap: 10px; align-items: center; margin-top: 10px;">
+                <button class="btn" type="button" onclick="testGemmaConnection()">⚡ 測試後端連線狀態</button>
+                <span id="gemmaStatusBadge" style="font-size: 12px; color: #10b981;">✓ 內建語意引擎已就緒</span>
+            </div>
+        </div>
+
+        <div class="card">
+            <h3 class="card-title">執行語意分析與重排</h3>
+            <div style="display: flex; gap: 10px; margin-bottom: 14px;">
+                <button class="btn btn-primary" onclick="runGemmaAnalysis()">⚡ 開始執行當前小說 Gemma 2 深度分析</button>
+            </div>
+            <div id="gemmaProgressMsg" style="font-size: 13px; color: #38bdf8; display: none; margin-bottom: 10px;"></div>
+
+            <!-- 分析結果展示區 -->
+            <div id="gemmaResultsBox" style="display:none; margin-top: 15px;">
+                <div class="form-group" style="margin-bottom: 15px;">
+                    <label>📊 文本校驗與重排報告:</label>
+                    <div id="gemmaReportBox" style="padding: 10px; background: #0f172a; border-radius: 6px; font-family: monospace; font-size: 12px; color: #38bdf8; white-space: pre-wrap;"></div>
+                </div>
+
+                <div class="form-group" style="margin-bottom: 15px;">
+                    <label>📖 世界觀與大綱摘要:</label>
+                    <div id="gemmaWorldviewBox" style="padding: 12px; background: #14171d; border-radius: 6px; font-size: 13px; line-height: 1.6;"></div>
+                </div>
+
+                <div class="form-group">
+                    <label>👥 登場角色名冊 (自動萃取):</label>
+                    <table>
+                        <thead><tr><th>人物姓名</th><th>定位</th><th>身分特質</th><th>重要事蹟/關係</th></tr></thead>
+                        <tbody id="gemmaCharsTbody"></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- TAB 7: 日誌與下載 -->
+    <div class="tab-content" id="tab6">
+        <div class="card">
+            <h3 class="card-title">轉換控制台日誌</h3>
+            <div class="progress-bar">
+                <div class="progress-fill" id="progressFill"></div>
+            </div>
+            <div class="log-box" id="logBox">等待轉換任務啟動...</div>
+        </div>
+        <div class="card" id="downloadCard" style="display:none;">
+            <h3 class="card-title">✨ 電子書下載</h3>
+            <div id="downloadList"></div>
+        </div>
+    </div>
+</div>
+
+<!-- 章節測試彈窗 -->
+<div class="modal" id="previewModal">
+    <div class="modal-content">
+        <h3 style="margin-top: 0; color: var(--primary);">章節目錄匹配即時預覽</h3>
+        <div id="modalSummary" style="font-size: 13px; color: var(--text-muted); margin-bottom: 10px;"></div>
+        <div class="modal-body">
+            <table>
+                <thead><tr><th>行號</th><th>類型</th><th>標題</th></tr></thead>
+                <tbody id="modalTableBody"></tbody>
+            </table>
+        </div>
+        <div style="text-align: right; margin-top: 15px;">
+            <button class="btn" onclick="document.getElementById('previewModal').style.display='none'">關閉</button>
+        </div>
+    </div>
+</div>
+
+<script>
+let currentFile = null;
+let currentFileContent = null;
+let cssPresets = {};
+
+// ===== 淺色 / 深色 主題管理 =====
+function initTheme() {
+    const savedTheme = localStorage.getItem('kaf_web_theme') || 'dark';
+    applyTheme(savedTheme);
+}
+
+function applyTheme(theme) {
+    if (theme === 'light') {
+        document.documentElement.setAttribute('data-theme', 'light');
+        const icon = document.getElementById('themeIcon');
+        const text = document.getElementById('themeText');
+        if (icon) icon.innerText = '🌙';
+        if (text) text.innerText = '切換深色';
+    } else {
+        document.documentElement.setAttribute('data-theme', 'dark');
+        const icon = document.getElementById('themeIcon');
+        const text = document.getElementById('themeText');
+        if (icon) icon.innerText = '☀️';
+        if (text) text.innerText = '切換淺色';
+    }
+    localStorage.setItem('kaf_web_theme', theme);
+}
+
+function toggleTheme() {
+    const curTheme = document.documentElement.getAttribute('data-theme') || 'dark';
+    const nextTheme = curTheme === 'dark' ? 'light' : 'dark';
+    applyTheme(nextTheme);
+}
+
+// 立即初始化主題
+initTheme();
+
+function switchTab(index) {
+    document.querySelectorAll('.tab-btn').forEach((btn, i) => {
+        btn.classList.toggle('active', i === index);
+    });
+    document.querySelectorAll('.tab-content').forEach((tc, i) => {
+        tc.classList.toggle('active', i === index);
+    });
+}
+
+function toggleCoverMode() {
+    const isOrly = document.querySelector('input[name="coverMode"]:checked').value === 'orly';
+    document.getElementById('orlyOptions').style.display = isOrly ? 'block' : 'none';
+}
+
+// 載入伺服器狀態與樣式
+fetch('/api/status').then(r => r.json()).then(data => {
+    const b = document.getElementById('statusBadge');
+    const t = document.getElementById('statusText');
+    if (data.ready) {
+        b.style.color = '#10b981';
+        b.style.background = 'rgba(16, 185, 129, 0.15)';
+        t.innerText = 'kaf-cli 已就緒 (' + data.version + ')';
+    } else {
+        b.style.color = '#ef4444';
+        b.style.background = 'rgba(239, 68, 68, 0.15)';
+        t.innerText = '未檢測到核心執行檔';
+    }
+});
+
+fetch('/api/css_presets').then(r => r.json()).then(data => {
+    cssPresets = data;
+    applyCssPreset();
+});
+
+function applyCssPreset() {
+    const sel = document.getElementById('cssPresetSelect').value;
+    if (cssPresets[sel]) {
+        document.getElementById('cssTextarea').value = cssPresets[sel].css;
+    }
+}
+
+function handleFileSelect(e) {
+    const file = e.target.files[0];
+    if (!file) return;
+    currentFile = file;
+    document.getElementById('fileInfo').style.display = 'block';
+
+    // 自動解析書名
+    let title = file.name.replace(/\.(txt|pdf)$/i, '');
+    let author = 'YSTYLE';
+    const m = title.match(/《([^》]+)》.*?作者[：:\s]+([^\s\.\(\)\[\]_]+)/i);
+    if (m) {
+        title = m[1];
+        author = m[2];
+    }
+    document.getElementById('booknameInput').value = title;
+    document.getElementById('authorInput').value = author;
+
+    const isPdf = file.name.toLowerCase().endsWith('.pdf');
+    const banner = document.getElementById('detectBanner');
+
+    if (isPdf) {
+        if (banner) {
+            banner.style.display = 'block';
+            banner.innerHTML = `📄 <b>已載入 PDF 書籍文件 (${(file.size / 1024 / 1024).toFixed(2)} MB)</b>：轉換時系統將自動抽取文字內容、過濾頁首頁尾與頁碼，並套用通用章節檢驗規則。`;
+        }
+        // 若為 PDF，推薦預設為通用書籍
+        const bType = document.getElementById('bookTypeSelect');
+        if (bType && bType.value === 'auto') {
+            bType.value = 'general';
+        }
+    } else {
+        // 讀取前 300KB 用於自動辨識與測試
+        const reader = new FileReader();
+        reader.onload = function(evt) {
+            currentFileContent = evt.target.result;
+            autoDetectRule(currentFileContent.slice(0, 300000));
+        };
+        reader.readAsText(file);
+    }
+}
+
+// 註冊 dropzone 拖曳事件
+window.addEventListener('DOMContentLoaded', () => {
+    const dz = document.getElementById('dropzone');
+    if (dz) {
+        dz.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            dz.style.borderColor = '#38bdf8';
+            dz.style.background = 'rgba(56, 189, 248, 0.08)';
+        });
+        dz.addEventListener('dragleave', () => {
+            dz.style.borderColor = '';
+            dz.style.background = '';
+        });
+        dz.addEventListener('drop', (e) => {
+            e.preventDefault();
+            dz.style.borderColor = '';
+            dz.style.background = '';
+            if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+                handleFileSelect({ target: { files: e.dataTransfer.files } });
+            }
+        });
+    }
+});
+
+function autoDetectRule(sampleText) {
+    const banner = document.getElementById('detectBanner');
+    if (banner) {
+        banner.style.display = 'block';
+        banner.innerHTML = '⚡ <b>正在分析小說章節特徵與最佳規則...</b>';
+    }
+    fetch('/api/auto_detect', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ sample_text: sampleText })
+    }).then(r => r.json()).then(data => {
+        if (data && data.regex) {
+            document.getElementById('matchInput').value = data.regex;
+            document.getElementById('maxLenInput').value = data.max_len;
+            if (banner) {
+                banner.innerHTML = `⚡ <b>系統已自動套用最佳章節規則：</b><span style="color:#60a5fa;font-weight:bold;">${data.rule_name}</span> (預估 <b>${data.chapter_count}</b> 章，標題長度上限 ${data.max_len} 字)`;
+            }
+        } else if (banner) {
+            banner.innerHTML = `ℹ️ <b>未發現特殊論壇格式</b>，已套用 kaf-cli 預設章節規則`;
+        }
+    }).catch(e => {
+        if (banner) banner.style.display = 'none';
+    });
+}
+
+function testChapterMatch() {
+    if (!currentFile) {
+        alert('請先選取 TXT 小說檔案！');
+        return;
+    }
+    const payload = {
+        sample_text: currentFileContent ? currentFileContent.slice(0, 300000) : '',
+        match_regex: document.getElementById('matchInput').value,
+        volume_regex: document.getElementById('chkVolume').checked ? document.getElementById('volumeInput').value : 'false',
+        exclude_regex: document.getElementById('excludeInput').value,
+        max_len: parseInt(document.getElementById('maxLenInput').value) || 35
+    };
+    fetch('/api/test_regex', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(payload)
+    }).then(r => r.json()).then(data => {
+        if (data.error) {
+            alert('測試出錯: ' + data.error);
+            return;
+        }
+        document.getElementById('modalSummary').innerHTML = 
+            `掃描章節數: <b>${data.chapters_found}</b> | 分卷數: <b>${data.volumes_found}</b> | 排除無效行: <b>${data.excluded_count}</b>`;
+        const tbody = document.getElementById('modalTableBody');
+        tbody.innerHTML = '';
+        (data.preview_items || []).forEach(it => {
+            const tr = document.createElement('tr');
+            tr.innerHTML = `<td>${it.line_no}</td><td style="color:${it.type==='卷'?'#10b981':'#3b82f6'};font-weight:bold;">${it.type}</td><td>${it.title}</td>`;
+            tbody.appendChild(tr);
+        });
+        document.getElementById('previewModal').style.display = 'flex';
+    });
+}
+
+function testUnwrapPreview() {
+    if (!currentFile || !currentFileContent) {
+        alert('請先在第一頁選取小說 TXT 檔案！');
+        return;
+    }
+    const payload = {
+        text: currentFileContent.slice(0, 50000),
+        match_regex: document.getElementById('matchInput').value
+    };
+    fetch('/api/unwrap_preview', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(payload)
+    }).then(r => r.json()).then(data => {
+        if (!data.success) {
+            alert('預覽失敗');
+            return;
+        }
+        document.getElementById('modalSummary').innerHTML =
+            `原行數: <b>${data.orig_lines}</b> | 修復後段落數: <b>${data.paragraphs_count}</b> | <span style="color:#a3e635;font-weight:bold;">${data.summary}</span>`;
+        const tbody = document.getElementById('modalTableBody');
+        tbody.innerHTML = '';
+        const paras = data.cleaned_text.split('\n\n').filter(p => p.trim()).slice(0, 15);
+        paras.forEach((p, idx) => {
+            const tr = document.createElement('tr');
+            tr.innerHTML = `<td>${idx + 1}</td><td style="color:#a3e635;font-weight:bold;">段落</td><td style="font-size:12px;line-height:1.6;">${p.replace(/</g, '&lt;')}</td>`;
+            tbody.appendChild(tr);
+        });
+        document.getElementById('previewModal').style.display = 'flex';
+    }).catch(err => {
+        alert('請求出錯: ' + err);
+    });
+}
+
+function toggleGemmaInputs() {
+    const backend = document.getElementById('gemmaBackendSelect').value;
+    const urlGroup = document.getElementById('gemmaUrlGroup');
+    if (backend === 'ollama' || backend === 'api') {
+        urlGroup.style.display = 'block';
+    } else {
+        urlGroup.style.display = 'none';
+    }
+}
+
+function testGemmaConnection() {
+    const backend = document.getElementById('gemmaBackendSelect').value;
+    const url = document.getElementById('gemmaUrlInput').value;
+    const model = document.getElementById('gemmaModelInput').value;
+    const badge = document.getElementById('gemmaStatusBadge');
+    badge.innerText = '連線檢測中...';
+    badge.style.color = '#f59e0b';
+
+    fetch(`/api/gemma/status?backend=${encodeURIComponent(backend)}&model=${encodeURIComponent(model)}&url=${encodeURIComponent(url)}`)
+        .then(r => r.json())
+        .then(data => {
+            if (data.ready) {
+                badge.innerText = '✓ ' + data.message;
+                badge.style.color = '#10b981';
+            } else {
+                badge.innerText = '✕ ' + data.message;
+                badge.style.color = '#ef4444';
+            }
+        }).catch(err => {
+            badge.innerText = '✕ 連線出錯: ' + err;
+            badge.style.color = '#ef4444';
+        });
+}
+
+function runGemmaAnalysis() {
+    if (!currentFile || !currentFileContent) {
+        alert('請先在第一頁選取小說 TXT 檔案！');
+        return;
+    }
+    const msg = document.getElementById('gemmaProgressMsg');
+    msg.style.display = 'block';
+    msg.innerHTML = '⚡ <b>正在進行 Embedding Gemma 2 深度語意分析、去重重排與角色萃取...</b> (請稍候)';
+
+    const payload = {
+        sample_text: currentFileContent.slice(0, 300000),
+        book_title: document.getElementById('booknameInput').value || currentFile.name,
+        backend: document.getElementById('gemmaBackendSelect').value,
+        model_name: document.getElementById('gemmaModelInput').value,
+        ollama_url: document.getElementById('gemmaUrlInput').value,
+        max_characters: 8
+    };
+
+    fetch('/api/gemma/analyze', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(payload)
+    }).then(r => r.json()).then(res => {
+        msg.style.display = 'none';
+        if (!res.success) {
+            alert('Gemma 2 分析失敗: ' + (res.error || '未知錯誤'));
+            return;
+        }
+
+        document.getElementById('gemmaResultsBox').style.display = 'block';
+
+        // 1. 報告
+        const rep = res.report || {};
+        document.getElementById('gemmaReportBox').innerText =
+            `原始段落數：${rep.original_sections} | 保留段落數：${rep.remaining_sections}\n` +
+            `剔除重複貼文：${rep.duplicates_removed} 處 | 清洗水帖雜訊：${rep.noise_filtered} 則\n` +
+            `修復錯位重排：${rep.rearranged_count} 處 | 補全章節標題：${rep.generated_titles} 篇\n\n` +
+            `${rep.summary_text}`;
+
+        // 2. 世界觀
+        const wv = res.worldview || {};
+        document.getElementById('gemmaWorldviewBox').innerHTML =
+            `<p><b>時代背景：</b>${wv.era || '未知'}</p>` +
+            `<p><b>題材標籤：</b>${(wv.genres || []).map(g => `<span class="badge" style="background:#1e3a8a;color:#93c5fd;padding:2px 8px;border-radius:4px;margin-right:5px;">${g}</span>`).join('')}</p>` +
+            `<p style="margin-bottom:0;"><b>故事內容提要：</b>${wv.synopsis || ''}</p>`;
+
+        // 3. 人物清單
+        const tbody = document.getElementById('gemmaCharsTbody');
+        tbody.innerHTML = '';
+        (res.characters || []).forEach(c => {
+            const tr = document.createElement('tr');
+            tr.innerHTML = `<td><b>${c.name}</b></td>` +
+                           `<td><span style="color:#60a5fa;font-weight:bold;">${c.role}</span></td>` +
+                           `<td>${c.identity}</td>` +
+                           `<td>${c.key_actions}</td>`;
+            tbody.appendChild(tr);
+        });
+
+        alert(`Gemma 2 分析完成！共萃取出 ${res.characters ? res.characters.length : 0} 位登場角色與世界觀導讀。`);
+    }).catch(err => {
+        msg.style.display = 'none';
+        alert('網路連線或請求失敗: ' + err);
+    });
+}
+
+function updateStepCard(stepNum, state) {
+    const card = document.getElementById('stepCard' + stepNum);
+    const badge = document.getElementById('stepBadge' + stepNum);
+    if (!card || !badge) return;
+
+    card.classList.remove('active', 'completed');
+    if (state === 'active') {
+        card.classList.add('active');
+        badge.innerText = '⚡ 處理中';
+        badge.style.color = '#38bdf8';
+    } else if (state === 'completed') {
+        card.classList.add('completed');
+        badge.innerText = '✓ 完成';
+        badge.style.color = '#10b981';
+    } else {
+        badge.innerText = '等待中';
+        badge.style.color = 'var(--text-muted)';
+    }
+}
+
+function setPipelineStep(activeStep) {
+    for (let i = 1; i <= 4; i++) {
+        if (i < activeStep) {
+            updateStepCard(i, 'completed');
+        } else if (i === activeStep) {
+            updateStepCard(i, 'active');
+        } else {
+            updateStepCard(i, 'pending');
+        }
+    }
+}
+
+function setAllPipelineCompleted() {
+    for (let i = 1; i <= 4; i++) {
+        updateStepCard(i, 'completed');
+    }
+}
+
+function resetPipelineSteps() {
+    for (let i = 1; i <= 4; i++) {
+        updateStepCard(i, 'pending');
+    }
+}
+
+function startConvert() {
+    if (!currentFile) {
+        alert('請先選取 TXT 小說檔案！');
+        return;
+    }
+    resetPipelineSteps();
+    setPipelineStep(1);
+
+    switchTab(6); // 切換到日誌分頁
+    const logBox = document.getElementById('logBox');
+    logBox.innerText = '🚀 開始執行 4 階段電子書轉換管線...\n\n';
+    document.getElementById('progressFill').style.width = '15%';
+
+    // 動態階段推進動畫模擬（隨處理時間逐步遞進，待回傳後依實際日誌定錨）
+    let simStage = 1;
+    const stageTimer = setInterval(() => {
+        if (simStage < 4) {
+            simStage++;
+            setPipelineStep(simStage);
+            document.getElementById('progressFill').style.width = (simStage * 22) + '%';
+        }
+    }, 1200);
+
+    const formData = new FormData();
+    formData.append('file', currentFile);
+    formData.append('book_type', document.getElementById('bookTypeSelect') ? document.getElementById('bookTypeSelect').value : 'auto');
+    formData.append('pdf_mode', document.getElementById('pdfModeSelect') ? document.getElementById('pdfModeSelect').value : 'auto');
+    formData.append('bookname', document.getElementById('booknameInput').value);
+    formData.append('author', document.getElementById('authorInput').value);
+    formData.append('format', document.getElementById('formatSelect').value);
+    formData.append('zh_conversion', document.getElementById('zhSelect').value);
+    formData.append('align', document.getElementById('alignSelect').value);
+    formData.append('lang', document.getElementById('langSelect').value);
+    formData.append('indent', document.getElementById('indentInput').value);
+    formData.append('bottom', document.getElementById('bottomInput').value);
+    formData.append('line_height', document.getElementById('lineHeightInput').value);
+    formData.append('separate_chapter_number', document.getElementById('chkSepChap').checked);
+    formData.append('tips', document.getElementById('chkTips').checked);
+    formData.append('match_regex', document.getElementById('matchInput').value);
+    formData.append('volume_regex', document.getElementById('chkVolume').checked ? document.getElementById('volumeInput').value : 'false');
+    formData.append('exclude_regex', document.getElementById('excludeInput').value);
+    formData.append('max_title_len', document.getElementById('maxLenInput').value);
+    formData.append('unknow_title', document.getElementById('unknowTitleInput').value);
+    formData.append('cover_mode', document.querySelector('input[name="coverMode"]:checked').value);
+    formData.append('orly_color', document.getElementById('orlyColorInput').value);
+    formData.append('orly_idx', document.getElementById('orlyIdxInput').value);
+    formData.append('custom_css_content', document.getElementById('cssTextarea').value);
+    formData.append('remove_hard_breaks', document.getElementById('chkRemoveHardBreaks') ? document.getElementById('chkRemoveHardBreaks').checked : true);
+    formData.append('use_gemma_pipeline', document.getElementById('chkGemmaPipeline').checked);
+    formData.append('enable_math', document.getElementById('chkEnableMath') ? document.getElementById('chkEnableMath').checked : true);
+    formData.append('gemma_backend', document.getElementById('gemmaBackendSelect') ? document.getElementById('gemmaBackendSelect').value : 'fast_local');
+    formData.append('gemma_model', document.getElementById('gemmaModelInput') ? document.getElementById('gemmaModelInput').value : 'google/embeddinggemma-2');
+    formData.append('gemma_ollama_url', document.getElementById('gemmaUrlInput') ? document.getElementById('gemmaUrlInput').value : 'http://localhost:11434');
+
+    fetch('/api/convert', {
+        method: 'POST',
+        body: formData
+    }).then(r => r.json()).then(res => {
+        clearInterval(stageTimer);
+        document.getElementById('progressFill').style.width = '100%';
+        logBox.innerText += '\n' + (res.logs || []).join('\n') + '\n';
+        if (res.success) {
+            setAllPipelineCompleted();
+            logBox.innerText += '\n✨ 轉換成功！所有 4 階段已完成。\n';
+            showDownloads(res.generated_files || []);
+        } else {
+            logBox.innerText += '\n❌ 轉換失敗: ' + res.message + '\n';
+        }
+    }).catch(err => {
+        clearInterval(stageTimer);
+        logBox.innerText += '\n網路或伺服器錯誤: ' + err;
+    });
+}
+
+function showDownloads(files) {
+    const card = document.getElementById('downloadCard');
+    const list = document.getElementById('downloadList');
+    list.innerHTML = '';
+    files.forEach(f => {
+        const div = document.createElement('div');
+        div.className = 'download-item';
+        div.innerHTML = `<span>📖 <b>${f.filename}</b> (${(f.size/1024).toFixed(1)} KB)</span>
+                         <a href="/api/download?file=${encodeURIComponent(f.path)}" class="btn btn-primary" download>下載電子書</a>`;
+        list.appendChild(div);
+    });
+    card.style.display = 'block';
+}
+</script>
+</body>
+</html>

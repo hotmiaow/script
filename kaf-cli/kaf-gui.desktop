@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=kaf-cli 電子書轉換器 (繁體中文版)
+GenericName=E-book Converter
+Comment=將 TXT 文字小說轉換為 EPUB / MOBI / AZW3 電子書
+Exec=bash -c "cd $(dirname %k) && ./launch.sh"
+Terminal=false
+Categories=Utility;Publishing;Office;
+Keywords=epub;mobi;azw3;novel;txt;ebook;

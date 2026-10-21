@@ -49,7 +49,7 @@ def to_yfinance_symbol(symbol: str) -> str:
     if ":" in s:
         parts = s.split(":")
         ticker, exchange = parts[0].strip(), parts[1].strip()
-        if exchange in ("TSE", "TSX", "TO"):
+        if exchange in ("TSE", "TSX", "TO", "CDN", "CA"):
             return f"{ticker}.TO"
         elif exchange in ("HKG", "HK", "HKEX"):
             if ticker.isdigit():
@@ -63,9 +63,12 @@ def to_yfinance_symbol(symbol: str) -> str:
         if prefix.isdigit():
             return f"{int(prefix):04d}.HK"
         return f"{prefix}.HK"
+    if s.endswith(".TO") or s.endswith(".TSE") or s.endswith(".CDN") or s.endswith(".CA") or s.endswith(".TSX"):
+        prefix = s.split(".")[0].strip()
+        return f"{prefix}.TO"
     if s.isdigit() and len(s) in (4, 5):
         return f"{int(s):04d}.HK"
-    if s in ("VFV", "VGRO", "ZAG", "XEF"):
+    if s in ("VFV", "VGRO", "ZAG", "XEF", "XEQT", "VEQT"):
         return f"{s}.TO"
     return s
 
@@ -84,6 +87,9 @@ class ChartFetcher:
     def _set_cache(self, key: str, data: Dict[str, Any]):
         self._cache[key] = (time.time(), data)
 
+    def clear_cache(self):
+        self._cache.clear()
+
     def fetch_symbol_history(self, raw_symbol: str, timeframe: str = "1D") -> Optional[Dict[str, Any]]:
         tf = timeframe.upper()
         if tf not in TIMEFRAME_CONFIGS:
@@ -95,16 +101,18 @@ class ChartFetcher:
             return cached
 
         result = None
-        # Try yfinance first if available
-        if YFINANCE_AVAILABLE:
+        # Fast path: built-in lightweight urllib query (0.1s, zero external dependencies, 0MB RAM)
+        try:
+            result = self._fetch_via_urllib(raw_symbol, tf, cfg)
+        except Exception:
+            pass
+
+        # Fallback to yfinance only if urllib failed and yfinance is installed
+        if not result and YFINANCE_AVAILABLE:
             try:
                 result = self._fetch_via_yfinance(raw_symbol, tf, cfg)
-            except Exception as e:
-                print(f"yfinance fetch failed for {raw_symbol}: {e}, falling back to direct API")
-
-        # Zero-dependency fallback via built-in urllib
-        if not result:
-            result = self._fetch_via_urllib(raw_symbol, tf, cfg)
+            except Exception:
+                pass
 
         if result:
             self._set_cache(cache_key, result)
@@ -175,73 +183,93 @@ class ChartFetcher:
         yf_sym = to_yfinance_symbol(raw_symbol)
         rng = cfg["period"]
         interval = cfg["interval"]
-        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{yf_sym}?range={rng}&interval={interval}&events=div%7Csplit"
-        req = urllib.request.Request(
-            url,
-            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=8) as resp:
-                data = json.loads(resp.read().decode())
-                chart_res = data.get("chart", {}).get("result")
-                if not chart_res:
-                    return None
-                res0 = chart_res[0]
-                meta = res0.get("meta", {})
-                timestamps_raw = res0.get("timestamp", [])
-                indicators = res0.get("indicators", {}).get("quote", [{}])[0]
-                closes_raw = indicators.get("close", [])
 
-                timestamps = []
-                prices = []
-                for ts, c in zip(timestamps_raw, closes_raw):
-                    if c is not None and ts is not None:
-                        timestamps.append(datetime.fromtimestamp(ts, tz=timezone.utc))
-                        prices.append(float(c))
+        def _do_query(host: str, q_rng: str, q_int: str) -> Optional[dict]:
+            url = f"https://{host}/v8/finance/chart/{yf_sym}?range={q_rng}&interval={q_int}&events=div%7Csplit"
+            req = urllib.request.Request(
+                url,
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=2.5) as resp:
+                    return json.loads(resp.read().decode())
+            except Exception:
+                return None
 
-                if not prices:
-                    return None
+        data = _do_query("query1.finance.yahoo.com", rng, interval)
+        if not data:
+            data = _do_query("query2.finance.yahoo.com", rng, interval)
 
-                prev_close = meta.get("previousClose") or meta.get("chartPreviousClose") or prices[0]
-                curr_price = prices[-1]
-                change = curr_price - prev_close
-                change_pct = (change / prev_close * 100) if prev_close > 0 else 0.0
+        # Special fallback for YTD: if range=ytd fails, try range=1y and filter from Jan 1
+        is_ytd = (tf == "YTD")
+        if not data and is_ytd:
+            data = _do_query("query1.finance.yahoo.com", "1y", "1d") or _do_query("query2.finance.yahoo.com", "1y", "1d")
 
-                div_events = []
-                events = res0.get("events", {}).get("dividends", {})
-                if events:
-                    for d_info in events.values():
-                        d_amount = float(d_info.get("amount", 0.0) or 0.0)
-                        d_ts = d_info.get("date")
-                        if d_amount > 0 and d_ts:
-                            div_events.append((datetime.fromtimestamp(d_ts, tz=timezone.utc), d_amount))
-                div_events.sort(key=lambda x: x[0])
-                start_ts_val = timestamps[0].timestamp() if timestamps else 0.0
-                end_ts_val = timestamps[-1].timestamp() if timestamps else time.time()
-                period_div = sum(amt for dt, amt in div_events if start_ts_val <= dt.timestamp() <= end_ts_val)
-                now_ts = time.time()
-                one_yr_divs = [amt for dt, amt in div_events if dt.timestamp() >= (now_ts - 365 * 86400)]
-                annual_div = sum(one_yr_divs) if one_yr_divs else (period_div if div_events else 0.0)
-
-                return {
-                    "label": raw_symbol,
-                    "symbol": yf_sym,
-                    "timeframe": tf,
-                    "timestamps": timestamps,
-                    "prices": prices,
-                    "prev_close": float(prev_close),
-                    "current_price": float(curr_price),
-                    "change": float(change),
-                    "change_pct": float(change_pct),
-                    "currency": meta.get("currency", "USD" if not yf_sym.endswith(".TO") else "CAD"),
-                    "dividend_events": div_events,
-                    "period_div_per_share": period_div,
-                    "annual_dividend_per_share": annual_div,
-                    "source": "urllib_fallback",
-                }
-        except Exception as e:
-            print(f"urllib chart fetch error for {raw_symbol}: {e}")
+        if not data:
             return None
+
+        chart_res = data.get("chart", {}).get("result")
+        if not chart_res:
+            return None
+        res0 = chart_res[0]
+        meta = res0.get("meta", {})
+        timestamps_raw = res0.get("timestamp", [])
+        indicators = res0.get("indicators", {}).get("quote", [{}])[0]
+        closes_raw = indicators.get("close", [])
+
+        timestamps = []
+        prices = []
+        now_dt = datetime.now(timezone.utc)
+        jan1_dt = datetime(now_dt.year, 1, 1, tzinfo=timezone.utc) if is_ytd else None
+
+        for ts, c in zip(timestamps_raw, closes_raw):
+            if c is not None and ts is not None:
+                dt_obj = datetime.fromtimestamp(ts, tz=timezone.utc)
+                if is_ytd and dt_obj < jan1_dt:
+                    continue
+                timestamps.append(dt_obj)
+                prices.append(float(c))
+
+        if not prices:
+            return None
+
+        prev_close = meta.get("previousClose") or meta.get("chartPreviousClose") or prices[0]
+        curr_price = prices[-1]
+        change = curr_price - prev_close
+        change_pct = (change / prev_close * 100) if prev_close > 0 else 0.0
+
+        div_events = []
+        events = res0.get("events", {}).get("dividends", {})
+        if events:
+            for d_info in events.values():
+                d_amount = float(d_info.get("amount", 0.0) or 0.0)
+                d_ts = d_info.get("date")
+                if d_amount > 0 and d_ts:
+                    div_events.append((datetime.fromtimestamp(d_ts, tz=timezone.utc), d_amount))
+        div_events.sort(key=lambda x: x[0])
+        start_ts_val = timestamps[0].timestamp() if timestamps else 0.0
+        end_ts_val = timestamps[-1].timestamp() if timestamps else time.time()
+        period_div = sum(amt for dt, amt in div_events if start_ts_val <= dt.timestamp() <= end_ts_val)
+        now_ts = time.time()
+        one_yr_divs = [amt for dt, amt in div_events if dt.timestamp() >= (now_ts - 365 * 86400)]
+        annual_div = sum(one_yr_divs) if one_yr_divs else (period_div if div_events else 0.0)
+
+        return {
+            "label": raw_symbol,
+            "symbol": yf_sym,
+            "timeframe": tf,
+            "timestamps": timestamps,
+            "prices": prices,
+            "prev_close": float(prev_close),
+            "current_price": float(curr_price),
+            "change": float(change),
+            "change_pct": float(change_pct),
+            "currency": meta.get("currency", "USD" if not yf_sym.endswith(".TO") else "CAD"),
+            "dividend_events": div_events,
+            "period_div_per_share": period_div,
+            "annual_dividend_per_share": annual_div,
+            "source": "urllib_fallback",
+        }
 
     def fetch_portfolio_history(
         self,
@@ -264,22 +292,54 @@ class ChartFetcher:
         if cached:
             return cached
 
-        # Fetch series for each holding
-        holding_series: List[Dict[datetime, float]] = []
+        # Collect valid holdings and unique symbols
+        valid_holdings = [h for h in holdings if float(h.get("shares", 0.0) or 0.0) > 0 and (h.get("symbol") or "").strip()]
+        if not valid_holdings:
+            return None
+
+        unique_symbols = list({h.get("symbol", "").strip().upper() for h in valid_holdings})
+
+        # Fetch missing symbols in parallel with fast timeout
+        symbol_data_map: Dict[str, Dict[str, Any]] = {}
+        missing_symbols = []
+        for sym in unique_symbols:
+            cached_sym = self._get_cache(f"sym:{sym}:{tf}", cfg["ttl"])
+            if cached_sym:
+                symbol_data_map[sym] = cached_sym
+            else:
+                missing_symbols.append(sym)
+
+        if missing_symbols:
+            import concurrent.futures
+            max_workers = min(4, len(missing_symbols))
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_to_sym = {executor.submit(self.fetch_symbol_history, sym, tf): sym for sym in missing_symbols}
+                try:
+                    for future in concurrent.futures.as_completed(future_to_sym, timeout=3.0):
+                        sym = future_to_sym[future]
+                        try:
+                            res = future.result()
+                            if res and res.get("prices"):
+                                symbol_data_map[sym] = res
+                        except Exception:
+                            pass
+                except concurrent.futures.TimeoutError:
+                    pass
+
+        # Assemble holding series with normalized date keys
+        holding_series: List[Dict[str, float]] = []
         prev_closes_total = 0.0
+        date_to_dt: Dict[str, Any] = {}
 
-        for h in holdings:
-            sym = h.get("symbol", "")
+        for h in valid_holdings:
+            sym = (h.get("symbol") or "").strip().upper()
             shares = float(h.get("shares", 0.0))
-            if shares <= 0:
-                continue
-
-            hold_curr = h.get("currency", "USD").strip().upper() or "USD"
+            hold_curr = (h.get("currency") or "USD").strip().upper() or "USD"
             rate = 1.0
             if converter and hold_curr != target_currency:
                 rate = converter.convert(1.0, hold_curr, target_currency)
 
-            h_data = self.fetch_symbol_history(sym, tf)
+            h_data = symbol_data_map.get(sym)
             if not h_data or not h_data.get("prices"):
                 continue
 
@@ -290,52 +350,73 @@ class ChartFetcher:
 
             series_dict = {}
             for t, p in zip(ts_list, pr_list):
-                series_dict[t] = p * shares * rate
-            holding_series.append(series_dict)
+                if hasattr(t, "strftime"):
+                    date_key = t.strftime("%H:%M") if tf == "1D" else t.strftime("%Y-%m-%d")
+                    date_to_dt[date_key] = t
+                else:
+                    date_key = str(t)[:10]
+                    date_to_dt[date_key] = t
+                series_dict[date_key] = p * shares * rate
+            if series_dict:
+                holding_series.append(series_dict)
 
         if not holding_series:
             return None
 
-        # Align timestamps across all holdings
-        # If pandas is available, use fast concat
+        # Robust Alignment: Normalized date keys, forward-fill & backward-fill
+        all_dates = sorted(list({k for s in holding_series for k in s.keys()}))
+        if not all_dates:
+            return None
+
+        # Pre-seed last_known with earliest price of each holding so earlier dates are preserved
+        last_known = []
+        for s in holding_series:
+            first_key = min(s.keys())
+            last_known.append(s[first_key])
+
         timestamps = []
         prices = []
+        for d in all_dates:
+            for idx, s in enumerate(holding_series):
+                if d in s:
+                    last_known[idx] = s[d]
+            t_total = sum(last_known)
+            if t_total > 0:
+                dt_obj = date_to_dt.get(d)
+                if dt_obj is None or not hasattr(dt_obj, "strftime"):
+                    try:
+                        if tf == "1D" and ":" in str(d):
+                            now_d = datetime.now(timezone.utc).date()
+                            parsed_t = datetime.strptime(str(d), "%H:%M").time()
+                            dt_obj = datetime.combine(now_d, parsed_t, tzinfo=timezone.utc)
+                        elif "-" in str(d):
+                            dt_obj = datetime.strptime(str(d)[:10], "%Y-%m-%d").replace(tzinfo=timezone.utc)
+                        else:
+                            dt_obj = d
+                    except Exception:
+                        dt_obj = d
+                timestamps.append(dt_obj)
+                prices.append(round(t_total, 2))
 
-        if PANDAS_AVAILABLE:
-            try:
-                dfs = [pd.Series(s) for s in holding_series]
-                combined = pd.concat(dfs, axis=1, sort=False).ffill().dropna()
-                if not combined.empty:
-                    tot_series = combined.sum(axis=1)
-                    timestamps = [t.to_pydatetime() if hasattr(t, "to_pydatetime") else t for t in tot_series.index]
-                    prices = tot_series.tolist()
-            except Exception as e:
-                print(f"Pandas portfolio alignment error: {e}, falling back to pure Python")
-
-        # Pure Python fallback alignment (zero-dependencies)
-        if not prices:
-            all_ts = set()
-            for s in holding_series:
-                all_ts.update(s.keys())
-            sorted_ts = sorted(all_ts)
-
-            # Last known values for forward-fill
-            last_known = [0.0] * len(holding_series)
-            for t in sorted_ts:
-                t_total = 0.0
-                all_present = True
-                for idx, s in enumerate(holding_series):
-                    if t in s:
-                        last_known[idx] = s[t]
-                    if last_known[idx] <= 0:
-                        all_present = False
-                    t_total += last_known[idx]
-                if all_present:
-                    timestamps.append(t)
-                    prices.append(t_total)
-
-        if not prices:
+        if len(prices) < 2:
             return None
+
+        # Calculate expected total current value for valid holdings and scale if partial
+        tot_curr_val = 0.0
+        for h in valid_holdings:
+            shs = float(h.get("shares", 0.0) or 0.0)
+            cp = float(h.get("current_price", h.get("price", 0.0)) or 0.0)
+            c = (h.get("currency") or "USD").strip().upper()
+            rate = converter.convert(1.0, c, target_currency) if (converter and c != target_currency) else 1.0
+            tot_curr_val += (shs * cp * rate)
+
+        if tot_curr_val > 0 and len(prices) > 0 and prices[-1] > 0 and len(holding_series) < len(valid_holdings):
+            scale = tot_curr_val / prices[-1]
+            prices = [round(p * scale, 2) for p in prices]
+            prev_closes_total = prev_closes_total * scale
+
+        if tot_curr_val > 0 and prices:
+            prices[-1] = round(tot_curr_val, 2)
 
         curr_price = prices[-1]
         if prev_closes_total <= 0:

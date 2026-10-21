@@ -7,7 +7,10 @@ Provides lightweight, zero-dependency charts using standard tk.Canvas:
 """
 
 import math
-import tkinter as tk
+try:
+    import tkinter as tk
+except (ImportError, ModuleNotFoundError):
+    tk = None
 from typing import List, Dict, Any, Tuple, Optional
 
 

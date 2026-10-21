@@ -13,11 +13,19 @@ Features:
 
 import sys
 import os
+import re
 import subprocess
 import threading
-import tkinter as tk
-from tkinter import ttk, messagebox
-from datetime import datetime, timezone
+try:
+    import tkinter as tk
+    from tkinter import ttk, messagebox
+    TKINTER_AVAILABLE = True
+except (ImportError, ModuleNotFoundError):
+    tk = None
+    ttk = None
+    messagebox = None
+    TKINTER_AVAILABLE = False
+from datetime import datetime, timezone, date
 from typing import Dict, List, Any, Optional, Tuple
 from i18n import t
 from financial_calc import calc_dividend_frequency
@@ -26,8 +34,10 @@ import warnings
 # Ignore Matplotlib missing glyph user warnings for CJK / currency symbols
 warnings.filterwarnings("ignore", message=r".*Glyph.*missing from font.*")
 
-# Check Matplotlib availability
+# Check Matplotlib availability (only when Tkinter is active)
 try:
+    if not TKINTER_AVAILABLE:
+        raise ImportError("Tkinter not available, skipping Matplotlib TkAgg")
     import matplotlib
     matplotlib.use("TkAgg")
     import matplotlib.font_manager as fm
@@ -107,7 +117,79 @@ TF_DISPLAY_LABELS = {
 }
 
 
-class GoogleFinanceChartView(ttk.Frame):
+def _parse_to_datetime(ts: Any) -> Optional[datetime]:
+    """Parse any timestamp representation (datetime, date, string, epoch) to a datetime object."""
+    if ts is None:
+        return None
+    if isinstance(ts, datetime):
+        return ts
+    if hasattr(ts, "to_pydatetime"):
+        try:
+            return ts.to_pydatetime()
+        except Exception:
+            pass
+    if isinstance(ts, date) or (hasattr(ts, "year") and hasattr(ts, "month") and hasattr(ts, "day")):
+        try:
+            return datetime.combine(ts, datetime.min.time())
+        except Exception:
+            pass
+    if isinstance(ts, (int, float)):
+        try:
+            sec = ts / 1000.0 if ts > 1e11 else float(ts)
+            return datetime.fromtimestamp(sec, tz=timezone.utc)
+        except Exception:
+            pass
+    if isinstance(ts, str):
+        s = ts.strip()
+        if not s:
+            return None
+        try:
+            iso_s = s.replace("Z", "+00:00")
+            return datetime.fromisoformat(iso_s)
+        except Exception:
+            pass
+        for fmt in (
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%d %H:%M",
+            "%Y-%m-%d",
+            "%Y/%m/%d %H:%M:%S",
+            "%Y/%m/%d",
+            "%m/%d/%Y %H:%M:%S",
+            "%m/%d/%Y",
+            "%H:%M:%S",
+            "%H:%M",
+        ):
+            try:
+                dt = datetime.strptime(s, fmt)
+                if fmt in ("%H:%M:%S", "%H:%M"):
+                    today = datetime.now(timezone.utc).date()
+                    dt = datetime.combine(today, dt.time(), tzinfo=timezone.utc)
+                return dt
+            except (ValueError, TypeError):
+                continue
+    return None
+
+
+def _safe_format_timestamp(ts: Any, tf: str, is_hover: bool = False) -> str:
+    """Safely format a timestamp across datetime, string, date, or epoch formats."""
+    dt = _parse_to_datetime(ts)
+    if dt is not None:
+        try:
+            if is_hover:
+                return dt.strftime("%d %b, %H:%M:%S") if tf in ("1D", "5D") else dt.strftime("%d %b %Y")
+            else:
+                if tf in ("1D", "5D"):
+                    return dt.strftime("%H:%M" if tf == "1D" else "%a %H:%M")
+                elif tf in ("1M", "6M", "YTD"):
+                    return dt.strftime("%b %d")
+                else:
+                    return dt.strftime("%b %Y")
+        except Exception:
+            pass
+    return str(ts) if ts is not None else ""
+
+
+class GoogleFinanceChartView(ttk.Frame if ttk else object):
     def __init__(self, parent, get_holdings_callback, get_currency_converter_callback, default_currency="USD"):
         super().__init__(parent)
         self.get_holdings = get_holdings_callback
@@ -344,61 +426,62 @@ class GoogleFinanceChartView(ttk.Frame):
         self.refresh_chart()
 
     def _on_style_changed(self, event=None):
-        style = self.style_combo.get().strip().lower()
-        self.chart_type = "line" if style == "line" else "area"
+        idx = self.style_combo.current() if hasattr(self.style_combo, "current") else -1
+        if idx == 0:
+            self.chart_type = "area"
+        elif idx == 1:
+            self.chart_type = "line"
+        else:
+            style = self.style_combo.get().strip().lower()
+            self.chart_type = "line" if ("line" in style or "折線" in style or "折线" in style) else "area"
         if self.chart_data:
             self._render_chart(self.chart_data)
 
     def _on_metric_changed(self, event=None):
-        val = self.metric_combo.get().strip()
-        div_only_match = (
-            val in (t("chart_metric_div_only"), "Dividends Only", "僅累積股息分派", "仅累积股息分派")
-            or "only" in val.lower()
-            or "僅" in val
-            or "仅" in val
-        )
-        price_match = (
-            val in (t("chart_metric_price"), "Stock Price (Per Share)", "股價 (每股)", "股价 (每股)")
-            or "price" in val.lower()
-            or ("股價" in val or "股价" in val)
-        )
-        growth_match = (
-            val in (t("chart_metric_growth"), "Net Growth / P&L (Excl. Invested)", "淨增長 / 盈虧 (扣除本金)", "净增长 / 盈亏 (扣除本金)")
-            or "excl" in val.lower()
-            or "扣除" in val
-        )
-        growth_div_match = (
-            val in (t("chart_metric_growth_div"), "Net Growth + Dividends", "淨增長 + 累積股息分派", "净增长 + 累积股息分派")
-            or "+" in val
-            or "growth" in val.lower()
-        )
-
-        if div_only_match:
-            self.chart_metric = "div_only"
-        elif price_match:
-            self.chart_metric = "price"
-        elif growth_div_match:
-            self.chart_metric = "growth_div"
-        elif growth_match:
-            self.chart_metric = "growth"
+        idx = self.metric_combo.current() if hasattr(self.metric_combo, "current") else -1
+        metric_map = ["total", "price", "growth", "growth_div", "div_only"]
+        if 0 <= idx < len(metric_map):
+            self.chart_metric = metric_map[idx]
         else:
-            self.chart_metric = "total"
+            val = self.metric_combo.get().strip().lower()
+            if "only" in val or "僅" in val or "仅" in val:
+                self.chart_metric = "div_only"
+            elif "price" in val or "股價" in val or "股价" in val:
+                self.chart_metric = "price"
+            elif "+" in val or ("div" in val and "growth" in val) or ("股息" in val and ("+" in val or "增長" in val or "增长" in val)):
+                self.chart_metric = "growth_div"
+            elif "excl" in val or "扣除" in val or "growth" in val or "增長" in val or "增长" in val:
+                self.chart_metric = "growth"
+            else:
+                self.chart_metric = "total"
 
         if self.chart_data:
             self._render_chart(self.chart_data)
 
     def _on_benchmark_changed(self, event=None):
-        val = self.benchmark_combo.get()
-        if t("bm_sp500") in val or "500" in val or "SPY" in val or "標普" in val or "标普" in val:
+        idx = self.benchmark_combo.current() if hasattr(self.benchmark_combo, "current") else -1
+        if idx == 1:
             self.current_benchmark = "sp500"
             self.benchmark_symbol = "SPY"
-        elif t("bm_tsx60") in val or "60" in val or "XIU" in val or "多倫多" in val or "多伦多" in val:
+        elif idx == 2:
             self.current_benchmark = "tsx60"
             self.benchmark_symbol = "XIU.TO"
-        else:
+        elif idx == 0:
             self.current_benchmark = "none"
             self.benchmark_symbol = ""
             self.benchmark_data = None
+        else:
+            val = self.benchmark_combo.get()
+            if t("bm_sp500") in val or "500" in val or "SPY" in val or "標普" in val or "标普" in val:
+                self.current_benchmark = "sp500"
+                self.benchmark_symbol = "SPY"
+            elif t("bm_tsx60") in val or "60" in val or "XIU" in val or "多倫多" in val or "多伦多" in val:
+                self.current_benchmark = "tsx60"
+                self.benchmark_symbol = "XIU.TO"
+            else:
+                self.current_benchmark = "none"
+                self.benchmark_symbol = ""
+                self.benchmark_data = None
         self.refresh_chart()
 
     def _get_scope_invested_and_div(self, target_currency: Optional[str] = None) -> Tuple[float, float, float, float]:
@@ -492,26 +575,32 @@ class GoogleFinanceChartView(ttk.Frame):
         n_pts = len(raw_prices)
         div_events = data.get("dividend_events", [])
         if div_events and raw_timestamps and is_single_stock and total_shares > 0:
-            start_ts = raw_timestamps[0]
-            start_dt = start_ts if getattr(start_ts, "tzinfo", None) else start_ts.replace(tzinfo=timezone.utc)
-            start_date = start_dt.date() if hasattr(start_dt, "date") else start_dt
+            parsed_start = _parse_to_datetime(raw_timestamps[0])
+            start_dt = parsed_start if (parsed_start and getattr(parsed_start, "tzinfo", None)) else (parsed_start.replace(tzinfo=timezone.utc) if parsed_start else None)
+            start_date = start_dt.date() if start_dt else None
 
             # Only include dividend events that occurred within the selected timeframe (on or after start_date)
             tf_div_events = []
             for dt, amt in div_events:
-                d_dt = dt if getattr(dt, "tzinfo", None) else dt.replace(tzinfo=timezone.utc)
-                d_date = d_dt.date() if hasattr(d_dt, "date") else d_dt
-                if d_date >= start_date:
-                    tf_div_events.append((d_dt, amt))
+                p_dt = _parse_to_datetime(dt)
+                d_dt = p_dt if (p_dt and getattr(p_dt, "tzinfo", None)) else (p_dt.replace(tzinfo=timezone.utc) if p_dt else None)
+                d_date = d_dt.date() if d_dt else None
+                if start_date is None or (d_date and d_date >= start_date):
+                    if d_dt:
+                        tf_div_events.append((d_dt, amt))
 
             # Construct cumulative dividend series from real dividend events
             div_series = []
             for ts in raw_timestamps:
-                ts_comp = ts if getattr(ts, "tzinfo", None) else ts.replace(tzinfo=timezone.utc)
-                cum_div = sum(
-                    amt for dt, amt in tf_div_events
-                    if dt <= ts_comp
-                )
+                p_ts = _parse_to_datetime(ts)
+                ts_comp = p_ts if (p_ts and getattr(p_ts, "tzinfo", None)) else (p_ts.replace(tzinfo=timezone.utc) if p_ts else None)
+                if ts_comp:
+                    cum_div = sum(
+                        amt for dt, amt in tf_div_events
+                        if dt <= ts_comp
+                    )
+                else:
+                    cum_div = 0.0
                 div_series.append(round(cum_div * total_shares * total_rate, 2))
             timeframe_div = div_series[-1] if div_series else 0.0
             if timeframe_div == 0.0 and total_div > 0 and tf not in ("1D", "5D"):
@@ -584,10 +673,13 @@ class GoogleFinanceChartView(ttk.Frame):
         val = self.scope_combo.get().strip()
         if not val:
             return
-        if val.startswith("📁 Portfolio:"):
+        idx = self.scope_combo.current() if hasattr(self.scope_combo, "current") else -1
+        lower_val = val.lower()
+        if idx == 0 or "portfolio:" in lower_val or lower_val in ("portfolio", "all portfolios", "投資組合", "投资组合"):
             self.current_scope = "portfolio"
         else:
-            sym = val.split(" - ")[0].strip()
+            clean = re.sub(r"^[^\w\d]+", "", val).strip()
+            sym = clean.split(" - ")[0].strip()
             self.current_scope = sym
         self.refresh_chart()
 
@@ -774,20 +866,18 @@ class GoogleFinanceChartView(ttk.Frame):
                 self.ax2.grid(False)
 
         # X-axis
-        n_ticks = 5
-        indices = np.linspace(0, len(prices) - 1, n_ticks, dtype=int)
-        labels = []
-        for idx in indices:
-            ts = timestamps[idx]
-            if self.current_timeframe in ("1D", "5D"):
-                labels.append(ts.strftime("%H:%M" if self.current_timeframe == "1D" else "%a %H:%M"))
-            elif self.current_timeframe in ("1M", "6M", "YTD"):
-                labels.append(ts.strftime("%b %d"))
-            else:
-                labels.append(ts.strftime("%b %Y"))
+        try:
+            n_ticks = min(5, len(prices))
+            indices = np.linspace(0, len(prices) - 1, n_ticks, dtype=int)
+            labels = []
+            for idx in indices:
+                ts = timestamps[idx] if idx < len(timestamps) else ""
+                labels.append(_safe_format_timestamp(ts, self.current_timeframe, is_hover=False))
 
-        self.ax.set_xticks(indices)
-        self.ax.set_xticklabels(labels)
+            self.ax.set_xticks(indices)
+            self.ax.set_xticklabels(labels)
+        except Exception:
+            pass
 
         # Y-axis
         y_min, y_max = min(prices), max(prices)
@@ -906,12 +996,7 @@ class GoogleFinanceChartView(ttk.Frame):
         for i in range(0, n_pts, step):
             cx = pad_l + (i / (n_pts - 1)) * plot_w if n_pts > 1 else pad_l + plot_w // 2
             ts = timestamps[i]
-            if self.current_timeframe in ("1D", "5D"):
-                lbl = ts.strftime("%H:%M" if self.current_timeframe == "1D" else "%a %H:%M")
-            elif self.current_timeframe in ("1M", "6M", "YTD"):
-                lbl = ts.strftime("%b %d")
-            else:
-                lbl = ts.strftime("%b %Y")
+            lbl = _safe_format_timestamp(ts, self.current_timeframe, is_hover=False)
             self.native_canvas.create_text(cx, pad_t + plot_h + 15, text=lbl, fill="#5F6368", font=("Segoe UI", 8))
 
     def _update_header(
@@ -1033,7 +1118,10 @@ class GoogleFinanceChartView(ttk.Frame):
     def _on_mpl_hover(self, event):
         if not hasattr(self, "plot_prices") or not self.plot_prices:
             return
-        if event.inaxes != self.ax or event.xdata is None:
+        valid_axes = [self.ax]
+        if hasattr(self, "ax2") and self.ax2 is not None:
+            valid_axes.append(self.ax2)
+        if event.inaxes not in valid_axes or event.xdata is None:
             return
 
         x_idx = int(round(event.xdata))
@@ -1060,9 +1148,9 @@ class GoogleFinanceChartView(ttk.Frame):
         curr_sym = getattr(self, "plot_currency", "$")
         self._update_hover_header(pr, ts, prev, curr_sym)
 
-    def _update_hover_header(self, hover_price: float, hover_time: datetime, prev: float, curr_sym: str):
+    def _update_hover_header(self, hover_price: float, hover_time: Any, prev: float, curr_sym: str):
         mode = getattr(self, "chart_metric", "total")
-        time_fmt = hover_time.strftime("%d %b, %H:%M:%S") if self.current_timeframe in ("1D", "5D") else hover_time.strftime("%d %b %Y")
+        time_fmt = _safe_format_timestamp(hover_time, self.current_timeframe, is_hover=True)
         total_shares = getattr(self, "plot_total_shares", 1.0)
         scale_factor = getattr(self, "plot_scale_factor", 1.0)
 
@@ -1095,7 +1183,10 @@ class GoogleFinanceChartView(ttk.Frame):
             badge_color = "#137333" if is_pos else "#C5221F"
             badge_bg = "#E6F4EA" if is_pos else "#FCE8E6"
             self.lbl_price.config(text=f"{curr_sym}{hover_price:,.2f}")
-            share_info = f" · {total_shares:g} @ {curr_sym}{hover_price/scale_factor:,.2f}" if (getattr(self, "current_scope", "portfolio") != "portfolio" and total_shares > 0 and scale_factor > 0) else ""
+            if mode == "price":
+                share_info = f" · {total_shares:g} {t('lbl_unit_shares')} (Val: {curr_sym}{hover_price * total_shares:,.2f})" if (getattr(self, "current_scope", "portfolio") != "portfolio" and total_shares > 0) else ""
+            else:
+                share_info = f" · {total_shares:g} {t('lbl_unit_shares')} @ {curr_sym}{hover_price/scale_factor:,.2f}" if (getattr(self, "current_scope", "portfolio") != "portfolio" and total_shares > 0 and scale_factor > 0) else ""
             self.lbl_badge.config(
                 text=f"{sign}{abs(change_pct):.2f}% ({sign[2:]}{curr_sym}{abs(change):,.2f}) {t('lbl_at_time', time=time_fmt)}{share_info}",
                 fg=badge_color,
@@ -1106,7 +1197,17 @@ class GoogleFinanceChartView(ttk.Frame):
         if hasattr(self, "native_canvas"):
             self.native_canvas.delete("hover_marker")
         if self.chart_data:
-            self._render_chart(self.chart_data)
+            try:
+                prices, timestamps, prev_close, change, change_pct, line_color, fill_color, is_growth_mode, ref_label, total_cb, total_div = self._prepare_metric_series(self.chart_data)
+                if prices:
+                    curr_price = prices[-1]
+                    display_curr = getattr(self, "current_scope_currency", self.chart_data.get("currency", "USD"))
+                    curr_sym = "$" if display_curr in ("USD", "CAD") else (display_curr + " ")
+                    total_shares = getattr(self, "current_scope_shares", 1.0)
+                    scale_factor = getattr(self, "current_scope_scale", 1.0)
+                    self._update_header(curr_price, change, change_pct, curr_sym, display_curr, is_growth_mode, total_cb, total_div, total_shares, scale_factor, data=self.chart_data)
+            except Exception:
+                pass
 
     # -------------------------------------------------------------
     # Package Installation Helper

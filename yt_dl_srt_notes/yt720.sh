@@ -15,8 +15,8 @@ read -p "輸入選項 (1, 2 或 3): " CHOICE
 
 case $CHOICE in
     1)
-        # 優先選擇 720p 的 MP4
-        yt-dlp -f "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720]" --merge-output-format mp4 -o "%(title)s_720p.%(ext)s" "$URL"
+        # 優先選擇 720p 的 MP4 (優先 avc1 避免 AV1 串流 403 錯誤)
+        yt-dlp -f "bestvideo[height<=720][vcodec^=avc1]+bestaudio[ext=m4a]/bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=720]+bestaudio/best[height<=720]" --merge-output-format mp4 -o "%(title)s_720p.%(ext)s" "$URL"
         ;;
     2)
         # 精確鎖定 480p (高度不超過 480)

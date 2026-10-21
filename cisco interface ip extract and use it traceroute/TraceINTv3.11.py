@@ -836,6 +836,9 @@ class CiscoTracerouteMapper:
                     else:
                         last_h["next_hop"] = f"Target ({target_ip})"
                         last_h["next_in_iface"] = f"Target:{target_ip}"
+                else:
+                    last_h["next_hop"] = f"Target ({target_ip})"
+                    last_h["next_in_iface"] = f"Target:{target_ip}"
             if last_h["out_iface"] is None:
                 if last_h["matched_iface"] and last_h["matched_iface"] != last_h["in_iface"]:
                     last_h["out_iface"] = last_h["matched_iface"]
@@ -916,7 +919,9 @@ class CiscoTracerouteMapper:
 
         return resolved_hops
 
-    def format_path_flow(self, resolved_hops: List[dict]) -> List[str]:
+    def format_path_flow(
+        self, resolved_hops: List[dict], target_ip: Optional[str] = None
+    ) -> List[str]:
         """Generates formatted lines showing end-to-end device/link path flow."""
         lines = []
         valid_hops = [h for h in resolved_hops if not h.get("is_timeout")]
@@ -972,20 +977,31 @@ class CiscoTracerouteMapper:
                 lines.append(f"       ↳ Destination Reached ({ip_str})")
             elif h.get("next_hop") and "Connected" in h.get("next_hop", ""):
                 lines.append(f"       ↳ Destination Reached ({ip_str})")
-            elif h.get("next_hop"):
+            elif target_ip and ip_str == target_ip:
+                lines.append(f"       ↳ Destination Reached ({ip_str})")
+            elif h.get("next_hop") and h.get("next_hop") != "-":
                 lines.append(f"       ↳ Towards: {h['next_hop']}")
+            elif target_ip and ip_str != target_ip:
+                lines.append(f"       ↳ Towards: Target ({target_ip})")
             else:
                 lines.append(f"       ↳ Destination Reached ({ip_str})")
 
         return lines
 
     # ───── display helpers ────────────────────────────────────────────────────
-    def _display_resolved_hop(self, rec: dict) -> None:
+    def _display_resolved_hop(
+        self,
+        rec: dict,
+        show_flow_link: bool = False,
+        target_ip: Optional[str] = None,
+    ) -> None:
         """Prints one hop across 2 lines: line 1 for INBOUND, line 2 for OUTBOUND."""
         hop_no = rec.get("hop_no", 0)
         ip = rec.get("ip")
         if ip is None or rec.get("is_timeout"):
             print(f"{hop_no:>2}   {'* * * (timeout)':<20}")
+            if show_flow_link:
+                print("       ↳ (no response / timeout)")
             return
 
         ptr = None
@@ -1045,6 +1061,18 @@ class CiscoTracerouteMapper:
             f"{'':>2}   {'':<20} {'':<18} {'OUT':<4} {out_iface[:18]:<18} "
             f"{next_hop[:24]:<24} {out_zone[:14]:<14} {out_vrf[:10]:<10} {out_desc_show}"
         )
+
+        # Immediate path flow link display for this hop
+        if show_flow_link and ip:
+            if "Destination Reached" in next_hop or (target_ip and ip == target_ip):
+                print(f"       ↳ Destination Reached ({ip})")
+            elif ":" in next_hop:
+                dev = device if device != "External/Unknown" else ip
+                out_if = out_iface if out_iface != "-" else ""
+                src_label = f"{dev}:{out_if}" if out_if else dev
+                print(f"       ↳ Link: {src_label} ⇄ {next_hop}")
+            elif next_hop and next_hop != "-":
+                print(f"       ↳ Towards: {next_hop}")
 
     def _display_hop(self, hop_no: int, ip: Optional[str]) -> None:
         """Fallback single-hop display."""
@@ -1141,7 +1169,9 @@ class CiscoTracerouteMapper:
                         (r for r in resolved if r["hop_no"] == buffered_hop[0]), None
                     )
                     if target_rec:
-                        self._display_resolved_hop(target_rec)
+                        self._display_resolved_hop(
+                            target_rec, show_flow_link=True, target_ip=target_ip
+                        )
                     if buffered_hop[1] is not None:
                         prev_valid_hop = (buffered_hop[0], buffered_hop[1])
 
@@ -1170,7 +1200,9 @@ class CiscoTracerouteMapper:
                     (r for r in resolved if r["hop_no"] == buffered_hop[0]), None
                 )
                 if target_rec:
-                    self._display_resolved_hop(target_rec)
+                    self._display_resolved_hop(
+                        target_rec, show_flow_link=True, target_ip=target_ip
+                    )
 
         except KeyboardInterrupt:
             print("\nInterrupted by user.")
@@ -1743,6 +1775,20 @@ class CiscoTracerouteMapper:
     def _is_wan_router(self, device: Optional[str]) -> bool:
         return bool(device) and self.wan_keyword.lower() in device.lower()
 
+    def _first_wan_index(self, hops: List[Tuple[int, Optional[str]]]) -> Optional[int]:
+        """Index of the first WAN router seen in the trace (closest to probing PC)."""
+        for i in range(len(hops)):
+            if self._is_wan_router(self._hop_device(hops[i][1])):
+                return i
+        return None
+
+    def _all_wan_indices(self, hops: List[Tuple[int, Optional[str]]]) -> List[int]:
+        """All indices of WAN routers in the trace."""
+        return [
+            i for i, (_, ip) in enumerate(hops)
+            if self._is_wan_router(self._hop_device(ip))
+        ]
+
     def _last_wan_index(self, hops: List[Tuple[int, Optional[str]]]) -> Optional[int]:
         """Index of the WAN router closest to the traced endpoint (last one seen)."""
         for i in range(len(hops) - 1, -1, -1):
@@ -1780,14 +1826,331 @@ class CiscoTracerouteMapper:
             return f"({ptr_dev})", "", ""
         return "External/Unknown", "", ""
 
+    def stitch_wan_path(
+        self,
+        src_hops: List[Tuple[int, Optional[str]]],
+        dst_hops: List[Tuple[int, Optional[str]]],
+        src_ip: str,
+        dst_ip: str,
+    ) -> Tuple[List[Tuple[str, Optional[str], str]], List[Tuple[int, Optional[str]]], str]:
+        """
+        Combines two traceroutes (probe->source and probe->destination) into an
+        end-to-end path from SOURCE to DESTINATION.
+
+        Handles execution from an arbitrary probing host (e.g. Site A):
+        - When Source (Site B) and Destination (Site C) are both remote across WAN:
+          Site A hops and Site A's WAN router are completely excluded from the path,
+          Site B internal hops are reversed, and the path connects:
+          Source (Site B) -> SiteB-wanr ⇄ SiteC-wanr -> Destination (Site C).
+        - If Source or Destination does NOT go via WANR, it is in the same site
+          as the current probing PC (Site A), and connects via Site A's local WAN router.
+        - When both endpoints are in the local site, pivots on their common local switch/hop.
+        """
+        src_trimmed = self._trim_trace(src_hops, src_ip)
+        dst_trimmed = self._trim_trace(dst_hops, dst_ip)
+
+        src_reached = bool(src_trimmed) and src_trimmed[-1][1] == src_ip
+        dst_reached = bool(dst_trimmed) and dst_trimmed[-1][1] == dst_ip
+
+        src_wan_all = self._all_wan_indices(src_trimmed)
+        dst_wan_all = self._all_wan_indices(dst_trimmed)
+
+        # Detect the probing PC's local site (Site A) exit WAN router:
+        # If both traces start from probing PC at Site A, their first WAN router
+        # is the local exit router of Site A.
+        site_a_wan_dev: Optional[str] = None
+        if src_wan_all and dst_wan_all:
+            first_src_dev = self._hop_device(src_trimmed[src_wan_all[0]][1])
+            first_dst_dev = self._hop_device(dst_trimmed[dst_wan_all[0]][1])
+            if first_src_dev and first_src_dev == first_dst_dev:
+                site_a_wan_dev = first_src_dev
+
+        def get_remote_wan_idx(
+            hops: List[Tuple[int, Optional[str]]],
+            wan_indices: List[int],
+            probing_wan: Optional[str],
+        ) -> Optional[int]:
+            if not wan_indices:
+                return None
+            if probing_wan:
+                # Filter out the probing site's WAN router
+                remote = [i for i in wan_indices if self._hop_device(hops[i][1]) != probing_wan]
+                return remote[-1] if remote else None
+            # If no shared probing router detected, but multiple WAN routers exist:
+            # First is probing site, last is remote site
+            if len(wan_indices) >= 2:
+                return wan_indices[-1]
+            return wan_indices[0]
+
+        ia = get_remote_wan_idx(src_trimmed, src_wan_all, site_a_wan_dev)
+        ib = get_remote_wan_idx(dst_trimmed, dst_wan_all, site_a_wan_dev)
+
+        path: List[Tuple[str, Optional[str], str]] = []
+        status_msg = ""
+
+        # Case 1: WAN routers found for both remote endpoints (Remote Site B & Remote Site C)
+        # Site A's device and Site A's WAN router are NOT involved in the path.
+        if ia is not None and ib is not None:
+            wan_src_ip = src_trimmed[ia][1]
+            wan_dst_ip = dst_trimmed[ib][1]
+            dev_src_wan = self._hop_device(wan_src_ip) or "SRC-WAN"
+            dev_dst_wan = self._hop_device(wan_dst_ip) or "DST-WAN"
+
+            src_internal = src_trimmed[ia + 1:]
+            dst_internal = dst_trimmed[ib + 1:]
+
+            if dev_src_wan != dev_dst_wan:
+                status_msg = (
+                    f"Sites connected via WAN: {dev_src_wan} ≈≈ WAN ≈≈ {dev_dst_wan} "
+                    f"(Probing PC site ignored; Site A and its WAN router excluded; Source site reversed)"
+                )
+                if not src_reached:
+                    path.append(("SOURCE", src_ip, "not reached by traceroute"))
+                for idx, (_, ip) in enumerate(reversed(src_internal)):
+                    if idx == 0 and ip == src_ip and src_reached:
+                        path.append(("SOURCE", ip, ""))
+                    else:
+                        path.append(("SRC-SITE", ip, ""))
+                path.append(("SRC-WAN", wan_src_ip, ""))
+                path.append(("WAN", None, f"WAN  {dev_src_wan} ⇄ {dev_dst_wan}"))
+                path.append(("DST-WAN", wan_dst_ip, ""))
+                for idx, (_, ip) in enumerate(dst_internal):
+                    if idx == len(dst_internal) - 1 and ip == dst_ip and dst_reached:
+                        path.append(("DEST", ip, ""))
+                    else:
+                        path.append(("DST-SITE", ip, ""))
+                if not dst_reached:
+                    path.append(("DEST", dst_ip, "not reached by traceroute"))
+
+            else:
+                # Same remote WAN router (same remote site / hub, e.g. both in Site B)
+                # Site A's router is excluded; path stays within remote site
+                status_msg = (
+                    f"Both paths converge at remote WAN router {dev_src_wan} "
+                    f"(Probing PC site ignored; Site A and its WAN router excluded; Source site reversed)"
+                )
+                common_int = -1
+                for i in range(min(len(src_internal), len(dst_internal))):
+                    if src_internal[i][1] and src_internal[i][1] == dst_internal[i][1]:
+                        common_int = i
+                    else:
+                        break
+
+                if common_int >= 0:
+                    pivot_ip = src_internal[common_int][1]
+                    if not src_reached:
+                        path.append(("SOURCE", src_ip, "not reached by traceroute"))
+                    for idx, (_, ip) in enumerate(reversed(src_internal[common_int + 1:])):
+                        if idx == 0 and ip == src_ip and src_reached:
+                            path.append(("SOURCE", ip, ""))
+                        else:
+                            path.append(("SRC-SITE", ip, ""))
+                    path.append(("PIVOT", pivot_ip, "common internal switch"))
+                    for idx, (_, ip) in enumerate(dst_internal[common_int + 1:]):
+                        if idx == len(dst_internal[common_int + 1:]) - 1 and ip == dst_ip and dst_reached:
+                            path.append(("DEST", ip, ""))
+                        else:
+                            path.append(("DST-SITE", ip, ""))
+                    if not dst_reached:
+                        path.append(("DEST", dst_ip, "not reached by traceroute"))
+                else:
+                    if not src_reached:
+                        path.append(("SOURCE", src_ip, "not reached by traceroute"))
+                    for idx, (_, ip) in enumerate(reversed(src_internal)):
+                        if idx == 0 and ip == src_ip and src_reached:
+                            path.append(("SOURCE", ip, ""))
+                        else:
+                            path.append(("SRC-SITE", ip, ""))
+                    path.append(("WAN-RTR", wan_src_ip, "same site WAN router"))
+                    for idx, (_, ip) in enumerate(dst_internal):
+                        if idx == len(dst_internal) - 1 and ip == dst_ip and dst_reached:
+                            path.append(("DEST", ip, ""))
+                        else:
+                            path.append(("DST-SITE", ip, ""))
+                    if not dst_reached:
+                        path.append(("DEST", dst_ip, "not reached by traceroute"))
+
+        # Case 2: Source in local site with probing PC (no remote WANR), Destination remote across WAN
+        elif ia is None and ib is not None:
+            local_wan_idx = dst_wan_all[0] if dst_wan_all else ib
+            wan_local_ip = dst_trimmed[local_wan_idx][1]
+            dev_local_wan = self._hop_device(wan_local_ip) or "LOCAL-WAN"
+
+            remote_wan_idx = ib
+            wan_remote_ip = dst_trimmed[remote_wan_idx][1]
+            dev_remote_wan = self._hop_device(wan_remote_ip) or "REMOTE-WAN"
+
+            status_msg = (
+                f"Source in local site with probing PC, Destination remote across WAN "
+                f"({dev_local_wan} ≈≈ WAN ≈≈ {dev_remote_wan})"
+            )
+            dst_local_segment = dst_trimmed[:local_wan_idx]
+            common_local = -1
+            for i in range(min(len(src_trimmed), len(dst_local_segment))):
+                if src_trimmed[i][1] and src_trimmed[i][1] == dst_local_segment[i][1]:
+                    common_local = i
+                else:
+                    break
+
+            if not src_reached:
+                path.append(("SOURCE", src_ip, "not reached by traceroute"))
+            src_rev_hops = src_trimmed[common_local + 1:] if common_local >= 0 else src_trimmed
+            for idx, (_, ip) in enumerate(reversed(src_rev_hops)):
+                if idx == 0 and ip == src_ip and src_reached:
+                    path.append(("SOURCE", ip, ""))
+                else:
+                    path.append(("SRC-SITE", ip, ""))
+
+            if common_local >= 0 and dst_local_segment:
+                pivot_ip = dst_local_segment[common_local][1]
+                path.append(("PIVOT", pivot_ip, "local switch"))
+                for _, ip in dst_local_segment[common_local + 1:]:
+                    path.append(("LOCAL-SITE", ip, ""))
+
+            path.append(("SRC-WAN", wan_local_ip, ""))
+            if local_wan_idx != remote_wan_idx:
+                path.append(("WAN", None, f"WAN  {dev_local_wan} ⇄ {dev_remote_wan}"))
+                path.append(("DST-WAN", wan_remote_ip, ""))
+
+            dst_internal = dst_trimmed[remote_wan_idx + 1:]
+            for idx, (_, ip) in enumerate(dst_internal):
+                if idx == len(dst_internal) - 1 and ip == dst_ip and dst_reached:
+                    path.append(("DEST", ip, ""))
+                else:
+                    path.append(("DST-SITE", ip, ""))
+            if not dst_reached:
+                path.append(("DEST", dst_ip, "not reached by traceroute"))
+
+        # Case 3: Destination in local site with probing PC (no remote WANR), Source remote across WAN
+        elif ia is not None and ib is None:
+            remote_wan_idx = ia
+            wan_remote_ip = src_trimmed[remote_wan_idx][1]
+            dev_remote_wan = self._hop_device(wan_remote_ip) or "REMOTE-WAN"
+
+            local_wan_idx = src_wan_all[0] if src_wan_all else ia
+            wan_local_ip = src_trimmed[local_wan_idx][1]
+            dev_local_wan = self._hop_device(wan_local_ip) or "LOCAL-WAN"
+
+            status_msg = (
+                f"Source remote across WAN, Destination in local site with probing PC "
+                f"({dev_remote_wan} ≈≈ WAN ≈≈ {dev_local_wan})"
+            )
+            src_internal = src_trimmed[remote_wan_idx + 1:]
+            if not src_reached:
+                path.append(("SOURCE", src_ip, "not reached by traceroute"))
+            for idx, (_, ip) in enumerate(reversed(src_internal)):
+                if idx == 0 and ip == src_ip and src_reached:
+                    path.append(("SOURCE", ip, ""))
+                else:
+                    path.append(("SRC-SITE", ip, ""))
+
+            path.append(("SRC-WAN", wan_remote_ip, ""))
+            if local_wan_idx != remote_wan_idx:
+                path.append(("WAN", None, f"WAN  {dev_remote_wan} ⇄ {dev_local_wan}"))
+                path.append(("DST-WAN", wan_local_ip, ""))
+
+            src_local_segment = src_trimmed[:local_wan_idx]
+            common_local = -1
+            for i in range(min(len(src_local_segment), len(dst_trimmed))):
+                if src_local_segment[i][1] and src_local_segment[i][1] == dst_trimmed[i][1]:
+                    common_local = i
+                else:
+                    break
+
+            if common_local >= 0:
+                for _, ip in reversed(src_local_segment[common_local + 1:]):
+                    path.append(("LOCAL-SITE", ip, ""))
+                pivot_ip = dst_trimmed[common_local][1]
+                path.append(("PIVOT", pivot_ip, "local switch"))
+                dst_local_tail = dst_trimmed[common_local + 1:]
+            else:
+                dst_local_tail = dst_trimmed
+
+            for idx, (_, ip) in enumerate(dst_local_tail):
+                if idx == len(dst_local_tail) - 1 and ip == dst_ip and dst_reached:
+                    path.append(("DEST", ip, ""))
+                else:
+                    path.append(("DST-SITE", ip, ""))
+            if not dst_reached:
+                path.append(("DEST", dst_ip, "not reached by traceroute"))
+
+        # Case 4: Neither trace has remote WAN router (both in local site with probing PC)
+        else:
+            status_msg = "Both Source and Destination in local site with probing PC (no remote WAN router traversed)"
+            common = -1
+            for i in range(min(len(src_trimmed), len(dst_trimmed))):
+                a_ip, b_ip = src_trimmed[i][1], dst_trimmed[i][1]
+                if a_ip and a_ip == b_ip:
+                    common = i
+                else:
+                    break
+
+            if site_a_wan_dev:
+                while common >= 0 and self._hop_device(src_trimmed[common][1]) == site_a_wan_dev:
+                    common -= 1
+
+            if common < 0:
+                if not src_reached:
+                    path.append(("SOURCE", src_ip, "not reached by traceroute"))
+                for idx, (_, ip) in enumerate(reversed(src_trimmed)):
+                    if idx == 0 and ip == src_ip and src_reached:
+                        path.append(("SOURCE", ip, ""))
+                    else:
+                        path.append(("SRC-SITE", ip, ""))
+                for idx, (_, ip) in enumerate(dst_trimmed):
+                    if idx == len(dst_trimmed) - 1 and ip == dst_ip and dst_reached:
+                        path.append(("DEST", ip, ""))
+                    else:
+                        path.append(("DST-SITE", ip, ""))
+                if not dst_reached:
+                    path.append(("DEST", dst_ip, "not reached by traceroute"))
+            else:
+                pivot_ip = src_trimmed[common][1]
+                if not src_reached:
+                    path.append(("SOURCE", src_ip, "not reached by traceroute"))
+                for idx, (_, ip) in enumerate(reversed(src_trimmed[common + 1:])):
+                    if idx == 0 and ip == src_ip and src_reached:
+                        path.append(("SOURCE", ip, ""))
+                    else:
+                        path.append(("SRC-SITE", ip, ""))
+                path.append(("PIVOT", pivot_ip, "last common hop"))
+                for idx, (_, ip) in enumerate(dst_trimmed[common + 1:]):
+                    if idx == len(dst_trimmed[common + 1:]) - 1 and ip == dst_ip and dst_reached:
+                        path.append(("DEST", ip, ""))
+                    else:
+                        path.append(("DST-SITE", ip, ""))
+                if not dst_reached:
+                    path.append(("DEST", dst_ip, "not reached by traceroute"))
+
+        # Build stitched_hops for resolve_path_interfaces
+        stitched_hops: List[Tuple[int, Optional[str]]] = []
+        for seg, ip, _ in path:
+            if seg == "WAN":
+                continue
+            stitched_hops.append((len(stitched_hops) + 1, ip))
+
+        return path, stitched_hops, status_msg
+
     def _print_combined_path(
-        self, path: List[Tuple[str, Optional[str], str]]
+        self,
+        path: List[Tuple[str, Optional[str], str]],
+        source_ip: Optional[str] = None,
+        target_ip: Optional[str] = None,
     ) -> None:
         """Prints stitched path rows with Inbound and Outbound interfaces."""
-        hop_items = [(idx + 1, ip) for idx, (_, ip, _) in enumerate(path) if ip is not None]
+        hop_items = []
+        cur_hop = 0
+        for seg, ip, _ in path:
+            if seg == "WAN":
+                continue
+            cur_hop += 1
+            hop_items.append((cur_hop, ip))
+
         resolved_map = {}
         if hop_items:
-            resolved_list = self.resolve_path_interfaces(hop_items)
+            resolved_list = self.resolve_path_interfaces(
+                hop_items, target_ip=target_ip, source_ip=source_ip
+            )
             for r in resolved_list:
                 resolved_map[r["hop_no"]] = r
 
@@ -1841,7 +2204,7 @@ class CiscoTracerouteMapper:
         # Flow Diagram
         if resolved_for_flow:
             print("\nPATH FLOW:")
-            for line in self.format_path_flow(resolved_for_flow):
+            for line in self.format_path_flow(resolved_for_flow, target_ip=target_ip):
                 print(line)
             print("-" * 150)
 
@@ -1881,8 +2244,8 @@ class CiscoTracerouteMapper:
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
             f_src = ex.submit(self.collect_trace, src_ip, True)
             f_dst = ex.submit(self.collect_trace, dst_ip, True)
-            src_hops = self._trim_trace(f_src.result(), src_ip)
-            dst_hops = self._trim_trace(f_dst.result(), dst_ip)
+            src_hops = f_src.result()
+            dst_hops = f_dst.result()
 
         # Side-by-side view of the raw traces
         resolved = [(f"SRC: {source}", src_ip), (f"DST: {destination}", dst_ip)]
@@ -1893,84 +2256,16 @@ class CiscoTracerouteMapper:
         max_hop = max([h for h, _ in src_hops + dst_hops] or [0])
         self._display_comparison_grid(resolved, results, max_hop)
 
-        def seg(ip: Optional[str], default: str) -> str:
-            if ip == src_ip:
-                return "SOURCE"
-            if ip == dst_ip:
-                return "DEST"
-            return default
-
-        src_reached = bool(src_hops) and src_hops[-1][1] == src_ip
-        dst_reached = bool(dst_hops) and dst_hops[-1][1] == dst_ip
-
-        ia = self._last_wan_index(src_hops)
-        ib = self._last_wan_index(dst_hops)
-        path: List[Tuple[str, Optional[str], str]] = []
+        path, stitched_hops, status_msg = self.stitch_wan_path(
+            src_hops, dst_hops, src_ip, dst_ip
+        )
 
         print("\n" + "=" * 80)
         print("COMBINED END-TO-END PATH")
         print("=" * 80)
-
-        if ia is not None and ib is not None:
-            wan_a_ip, wan_b_ip = src_hops[ia][1], dst_hops[ib][1]
-            dev_a, dev_b = self._hop_device(wan_a_ip), self._hop_device(wan_b_ip)
-
-            if not src_reached:
-                path.append(("SOURCE", src_ip, "not reached by traceroute"))
-            for _, ip in reversed(src_hops[ia + 1:]):
-                path.append((seg(ip, "SRC-SITE"), ip, ""))
-
-            if dev_a == dev_b:
-                print(f"✓ Both paths converge at WAN router {dev_a} (same site / hub).")
-                path.append(("WAN-RTR", wan_a_ip, ""))
-                if wan_b_ip != wan_a_ip:
-                    path.append(("WAN-RTR", wan_b_ip, ""))
-            else:
-                print(f"✓ Sites are connected via WAN: {dev_a}  ≈≈ WAN ≈≈  {dev_b}")
-                path.append(("SRC-WAN", wan_a_ip, ""))
-                path.append(("WAN", None, f"WAN  {dev_a} ⇄ {dev_b}"))
-                path.append(("DST-WAN", wan_b_ip, ""))
-
-            for _, ip in dst_hops[ib + 1:]:
-                path.append((seg(ip, "DST-SITE"), ip, ""))
-            if not dst_reached:
-                path.append(("DEST", dst_ip, "not reached by traceroute"))
-
-            self._print_combined_path(path)
-            print("ℹ️  Source-side segment is the reverse of the trace to the source (inferred).")
-        else:
-            missing = []
-            if ia is None:
-                missing.append("source")
-            if ib is None:
-                missing.append("destination")
-            print(f"⚠️  No '{self.wan_keyword}' WAN router found in the trace to the "
-                  f"{' and '.join(missing)} – sites are not linked via WAN.")
-
-            # Fallback: pivot on the last hop common to both traces (same site)
-            common = -1
-            for i in range(min(len(src_hops), len(dst_hops))):
-                a_ip, b_ip = src_hops[i][1], dst_hops[i][1]
-                if a_ip and a_ip == b_ip:
-                    common = i
-                elif a_ip != b_ip:
-                    break
-            if common < 0:
-                print("   No common hop either – unable to build a combined path.")
-                return
-
-            pivot_ip = src_hops[common][1]
-            print(f"   Building local path via last common hop {pivot_ip}.")
-            if not src_reached:
-                path.append(("SOURCE", src_ip, "not reached by traceroute"))
-            for _, ip in reversed(src_hops[common + 1:]):
-                path.append((seg(ip, "SRC-SIDE"), ip, ""))
-            path.append(("PIVOT", pivot_ip, "last common hop"))
-            for _, ip in dst_hops[common + 1:]:
-                path.append((seg(ip, "DST-SIDE"), ip, ""))
-            if not dst_reached:
-                path.append(("DEST", dst_ip, "not reached by traceroute"))
-            self._print_combined_path(path)
+        print(f"✓ {status_msg}")
+        self._print_combined_path(path, source_ip=src_ip, target_ip=dst_ip)
+        print("ℹ️  Source-side segment is the reverse of the trace to the source (inferred).")
 
     # ───── interactive menu ──────────────────────────────────────────────────
     def _configure_settings(self) -> None:
@@ -2654,7 +2949,11 @@ class TraceINTGUI:
                 if self.stop_event.is_set():
                     break
                 hops.append((hop_no, ip))
-                self.queue.put(("hop_streaming", hop_no, ip))
+                # Live resolution of hops collected so far
+                partial_resolved = self.mapper.resolve_path_interfaces(
+                    hops, target_ip=target_ip, source_ip=source_ip
+                )
+                self.queue.put(("hop_streaming", hop_no, ip, partial_resolved))
                 if ip == target_ip:
                     dest_reached = True
                     break
@@ -2702,6 +3001,8 @@ class TraceINTGUI:
                     break
                 src_hops.append((hop_no, ip))
                 self.queue.put(("log", f"Src Hop {hop_no}: {ip or '* * *'}"))
+                partial_src = self.mapper.resolve_path_interfaces(src_hops, target_ip=src_ip)
+                self.queue.put(("hop_streaming", hop_no, ip, partial_src))
 
             self.queue.put(("status", f"Tracing path to destination {dst_ip}…"))
             dst_hops: List[Tuple[int, Optional[str]]] = []
@@ -2712,39 +3013,14 @@ class TraceINTGUI:
                     break
                 dst_hops.append((hop_no, ip))
                 self.queue.put(("log", f"Dst Hop {hop_no}: {ip or '* * *'}"))
+                partial_dst = self.mapper.resolve_path_interfaces(dst_hops, target_ip=dst_ip)
+                self.queue.put(("hop_streaming", hop_no, ip, partial_dst))
 
-            # WAN router stitch
-            resolved_src = self.mapper.resolve_path_interfaces(src_hops, target_ip=src_ip)
-            resolved_dst = self.mapper.resolve_path_interfaces(dst_hops, target_ip=dst_ip)
-
-            wan_kw = self.mapper.wan_keyword.lower()
-            src_wan_idx = None
-            for idx, r in enumerate(resolved_src):
-                dev = (r.get("device") or "").lower()
-                if wan_kw in dev:
-                    src_wan_idx = idx
-                    break
-
-            dst_wan_idx = None
-            for idx, r in enumerate(resolved_dst):
-                dev = (r.get("device") or "").lower()
-                if wan_kw in dev:
-                    dst_wan_idx = idx
-                    break
-
-            stitched_hops = []
-            if src_wan_idx is not None and dst_wan_idx is not None:
-                self.queue.put(("log", f"✓ Found WAN routers on both traces. Stitching paths…"))
-                # Reverse source side up to wan router
-                src_segment = list(reversed(resolved_src[: src_wan_idx + 1]))
-                dst_segment = resolved_dst[dst_wan_idx:]
-                for s in src_segment:
-                    stitched_hops.append((len(stitched_hops) + 1, s.get("ip")))
-                for d in dst_segment:
-                    stitched_hops.append((len(stitched_hops) + 1, d.get("ip")))
-            else:
-                self.queue.put(("log", "ℹ️ WAN router keyword not found on both paths; showing destination trace."))
-                stitched_hops = dst_hops
+            # WAN router stitch using unified stitch_wan_path
+            path, stitched_hops, status_msg = self.mapper.stitch_wan_path(
+                src_hops, dst_hops, src_ip, dst_ip
+            )
+            self.queue.put(("log", f"✓ {status_msg}"))
 
             resolved = self.mapper.resolve_path_interfaces(
                 stitched_hops, target_ip=dst_ip, source_ip=src_ip
@@ -2771,10 +3047,17 @@ class TraceINTGUI:
                     self.log_message(msg[1])
 
                 elif msg_type == "hop_streaming":
-                    hop_no, ip = msg[1], msg[2]
+                    hop_no = msg[1]
+                    ip = msg[2]
+                    partial_resolved = msg[3] if len(msg) > 3 else None
                     ip_disp = ip if ip else "* * * (timeout)"
-                    self.status_var.set(f"Hop {hop_no}: {ip_disp}")
+                    self.status_var.set(f"Hop {hop_no}: {ip_disp} (tracing…)")
                     self.log_message(f"Hop {hop_no:>2}: {ip_disp}")
+                    if partial_resolved:
+                        self.last_resolved_hops = partial_resolved
+                        target = self.target_var.get().strip() or (partial_resolved[-1].get("ip") if partial_resolved else "")
+                        self._render_resolved_table(partial_resolved, target_ip=target)
+                        self._render_path_flow(partial_resolved)
 
                 elif msg_type == "trace_done":
                     resolved, target_ip, dest_reached, elapsed = msg[1], msg[2], msg[3], msg[4]
@@ -2910,12 +3193,19 @@ class TraceINTGUI:
         # Auto-fit columns to newly loaded data
         self.autofit_columns()
 
+        # Keep latest hop in view
+        children = self.tree.get_children()
+        if children:
+            self.tree.see(children[-1])
+
     def _render_path_flow(self, resolved_hops: List[dict]) -> None:
         self.flow_text.delete("1.0", "end")
-        flow_lines = self.mapper.format_path_flow(resolved_hops)
+        target = self.target_var.get().strip()
+        flow_lines = self.mapper.format_path_flow(resolved_hops, target_ip=target)
         self.flow_text.insert("end", "PATH FLOW:\n")
         for line in flow_lines:
             self.flow_text.insert("end", line + "\n")
+        self.flow_text.see("end")
 
     # ───── Clipboard & Export Helpers ─────────────────────────────────────────
     def copy_selected_rows(self) -> None:
@@ -3004,8 +3294,7 @@ def launch_gui(
 ) -> None:
     """Launches the Tkinter Graphical User Interface."""
     if not TKINTER_AVAILABLE:
-        print("Error: Tkinter is not installed or not available in this Python environment.")
-        return
+        raise RuntimeError("Tkinter is not available in this Python installation.")
 
     root = tk.Tk()
     app = TraceINTGUI(root, mapper=mapper)
@@ -3035,13 +3324,18 @@ def main() -> None:
     parser.add_argument(
         "targets",
         nargs="*",
-        help="Destination IP(s) or hostname(s). If omitted the interactive menu starts.",
+        help="Destination IP(s) or hostname(s). If omitted, GUI starts by default (or interactive CLI).",
     )
     parser.add_argument(
         "-g",
         "--gui",
         action="store_true",
-        help="Launch Graphical User Interface (Tkinter)",
+        help="Explicitly launch Graphical User Interface (Tkinter)",
+    )
+    parser.add_argument(
+        "--cli",
+        action="store_true",
+        help="Force Command Line Interface (CLI) mode instead of default GUI",
     )
     parser.add_argument(
         "-p",
@@ -3092,26 +3386,50 @@ def main() -> None:
     if bool(args.source) != bool(args.destination):
         parser.error("--source and --destination must be used together")
 
-    # Check GUI flag first
-    if args.gui:
-        launch_gui(
-            csv_file=args.csv,
-            extra_info=args.extra_info,
-            wan_keyword=args.wan_keyword,
-            resolve_dns=args.resolve_dns,
-            transit_subnets=args.transit_subnets,
-        )
-        return
+    # Determine whether to attempt launching the GUI:
+    # Default is GUI when no targets or source/dest are provided and --cli is NOT specified,
+    # OR when --gui is explicitly passed.
+    want_gui = args.gui or (not args.cli and not args.targets and not (args.source and args.destination))
 
+    if want_gui:
+        try:
+            launch_gui(
+                csv_file=args.csv,
+                extra_info=args.extra_info,
+                wan_keyword=args.wan_keyword,
+                resolve_dns=args.resolve_dns,
+                transit_subnets=args.transit_subnets,
+            )
+            return
+        except Exception as exc:
+            if args.gui:
+                print(f"Error launching GUI: {exc}")
+                sys.exit(1)
+            # Default GUI attempt failed (e.g. no display / headless) -> gracefully fall back to CLI
+            print(f"⚠️  GUI unavailable ({exc}). Falling back to interactive CLI mode…\n")
+
+    # ───── CLI Mode Execution ─────────────────────────────────────────────────
     # 1. Instantiate & Load Data
-    mapper = CiscoTracerouteMapper(csv_file=args.csv)
+    csv_file = args.csv
+    mapper = CiscoTracerouteMapper(csv_file=csv_file)
     if not mapper.load_csv_data():
-        sys.exit(1)
+        # In interactive CLI mode, give user a chance to specify the CSV path if default not found
+        if not args.targets and not (args.source and args.destination) and sys.stdin.isatty():
+            while True:
+                prompt_path = input("Enter path to network inventory CSV (or press Enter to exit): ").strip()
+                if not prompt_path:
+                    sys.exit(1)
+                mapper.csv_file = prompt_path
+                if mapper.load_csv_data():
+                    break
+        else:
+            sys.exit(1)
+
     mapper.load_addon_subnets()
     mapper.load_additional_int_info(args.extra_info)
 
     # 2. Check Arguments
-    mapper.resolve_dns = args.resolve_dns  # Apply argument
+    mapper.resolve_dns = args.resolve_dns
     mapper.wan_keyword = args.wan_keyword
     mapper.set_transit_subnets(args.transit_subnets)
 

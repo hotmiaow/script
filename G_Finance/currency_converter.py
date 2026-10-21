@@ -4,16 +4,21 @@ Provides real-time exchange rates (e.g. USD, CAD, HKD) from Google Finance with 
 offline fallback rates, and automatic currency conversion for portfolio summaries.
 """
 
+import os
+import json
 import threading
 import time
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, List
 from google_finance_fetcher import GoogleFinanceFetcher
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CURRENCY_CACHE_FILE = os.path.join(BASE_DIR, "currency_cache.json")
 
 
 class CurrencyConverter:
     """
-    Manages exchange rates between major currencies (USD, CAD, HKD, EUR, GBP).
-    Uses Google Finance quote queries (e.g. 'USD-CAD', 'USD-HKD') with thread-safe caching.
+    Manages exchange rates between major currencies (USD, CAD, HKD, EUR, GBP, JPY, CNY, AUD, etc.).
+    Uses Google Finance quote queries with thread-safe caching and local disk persistence.
     """
 
     # Baseline fallback rates relative to 1 USD
@@ -25,6 +30,12 @@ class CurrencyConverter:
         "GBP": 0.775,
         "JPY": 155.0,
         "CNY": 7.25,
+        "AUD": 1.52,
+        "CHF": 0.88,
+        "SGD": 1.33,
+        "NZD": 1.67,
+        "TWD": 32.1,
+        "KRW": 1380.0,
     }
 
     CURRENCY_SYMBOLS: Dict[str, str] = {
@@ -35,6 +46,12 @@ class CurrencyConverter:
         "GBP": "£",
         "JPY": "¥",
         "CNY": "¥",
+        "AUD": "A$",
+        "CHF": "CHF",
+        "SGD": "S$",
+        "NZD": "NZ$",
+        "TWD": "NT$",
+        "KRW": "₩",
     }
 
     def __init__(self, fetcher: Optional[GoogleFinanceFetcher] = None, cache_ttl_sec: int = 1800):
@@ -45,6 +62,38 @@ class CurrencyConverter:
         self._lock = threading.Lock()
         self._is_refreshing = False
         self.is_running = True
+        self._load_cache_from_disk()
+
+    def _load_cache_from_disk(self):
+        """Loads cached rates from disk if valid and available."""
+        if os.path.exists(CURRENCY_CACHE_FILE):
+            try:
+                with open(CURRENCY_CACHE_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if isinstance(data, dict) and "rates" in data:
+                        rates = data.get("rates", {})
+                        if isinstance(rates, dict):
+                            self._rates_to_usd.update({k.upper(): float(v) for k, v in rates.items() if float(v) > 0})
+                            self._last_update = float(data.get("updated_at", 0.0))
+            except Exception:
+                pass
+
+    def _save_cache_to_disk(self):
+        """Persists current exchange rates to disk cache."""
+        try:
+            payload = {
+                "updated_at": self._last_update,
+                "rates": dict(self._rates_to_usd),
+            }
+            with open(CURRENCY_CACHE_FILE, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2)
+        except Exception:
+            pass
+
+    def get_supported_currencies(self) -> List[str]:
+        """Returns list of all supported currency codes."""
+        with self._lock:
+            return sorted(list(self._rates_to_usd.keys()))
 
     def get_usd_rate(self, currency: str) -> float:
         """
@@ -80,13 +129,21 @@ class CurrencyConverter:
         rate = self.get_rate(from_curr, to_curr)
         return round(amount * rate, 2)
 
+    def get_symbol(self, currency: str) -> str:
+        """
+        Returns the currency symbol for the given currency code (e.g. '$', 'C$', 'HK$').
+        Defaults to '$' if not found.
+        """
+        curr = currency.upper().strip()
+        return self.CURRENCY_SYMBOLS.get(curr, "$")
+
     def format_money(self, amount: float, currency: str) -> str:
         """
         Formats money with appropriate currency symbol and commas.
         e.g. US$1,234.56, C$1,234.56, HK$1,234.56.
         """
         curr = currency.upper().strip()
-        sym = self.CURRENCY_SYMBOLS.get(curr, "$")
+        sym = self.get_symbol(curr)
         sign = "-" if amount < 0 else ""
         abs_amt = abs(amount)
         return f"{sign}{sym}{abs_amt:,.2f}"
@@ -146,8 +203,10 @@ class CurrencyConverter:
                             new_rates[curr] = 1.0 / p
 
                 with self._lock:
-                    self._rates_to_usd.update(new_rates)
-                    self._last_update = time.time()
+                    if new_rates:
+                        self._rates_to_usd.update(new_rates)
+                        self._last_update = time.time()
+                        self._save_cache_to_disk()
             except Exception as e:
                 print(f"Failed to refresh currency rates: {e}")
             finally:

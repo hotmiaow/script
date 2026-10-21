@@ -143,7 +143,15 @@ class GoogleFinanceFetcher:
 
         # If exchange is explicitly specified
         if ":" in sym:
-            return self._fetch_url(f"https://www.google.com/finance/quote/{sym}", sym)
+            parts = sym.split(":")
+            tkr = parts[0].strip()
+            exch = parts[1].strip()
+            if exch in ("CDN", "CA", "TSX"):
+                exch = "TSE"
+            elif exch in ("HK", "HKEX"):
+                exch = "HKG"
+            norm_sym = f"{tkr}:{exch}"
+            return self._fetch_url(f"https://www.google.com/finance/quote/{norm_sym}", norm_sym)
 
         # Handle Yahoo / Canadian / Hong Kong style suffixes
         if sym.endswith(".HK") or sym.endswith(".HKG"):
@@ -155,7 +163,7 @@ class GoogleFinanceFetcher:
             if res.get("success"):
                 return res
 
-        if sym.endswith(".TO") or sym.endswith(".TSE"):
+        if sym.endswith(".TO") or sym.endswith(".TSE") or sym.endswith(".CDN") or sym.endswith(".CA") or sym.endswith(".TSX"):
             prefix = sym.split(".")[0].strip()
             to_sym = f"{prefix}:TSE"
             res = self._fetch_url(f"https://www.google.com/finance/quote/{to_sym}", to_sym)

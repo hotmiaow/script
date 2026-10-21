@@ -12,6 +12,9 @@ import shutil
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple
 
+import tempfile
+from contextlib import contextmanager
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PORTFOLIO_CSV = os.path.join(BASE_DIR, "portfolio.csv")
 SALES_HISTORY_CSV = os.path.join(BASE_DIR, "sales_history.csv")
@@ -19,7 +22,72 @@ TRANSACTION_HISTORY_CSV = os.path.join(BASE_DIR, "transaction_history.csv")
 WATCHLIST_CSV = os.path.join(BASE_DIR, "watchlist.csv")
 PORTFOLIOS_JSON = os.path.join(BASE_DIR, "portfolios.json")
 BACKUP_DIR = os.path.join(BASE_DIR, "backups")
-DEFAULT_MAX_BACKUPS = 5
+DEFAULT_MAX_BACKUPS = 10
+
+
+@contextmanager
+def atomic_write(filepath: str, mode: str = "w", encoding: str = "utf-8", newline: Optional[str] = ""):
+    """
+    Context manager that writes to a temporary file in the same directory as filepath,
+    then atomically replaces target filepath upon successful completion.
+    Prevents file truncation or corruption if an exception or crash occurs during writing.
+    """
+    dir_name = os.path.dirname(os.path.abspath(filepath))
+    os.makedirs(dir_name, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=".tmp_", suffix=".tmp", dir=dir_name)
+    os.close(fd)
+
+    file_obj = None
+    try:
+        if "b" in mode:
+            file_obj = open(tmp_path, mode=mode)
+        else:
+            file_obj = open(tmp_path, mode=mode, encoding=encoding, newline=newline)
+        yield file_obj
+        file_obj.flush()
+        try:
+            os.fsync(file_obj.fileno())
+        except OSError:
+            pass
+        file_obj.close()
+        file_obj = None
+        os.replace(tmp_path, filepath)
+    except Exception:
+        if file_obj and not file_obj.closed:
+            file_obj.close()
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+        raise
+
+
+def _safe_float(val: Any, default: float = 0.0) -> float:
+    """Safely converts string or number to float, stripping $, %, commas, and whitespace."""
+    if val is None:
+        return default
+    if isinstance(val, (int, float)):
+        return float(val)
+    s = str(val).replace("$", "").replace("%", "").replace(",", "").strip()
+    if not s or s.lower() in ("-", "n/a", "none", "nan"):
+        return default
+    try:
+        return float(s)
+    except ValueError:
+        return default
+
+
+
+def trigger_cloud_sync_on_edit(data_type: str = "all"):
+    """Notifies GoogleSheetSync to queue an auto-upload in a background thread."""
+    try:
+        from google_sheet_sync import get_google_sheet_sync
+        sync_mgr = get_google_sheet_sync()
+        if sync_mgr.is_auto_sync_enabled():
+            sync_mgr.queue_upload_on_edit(delay_seconds=1.0)
+    except Exception:
+        pass
 
 
 def parse_day_change_string(raw_chg: Optional[str], current_price: float = 0.0) -> Tuple[Optional[float], Optional[float]]:
@@ -245,36 +313,38 @@ def save_portfolio(holdings: List[Dict[str, Any]], filepath: str = PORTFOLIO_CSV
         "Currency",
         "Last Updated",
         "Sector",
+        "Target Sell Price",
+        "Stop Loss Price",
     ]
 
     try:
-        with open(filepath, mode="w", newline="", encoding="utf-8") as f:
+        with atomic_write(filepath, mode="w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             for h in holdings:
-                shares = float(h.get("shares", 0.0))
-                buy_price = float(h.get("buy_price", 0.0))
-                current_price = float(h.get("current_price", buy_price))
-                div_yield = float(h.get("dividend_yield", 0.0))
-                annual_div_share = float(h.get("annual_div_per_share", 0.0))
+                shares = _safe_float(h.get("shares", 0.0))
+                buy_price = _safe_float(h.get("buy_price", 0.0))
+                current_price = _safe_float(h.get("current_price", buy_price), buy_price)
+                div_yield = _safe_float(h.get("dividend_yield", 0.0))
+                annual_div_share = _safe_float(h.get("annual_div_per_share", 0.0))
                 port_name = str(h.get("portfolio", "")).strip() or DEFAULT_PORTFOLIO_NAME
 
-                cost_basis = float(h.get("cost_basis", 0.0))
+                cost_basis = _safe_float(h.get("cost_basis", 0.0))
                 if cost_basis <= 0.0 and shares > 0 and buy_price > 0:
                     cost_basis = round(shares * buy_price, 2)
                     h["cost_basis"] = cost_basis
 
-                market_value = float(h.get("market_value", 0.0))
+                market_value = _safe_float(h.get("market_value", 0.0))
                 if market_value <= 0.0 and shares > 0 and current_price > 0:
                     market_value = round(shares * current_price, 2)
                     h["market_value"] = market_value
 
-                unrealized_gain = float(h.get("unrealized_gain", 0.0))
+                unrealized_gain = _safe_float(h.get("unrealized_gain", 0.0))
                 if unrealized_gain == 0.0 and market_value != cost_basis:
                     unrealized_gain = round(market_value - cost_basis, 2)
                     h["unrealized_gain"] = unrealized_gain
 
-                unrealized_gain_pct = float(h.get("unrealized_gain_pct", 0.0))
+                unrealized_gain_pct = _safe_float(h.get("unrealized_gain_pct", 0.0))
                 if unrealized_gain_pct == 0.0 and cost_basis > 0 and unrealized_gain != 0.0:
                     unrealized_gain_pct = round((unrealized_gain / cost_basis * 100), 2)
                     h["unrealized_gain_pct"] = unrealized_gain_pct
@@ -283,7 +353,7 @@ def save_portfolio(holdings: List[Dict[str, Any]], filepath: str = PORTFOLIO_CSV
                     annual_div_share = current_price * (div_yield / 100.0)
                     h["annual_div_per_share"] = annual_div_share
 
-                annual_dividend = float(h.get("annual_dividend", 0.0))
+                annual_dividend = _safe_float(h.get("annual_dividend", 0.0))
                 if annual_dividend <= 0.0 and shares > 0 and annual_div_share > 0:
                     annual_dividend = round(shares * annual_div_share, 2)
                     h["annual_dividend"] = annual_dividend
@@ -291,13 +361,16 @@ def save_portfolio(holdings: List[Dict[str, Any]], filepath: str = PORTFOLIO_CSV
                 chg = h.get("change")
                 chg_pct = h.get("change_percent")
                 if chg is not None and chg_pct is not None:
-                    chg_str = f"{float(chg):+.2f} ({float(chg_pct):+.2f}%)"
+                    chg_str = f"{_safe_float(chg):+.2f} ({_safe_float(chg_pct):+.2f}%)"
                 elif chg is not None:
-                    chg_str = f"{float(chg):+.2f}"
+                    chg_str = f"{_safe_float(chg):+.2f}"
                 elif chg_pct is not None:
-                    chg_str = f"{float(chg_pct):+.2f}%"
+                    chg_str = f"{_safe_float(chg_pct):+.2f}%"
                 else:
                     chg_str = "-"
+
+                target_p = _safe_float(h.get("target_sell_price", 0.0))
+                stop_p = _safe_float(h.get("stop_loss_price", 0.0))
 
                 writer.writerow({
                     "Portfolio": port_name,
@@ -317,7 +390,10 @@ def save_portfolio(holdings: List[Dict[str, Any]], filepath: str = PORTFOLIO_CSV
                     "Currency": h.get("currency", "USD").strip().upper() or "USD",
                     "Last Updated": h.get("last_updated", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
                     "Sector": h.get("sector", ""),
+                    "Target Sell Price": f"{target_p:.2f}" if target_p > 0 else "",
+                    "Stop Loss Price": f"{stop_p:.2f}" if stop_p > 0 else "",
                 })
+        trigger_cloud_sync_on_edit("portfolio")
         return True
     except Exception as e:
         print(f"Error saving portfolio CSV: {e}")
@@ -377,6 +453,9 @@ def load_portfolio(filepath: str = PORTFOLIO_CSV, portfolio_name: Optional[str] 
                 raw_chg = row.get("Day Change") or row.get("Change") or row.get("Day Change ($)") or ""
                 chg_val, chg_pct_val = parse_day_change_string(raw_chg, current_price)
 
+                target_sell_price = _parse_float(row.get("Target Sell Price") or row.get("target_sell_price"))
+                stop_loss_price = _parse_float(row.get("Stop Loss Price") or row.get("stop_loss_price"))
+
                 holdings.append({
                     "portfolio": port,
                     "symbol": symbol,
@@ -396,11 +475,193 @@ def load_portfolio(filepath: str = PORTFOLIO_CSV, portfolio_name: Optional[str] 
                     "currency": row.get("Currency", "USD").strip().upper() or "USD",
                     "last_updated": row.get("Last Updated", ""),
                     "sector": (row.get("Sector") or row.get("sector") or "").strip(),
+                    "target_sell_price": target_sell_price,
+                    "stop_loss_price": stop_loss_price,
                 })
         return holdings
     except Exception as e:
         print(f"Error loading portfolio CSV: {e}")
         return []
+
+
+def add_holding(
+    holding_data: Dict[str, Any],
+    filepath: str = PORTFOLIO_CSV,
+) -> bool:
+    """
+    Adds a new holding or merges into an existing holding in the portfolio.
+    If the holding already exists in the target portfolio, merges shares and computes weighted average buy price.
+    Automatically recalculates cost basis, market value, and unrealized gain metrics.
+    """
+    from financial_calc import calc_holding_summary
+
+    sym = str(holding_data.get("symbol", "")).strip().upper()
+    if not sym:
+        return False
+
+    port = str(holding_data.get("portfolio", DEFAULT_PORTFOLIO_NAME)).strip() or DEFAULT_PORTFOLIO_NAME
+    shares = float(holding_data.get("shares", 0.0) or 0.0)
+    buy_price = float(holding_data.get("buy_price", 0.0) or 0.0)
+    current_price = float(holding_data.get("current_price", buy_price) or buy_price)
+    curr = str(holding_data.get("currency", "USD")).strip().upper() or "USD"
+    name = str(holding_data.get("name", sym)).strip() or sym
+    date_str = str(holding_data.get("last_updated") or datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+    holdings = load_portfolio(filepath)
+    existing = next(
+        (h for h in holdings if str(h.get("symbol", "")).strip().upper() == sym and (h.get("portfolio") or DEFAULT_PORTFOLIO_NAME).strip() == port),
+        None
+    )
+
+    if existing:
+        ex_sh = float(existing.get("shares", 0.0) or 0.0)
+        ex_bp = float(existing.get("buy_price", 0.0) or 0.0)
+        tot_sh = round(ex_sh + shares, 4)
+        tot_cb = round((ex_sh * ex_bp) + (shares * buy_price), 2)
+        avg_bp = round(tot_cb / tot_sh, 4) if tot_sh > 0 else buy_price
+        existing["shares"] = tot_sh
+        existing["buy_price"] = avg_bp
+        existing["cost_basis"] = tot_cb
+        existing["currency"] = curr
+        cur_p = float(existing.get("current_price", avg_bp) or avg_bp)
+        dy = float(existing.get("dividend_yield", 0.0) or 0.0)
+        ad = float(existing.get("annual_div_per_share", 0.0) or 0.0)
+        existing.update(calc_holding_summary(tot_sh, avg_bp, cur_p, dy, ad))
+        existing["last_updated"] = date_str
+        if holding_data.get("target_sell_price") is not None:
+            existing["target_sell_price"] = float(holding_data["target_sell_price"])
+        if holding_data.get("stop_loss_price") is not None:
+            existing["stop_loss_price"] = float(holding_data["stop_loss_price"])
+    else:
+        new_h = {
+            "portfolio": port,
+            "symbol": sym,
+            "name": name,
+            "shares": shares,
+            "buy_price": buy_price,
+            "current_price": current_price,
+            "dividend_yield": float(holding_data.get("dividend_yield", 0.0) or 0.0),
+            "annual_div_per_share": float(holding_data.get("annual_div_per_share", 0.0) or 0.0),
+            "currency": curr,
+            "last_updated": date_str,
+            "day_change": str(holding_data.get("day_change", "-")),
+            "sector": str(holding_data.get("sector", "")),
+        }
+        if holding_data.get("target_sell_price") is not None:
+            new_h["target_sell_price"] = float(holding_data["target_sell_price"])
+        if holding_data.get("stop_loss_price") is not None:
+            new_h["stop_loss_price"] = float(holding_data["stop_loss_price"])
+        new_h.update(calc_holding_summary(shares, buy_price, current_price, new_h["dividend_yield"], new_h["annual_div_per_share"]))
+        holdings.append(new_h)
+
+    return save_portfolio(holdings, filepath=filepath)
+
+
+def update_holding(
+    original_portfolio: str,
+    original_symbol: str,
+    updated_data: Dict[str, Any],
+    filepath: str = PORTFOLIO_CSV,
+) -> bool:
+    """
+    Updates an existing holding in the portfolio.
+    Supports updating:
+    - symbol (renaming holding ticker)
+    - portfolio (moving to another portfolio; merges if target portfolio already has this ticker)
+    - currency (updating stock currency, e.g. CAD <-> USD <-> HKD)
+    - shares, buy_price, current_price, target_sell_price, stop_loss_price
+    Automatically updates cost basis, market value, unrealized gain, and rotating backups.
+    """
+    from financial_calc import calc_holding_summary
+
+    orig_sym = str(original_symbol or "").strip().upper()
+    orig_port = str(original_portfolio or DEFAULT_PORTFOLIO_NAME).strip() or DEFAULT_PORTFOLIO_NAME
+    if not orig_sym:
+        return False
+
+    holdings = load_portfolio(filepath)
+    matched = next(
+        (h for h in holdings if str(h.get("symbol", "")).strip().upper() == orig_sym and (h.get("portfolio") or DEFAULT_PORTFOLIO_NAME).strip() == orig_port),
+        None
+    )
+    if not matched:
+        return False
+
+    new_port = str(updated_data.get("portfolio", orig_port)).strip() or orig_port
+    new_sym = str(updated_data.get("symbol", orig_sym)).strip().upper() or orig_sym
+    new_curr = str(updated_data.get("currency", matched.get("currency", "USD"))).strip().upper() or "USD"
+    new_shares = float(updated_data.get("shares", matched.get("shares", 0.0)))
+    new_bp = float(updated_data.get("buy_price", matched.get("buy_price", 0.0)))
+    new_cp = float(updated_data.get("current_price", matched.get("current_price", new_bp)))
+
+    # Check if renaming or moving causes collision with an existing holding in new_port
+    if (new_port, new_sym) != (orig_port, orig_sym):
+        existing = next(
+            (h for h in holdings if h is not matched and str(h.get("symbol", "")).strip().upper() == new_sym and (h.get("portfolio") or DEFAULT_PORTFOLIO_NAME).strip() == new_port),
+            None
+        )
+        if existing:
+            ex_sh = float(existing.get("shares", 0.0) or 0.0)
+            ex_bp = float(existing.get("buy_price", 0.0) or 0.0)
+            tot_sh = round(ex_sh + new_shares, 4)
+            tot_cb = round((ex_sh * ex_bp) + (new_shares * new_bp), 2)
+            avg_bp = round(tot_cb / tot_sh, 4) if tot_sh > 0 else new_bp
+            existing["shares"] = tot_sh
+            existing["buy_price"] = avg_bp
+            existing["cost_basis"] = tot_cb
+            existing["currency"] = new_curr
+            cur_p = float(existing.get("current_price", avg_bp) or avg_bp)
+            dy = float(existing.get("dividend_yield", 0.0) or 0.0)
+            ad = float(existing.get("annual_div_per_share", 0.0) or 0.0)
+            existing.update(calc_holding_summary(tot_sh, avg_bp, cur_p, dy, ad))
+            holdings.remove(matched)
+            return save_portfolio(holdings, filepath=filepath)
+
+    matched["portfolio"] = new_port
+    matched["symbol"] = new_sym
+    matched["currency"] = new_curr
+    matched["shares"] = new_shares
+    matched["buy_price"] = new_bp
+    matched["current_price"] = new_cp
+    if updated_data.get("name"):
+        matched["name"] = updated_data["name"]
+    elif matched.get("name") in (orig_sym, f"{orig_sym}:CDN", f"{orig_sym}:CA", ""):
+        matched["name"] = new_sym
+    if updated_data.get("target_sell_price") is not None:
+        matched["target_sell_price"] = float(updated_data["target_sell_price"])
+    if updated_data.get("stop_loss_price") is not None:
+        matched["stop_loss_price"] = float(updated_data["stop_loss_price"])
+
+    dy = float(matched.get("dividend_yield", 0.0) or 0.0)
+    ad = float(matched.get("annual_div_per_share", 0.0) or 0.0)
+    matched.update(calc_holding_summary(new_shares, new_bp, new_cp, dy, ad))
+
+    return save_portfolio(holdings, filepath=filepath)
+
+
+def delete_holding(
+    portfolio: str,
+    symbol: str,
+    filepath: str = PORTFOLIO_CSV,
+) -> bool:
+    """
+    Deletes a holding matching the symbol and optional portfolio.
+    Creates rotating backups before writing.
+    """
+    holdings = load_portfolio(filepath)
+    orig_len = len(holdings)
+    clean_sym = str(symbol or "").strip().upper()
+    target_port = str(portfolio or "").strip()
+    holdings = [
+        h for h in holdings
+        if not (
+            str(h.get("symbol", "")).strip().upper() == clean_sym
+            and (not target_port or target_port in ("All", "All Portfolios", "All Portfolios (Consolidated)") or str(h.get("portfolio", "")).strip() == target_port)
+        )
+    ]
+    if len(holdings) < orig_len:
+        return save_portfolio(holdings, filepath=filepath)
+    return False
 
 
 def load_registered_portfolios(filepath: str = PORTFOLIOS_JSON) -> List[str]:
@@ -420,11 +681,13 @@ def load_registered_portfolios(filepath: str = PORTFOLIOS_JSON) -> List[str]:
 
 
 def save_registered_portfolios(names: List[str], filepath: str = PORTFOLIOS_JSON) -> bool:
-    """Saves distinct registered portfolio names to JSON."""
+    """Saves distinct registered portfolio names to JSON with rotating backup."""
     clean = sorted(list(set(str(n).strip() for n in names if str(n).strip() and str(n).strip() != "All Portfolios (Consolidated)")))
+    rotate_file_backups(filepath, max_backups=DEFAULT_MAX_BACKUPS)
     try:
-        with open(filepath, "w", encoding="utf-8") as f:
+        with atomic_write(filepath, mode="w", encoding="utf-8") as f:
             json.dump(clean, f, indent=2, ensure_ascii=False)
+        trigger_cloud_sync_on_edit("portfolios")
         return True
     except Exception as e:
         print(f"Error saving portfolios JSON: {e}")
@@ -473,12 +736,13 @@ def get_portfolio_names(filepath: str = PORTFOLIO_CSV, include_registered: Optio
 
     if include_registered:
         # Load from registered portfolios.json
-        for p in load_registered_portfolios(PORTFOLIOS_JSON):
+        reg_ports = load_registered_portfolios(PORTFOLIOS_JSON)
+        for p in reg_ports:
             if p and p != "All Portfolios (Consolidated)":
                 names.add(p)
 
-        # Read from transaction history CSV
-        if os.path.exists(TRANSACTION_HISTORY_CSV):
+        # Read from transaction history CSV ONLY as fallback if names is still empty
+        if not names and os.path.exists(TRANSACTION_HISTORY_CSV):
             try:
                 with open(TRANSACTION_HISTORY_CSV, mode="r", newline="", encoding="utf-8") as f:
                     reader = csv.DictReader(f)
@@ -507,7 +771,9 @@ def get_portfolio_names(filepath: str = PORTFOLIO_CSV, include_registered: Optio
             names.add(DEFAULT_PORTFOLIO_NAME)
 
         sorted_names = sorted(list(names))
-        save_registered_portfolios(sorted_names, PORTFOLIOS_JSON)
+        # Only write to disk if registered portfolios actually changed
+        if set(sorted_names) != set(reg_ports):
+            save_registered_portfolios(sorted_names, PORTFOLIOS_JSON)
         return sorted_names
 
     if not names:
@@ -613,31 +879,66 @@ def save_transactions(transactions: List[Dict[str, Any]], filepath: str = TRANSA
     """
     Saves transactions (BUY, SELL, etc.) to CSV file.
     Automatically creates rotating backup copies (up to 5) before overwriting.
+    Deduplicates identical records to prevent runaway CSV bloat.
     """
     rotate_file_backups(filepath, max_backups=DEFAULT_MAX_BACKUPS)
+    # Deduplicate identical transactions while preserving chronological order
+    seen_tx = set()
+    unique_txs = []
+    for tx in transactions:
+        t_type = str(tx.get("type", "BUY")).strip().upper() or "BUY"
+        port = str(tx.get("portfolio", DEFAULT_PORTFOLIO_NAME)).strip()
+        sym = str(tx.get("symbol", "")).strip().upper()
+        sh_val = round(_safe_float(tx.get('shares', 0.0)), 4)
+        pr_val = round(_safe_float(tx.get('price', 0.0)), 2)
+        date_str = str(tx.get("date", "")).strip()
+        key = (date_str, t_type, port, sym, sh_val, pr_val)
+        if key in seen_tx:
+            continue
+        seen_tx.add(key)
+        unique_txs.append(tx)
+    transactions = unique_txs
+
     try:
-        with open(filepath, mode="w", newline="", encoding="utf-8") as f:
+        with atomic_write(filepath, mode="w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=TRANSACTION_FIELDNAMES)
             writer.writeheader()
             for tx in transactions:
                 t_type = str(tx.get("type", "BUY")).strip().upper() or "BUY"
+                sh_val = _safe_float(tx.get('shares', 0.0))
+                pr_val = _safe_float(tx.get('price', 0.0))
+                tot_val = _safe_float(tx.get('total_amount', 0.0))
+                if tot_val == 0.0 and sh_val > 0 and pr_val > 0:
+                    tot_val = round(sh_val * pr_val, 2)
+                cb_val = _safe_float(tx.get('cost_basis', 0.0))
+                if cb_val == 0.0 and t_type == "BUY":
+                    cb_val = tot_val
+                comm_val = _safe_float(tx.get('commission_fee', 0.0))
+                tax_val = _safe_float(tx.get('estimated_tax', 0.0))
+                net_val = _safe_float(tx.get('net_amount', 0.0))
+                if net_val == 0.0:
+                    net_val = round(tot_val - comm_val - tax_val, 2) if t_type == "SELL" else round(tot_val + comm_val, 2)
+                prof_val = _safe_float(tx.get('net_profit', 0.0))
+                roi_val = _safe_float(tx.get('net_roi_pct', 0.0))
+
                 writer.writerow({
                     "Date": tx.get("date", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
                     "Type": t_type,
                     "Portfolio": tx.get("portfolio", DEFAULT_PORTFOLIO_NAME),
                     "Symbol": str(tx.get("symbol", "")).strip().upper(),
-                    "Shares": f"{float(tx.get('shares', 0.0)):.4f}",
-                    "Price ($)": f"{float(tx.get('price', 0.0)):.2f}",
-                    "Total Amount ($)": f"{float(tx.get('total_amount', 0.0)):.2f}",
-                    "Cost Basis ($)": f"{float(tx.get('cost_basis', 0.0)):.2f}",
-                    "Commission ($)": f"{float(tx.get('commission_fee', 0.0)):.2f}",
-                    "Estimated Tax ($)": f"{float(tx.get('estimated_tax', 0.0)):.2f}",
-                    "Net Amount ($)": f"{float(tx.get('net_amount', 0.0)):.2f}",
-                    "Net Profit ($)": f"{float(tx.get('net_profit', 0.0)):+.2f}" if t_type == "SELL" else "",
-                    "Net ROI (%)": f"{float(tx.get('net_roi_pct', 0.0)):+.2f}%" if t_type == "SELL" else "",
+                    "Shares": f"{sh_val:.4f}",
+                    "Price ($)": f"{pr_val:.2f}",
+                    "Total Amount ($)": f"{tot_val:.2f}",
+                    "Cost Basis ($)": f"{cb_val:.2f}",
+                    "Commission ($)": f"{comm_val:.2f}",
+                    "Estimated Tax ($)": f"{tax_val:.2f}",
+                    "Net Amount ($)": f"{net_val:.2f}",
+                    "Net Profit ($)": f"{prof_val:+.2f}" if t_type == "SELL" else "",
+                    "Net ROI (%)": f"{roi_val:+.2f}%" if t_type == "SELL" else "",
                     "Currency": tx.get("currency", "USD").strip().upper() or "USD",
                     "Notes": tx.get("notes", ""),
                 })
+        trigger_cloud_sync_on_edit("transactions")
         return True
     except Exception as e:
         print(f"Error saving transaction history CSV: {e}")
@@ -810,6 +1111,302 @@ def delete_transaction(index: int, filepath: str = TRANSACTION_HISTORY_CSV) -> b
     return save_transactions(txs, filepath)
 
 
+def sync_transaction_change_to_portfolio(
+    old_tx: Optional[Dict[str, Any]],
+    new_tx: Optional[Dict[str, Any]],
+    portfolio_filepath: str = PORTFOLIO_CSV,
+) -> bool:
+    """
+    Synchronizes a transaction change (edit, addition, or deletion) into portfolio holdings.
+    If old_tx is provided, its effect is reversed from the corresponding holding.
+    If new_tx is provided, its effect is applied to the corresponding holding.
+    If a symbol was renamed, transfers/updates holding details cleanly.
+    Automatically saves the updated portfolio to portfolio_filepath.
+    """
+    from financial_calc import calc_holding_summary
+
+    if not old_tx and not new_tx:
+        return True
+
+    holdings = load_portfolio(portfolio_filepath)
+
+    def _normalize_sym(s: Any) -> str:
+        return str(s or "").strip().upper()
+
+    def _clean_sym(s: str) -> str:
+        s_norm = _normalize_sym(s)
+        return s_norm.split(":")[0].split(".")[0].strip()
+
+    def _find_holding(port: str, sym: str) -> Optional[Dict[str, Any]]:
+        target_port = port.strip() or DEFAULT_PORTFOLIO_NAME
+        target_sym = _normalize_sym(sym)
+        # 1. Exact match
+        for h in holdings:
+            h_port = (h.get("portfolio") or DEFAULT_PORTFOLIO_NAME).strip()
+            if h_port == target_port and _normalize_sym(h.get("symbol", "")) == target_sym:
+                return h
+        # 2. Match with :CDN or :CA alias
+        clean_target = _clean_sym(target_sym)
+        for h in holdings:
+            h_port = (h.get("portfolio") or DEFAULT_PORTFOLIO_NAME).strip()
+            if h_port == target_port:
+                h_sym = _normalize_sym(h.get("symbol", ""))
+                if h_sym.endswith(":CDN") or h_sym.endswith(":CA") or target_sym.endswith(":CDN") or target_sym.endswith(":CA"):
+                    if _clean_sym(h_sym) == clean_target:
+                        return h
+        return None
+
+    # Step 1: Revert old_tx
+    reverted_meta: Dict[str, Any] = {}
+    if old_tx:
+        o_type = str(old_tx.get("type", "BUY")).strip().upper()
+        o_port = str(old_tx.get("portfolio", DEFAULT_PORTFOLIO_NAME)).strip()
+        o_sym = _normalize_sym(old_tx.get("symbol", ""))
+        o_shares = float(old_tx.get("shares", 0.0) or 0.0)
+        o_price = float(old_tx.get("price", 0.0) or 0.0)
+        o_cb = float(old_tx.get("cost_basis", 0.0) or (o_shares * o_price))
+
+        h = _find_holding(o_port, o_sym)
+        if h:
+            reverted_meta = {
+                "name": h.get("name"),
+                "current_price": float(h.get("current_price", o_price) or o_price),
+                "dividend_yield": float(h.get("dividend_yield", 0.0) or 0.0),
+                "annual_div_per_share": float(h.get("annual_div_per_share", 0.0) or 0.0),
+                "currency": h.get("currency", old_tx.get("currency", "USD")),
+                "day_change": h.get("day_change", "-"),
+                "sector": h.get("sector", ""),
+            }
+            if o_type == "BUY":
+                cur_sh = float(h.get("shares", 0.0) or 0.0)
+                cur_bp = float(h.get("buy_price", 0.0) or 0.0)
+                cur_cb = float(h.get("cost_basis", 0.0) or (cur_sh * cur_bp))
+                rem_sh = round(cur_sh - o_shares, 6)
+                rem_cb = round(cur_cb - o_cb, 2)
+                if rem_sh <= 0.0001:
+                    holdings.remove(h)
+                else:
+                    h["shares"] = rem_sh
+                    h["cost_basis"] = max(0.0, rem_cb)
+                    h["buy_price"] = round(rem_cb / rem_sh, 4) if rem_sh > 0 else cur_bp
+                    cur_p = float(h.get("current_price", h["buy_price"]) or h["buy_price"])
+                    dy = float(h.get("dividend_yield", 0.0) or 0.0)
+                    ad = float(h.get("annual_div_per_share", 0.0) or 0.0)
+                    h.update(calc_holding_summary(rem_sh, h["buy_price"], cur_p, dy, ad))
+            elif o_type == "SELL":
+                cur_sh = float(h.get("shares", 0.0) or 0.0)
+                cur_bp = float(h.get("buy_price", 0.0) or 0.0)
+                cur_cb = float(h.get("cost_basis", 0.0) or (cur_sh * cur_bp))
+                tot_sh = round(cur_sh + o_shares, 6)
+                tot_cb = round(cur_cb + o_cb, 2)
+                h["shares"] = tot_sh
+                h["cost_basis"] = tot_cb
+                h["buy_price"] = round(tot_cb / tot_sh, 4) if tot_sh > 0 else cur_bp
+                cur_p = float(h.get("current_price", h["buy_price"]) or h["buy_price"])
+                dy = float(h.get("dividend_yield", 0.0) or 0.0)
+                ad = float(h.get("annual_div_per_share", 0.0) or 0.0)
+                h.update(calc_holding_summary(tot_sh, h["buy_price"], cur_p, dy, ad))
+
+    # Step 2: Apply new_tx
+    if new_tx:
+        n_type = str(new_tx.get("type", "BUY")).strip().upper()
+        n_port = str(new_tx.get("portfolio", DEFAULT_PORTFOLIO_NAME)).strip()
+        n_sym = _normalize_sym(new_tx.get("symbol", ""))
+        n_shares = float(new_tx.get("shares", 0.0) or 0.0)
+        n_price = float(new_tx.get("price", 0.0) or 0.0)
+        n_cb = float(new_tx.get("cost_basis", 0.0) or (n_shares * n_price))
+        n_curr = new_tx.get("currency") or reverted_meta.get("currency") or "USD"
+        n_date = new_tx.get("date") or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        h = _find_holding(n_port, n_sym)
+        if n_type == "BUY":
+            if h:
+                cur_sh = float(h.get("shares", 0.0) or 0.0)
+                cur_bp = float(h.get("buy_price", 0.0) or 0.0)
+                cur_cb = float(h.get("cost_basis", 0.0) or (cur_sh * cur_bp))
+                tot_sh = round(cur_sh + n_shares, 6)
+                tot_cb = round(cur_cb + n_cb, 2)
+                avg_bp = round(tot_cb / tot_sh, 4) if tot_sh > 0 else n_price
+                h["symbol"] = n_sym
+                h["portfolio"] = n_port
+                if n_curr:
+                    h["currency"] = n_curr
+                o_sym_val = _normalize_sym(old_tx.get("symbol", "")) if old_tx else ""
+                if not h.get("name") or h.get("name") in (n_sym, f"{n_sym}:CDN", f"{n_sym}:CA", o_sym_val, f"{o_sym_val}:CDN", f"{o_sym_val}:CA"):
+                    h["name"] = n_sym
+                h["shares"] = tot_sh
+                h["cost_basis"] = tot_cb
+                h["buy_price"] = avg_bp
+                cur_p = float(h.get("current_price", avg_bp) or avg_bp)
+                dy = float(h.get("dividend_yield", 0.0) or 0.0)
+                ad = float(h.get("annual_div_per_share", 0.0) or 0.0)
+                h.update(calc_holding_summary(tot_sh, avg_bp, cur_p, dy, ad))
+                h["last_updated"] = n_date
+
+                # Check if updating h created a collision with an existing holding in n_port
+                other_h = next(
+                    (x for x in holdings if x is not h and (x.get("portfolio") or DEFAULT_PORTFOLIO_NAME).strip() == n_port and _normalize_sym(x.get("symbol", "")) == n_sym),
+                    None
+                )
+                if other_h:
+                    o_sh = float(other_h.get("shares", 0.0) or 0.0)
+                    o_bp = float(other_h.get("buy_price", 0.0) or 0.0)
+                    m_sh = round(o_sh + tot_sh, 6)
+                    m_cb = round((o_sh * o_bp) + tot_cb, 2)
+                    m_bp = round(m_cb / m_sh, 4) if m_sh > 0 else avg_bp
+                    other_h["shares"] = m_sh
+                    other_h["cost_basis"] = m_cb
+                    other_h["buy_price"] = m_bp
+                    other_h["currency"] = n_curr
+                    cur_p = float(other_h.get("current_price", m_bp) or m_bp)
+                    dy = float(other_h.get("dividend_yield", 0.0) or 0.0)
+                    ad = float(other_h.get("annual_div_per_share", 0.0) or 0.0)
+                    other_h.update(calc_holding_summary(m_sh, m_bp, cur_p, dy, ad))
+                    holdings.remove(h)
+            else:
+                cur_p = reverted_meta.get("current_price", n_price)
+                dy = reverted_meta.get("dividend_yield", 0.0)
+                ad = reverted_meta.get("annual_div_per_share", 0.0)
+                name = reverted_meta.get("name") or n_sym
+                if name.endswith(":CDN") or name.endswith(":CA"):
+                    name = _clean_sym(name)
+                new_h = {
+                    "portfolio": n_port,
+                    "symbol": n_sym,
+                    "name": name,
+                    "shares": n_shares,
+                    "buy_price": n_price,
+                    "current_price": cur_p,
+                    "dividend_yield": dy,
+                    "annual_div_per_share": ad,
+                    "currency": n_curr,
+                    "last_updated": n_date,
+                    "day_change": reverted_meta.get("day_change", "-"),
+                    "sector": reverted_meta.get("sector", ""),
+                }
+                new_h.update(calc_holding_summary(n_shares, n_price, cur_p, dy, ad))
+                holdings.append(new_h)
+        elif n_type == "SELL":
+            if h:
+                cur_sh = float(h.get("shares", 0.0) or 0.0)
+                rem_sh = round(cur_sh - n_shares, 6)
+                if rem_sh <= 0.0001:
+                    holdings.remove(h)
+                else:
+                    cur_bp = float(h.get("buy_price", 0.0) or 0.0)
+                    rem_cb = round(rem_sh * cur_bp, 2)
+                    h["shares"] = rem_sh
+                    h["cost_basis"] = rem_cb
+                    h["symbol"] = n_sym
+                    h["portfolio"] = n_port
+                    if n_curr:
+                        h["currency"] = n_curr
+                    cur_p = float(h.get("current_price", cur_bp) or cur_bp)
+                    dy = float(h.get("dividend_yield", 0.0) or 0.0)
+                    ad = float(h.get("annual_div_per_share", 0.0) or 0.0)
+                    h.update(calc_holding_summary(rem_sh, cur_bp, cur_p, dy, ad))
+                    h["last_updated"] = n_date
+
+    return save_portfolio(holdings, filepath=portfolio_filepath)
+
+
+def reconcile_portfolio_holdings_with_transactions(
+    portfolio_filepath: str = PORTFOLIO_CSV,
+    history_filepath: str = TRANSACTION_HISTORY_CSV,
+) -> Dict[str, Any]:
+    """
+    Scans portfolio holdings and transaction history to detect and fix discrepancies:
+    1. Removes or fixes improper ticker suffixes like :CDN or :CA.
+    2. Synchronizes holdings whose symbols were updated in transaction history.
+    3. Merges duplicate holdings in the same portfolio if renaming creates a collision.
+    Saves portfolio_filepath if any changes were made.
+    """
+    if not os.path.exists(portfolio_filepath):
+        return {"success": False, "reconciled_count": 0, "reconciled": []}
+
+    holdings = load_portfolio(portfolio_filepath)
+    needs_tx_lookup = any(
+        str(h.get("symbol", "")).strip().upper().endswith((":CDN", ":CA"))
+        for h in holdings
+    )
+    txs = load_transactions(history_filepath, portfolio_name=None, tx_type=None) if (needs_tx_lookup and os.path.exists(history_filepath)) else []
+
+    def _clean_sym(s: str) -> str:
+        s_norm = str(s or "").strip().upper()
+        return s_norm.split(":")[0].split(".")[0].strip()
+
+    reconciled: List[str] = []
+    modified = False
+
+    for h in holdings:
+        h_sym = str(h.get("symbol", "")).strip().upper()
+        h_port = (h.get("portfolio") or DEFAULT_PORTFOLIO_NAME).strip()
+        h_shares = float(h.get("shares", 0.0) or 0.0)
+        h_bp = float(h.get("buy_price", 0.0) or 0.0)
+
+        # Check for :CDN or :CA invalid suffixes
+        if h_sym.endswith(":CDN") or h_sym.endswith(":CA"):
+            clean_s = _clean_sym(h_sym)
+            # Find matching tx in transaction history
+            target_sym = clean_s
+            for tx in txs:
+                tx_port = (tx.get("portfolio") or DEFAULT_PORTFOLIO_NAME).strip()
+                tx_sym = str(tx.get("symbol", "")).strip().upper()
+                if tx_port == h_port and _clean_sym(tx_sym) == clean_s:
+                    target_sym = tx_sym
+                    if tx.get("currency"):
+                        h["currency"] = str(tx.get("currency")).strip().upper()
+                    break
+
+            old_sym = h["symbol"]
+            h["symbol"] = target_sym
+            if h.get("name") in (old_sym, h_sym, clean_s, f"{clean_s}:CDN", f"{clean_s}:CA", ""):
+                if clean_s == "VGRO":
+                    h["name"] = "Vanguard Growth ETF Portfolio"
+                elif clean_s == "VFV":
+                    h["name"] = "Vanguard S&P 500 Index ETF"
+                else:
+                    h["name"] = target_sym
+            reconciled.append(f"Updated holding '{old_sym}' to '{target_sym}' in '{h_port}'.")
+            modified = True
+
+    # Check for duplicate holdings resulting from renaming (e.g. VGRO vs existing VGRO in same portfolio)
+    merged_map: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for h in holdings:
+        port = (h.get("portfolio") or DEFAULT_PORTFOLIO_NAME).strip()
+        sym = str(h.get("symbol", "")).strip().upper()
+        key = (port, sym)
+        if key in merged_map:
+            from financial_calc import calc_holding_summary
+            prev = merged_map[key]
+            sh1 = float(prev.get("shares", 0.0) or 0.0)
+            bp1 = float(prev.get("buy_price", 0.0) or 0.0)
+            sh2 = float(h.get("shares", 0.0) or 0.0)
+            bp2 = float(h.get("buy_price", 0.0) or 0.0)
+            tot_shares = sh1 + sh2
+            avg_bp = ((sh1 * bp1) + (sh2 * bp2)) / tot_shares if tot_shares > 0 else bp1
+            prev["shares"] = tot_shares
+            prev["buy_price"] = round(avg_bp, 4)
+            prev["cost_basis"] = round(tot_shares * avg_bp, 2)
+            cur_p = float(prev.get("current_price", avg_bp) or avg_bp)
+            dy = float(prev.get("dividend_yield", 0.0) or 0.0)
+            ad = float(prev.get("annual_div_per_share", 0.0) or 0.0)
+            prev.update(calc_holding_summary(tot_shares, avg_bp, cur_p, dy, ad))
+            reconciled.append(f"Merged duplicate holding '{sym}' in '{port}': total {tot_shares:.2f} shares.")
+            modified = True
+        else:
+            merged_map[key] = h
+
+    if modified:
+        save_portfolio(list(merged_map.values()), filepath=portfolio_filepath)
+
+    return {
+        "success": True,
+        "reconciled_count": len(reconciled),
+        "reconciled": reconciled,
+    }
+
+
 def save_sales_history(sales: List[Dict[str, Any]], filepath: str = SALES_HISTORY_CSV) -> bool:
     """
     Saves sales transactions to CSV.
@@ -836,7 +1433,7 @@ def save_sales_history(sales: List[Dict[str, Any]], filepath: str = SALES_HISTOR
     ]
 
     try:
-        with open(filepath, mode="w", newline="", encoding="utf-8") as f:
+        with atomic_write(filepath, mode="w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             for s in sales:
@@ -844,20 +1441,21 @@ def save_sales_history(sales: List[Dict[str, Any]], filepath: str = SALES_HISTOR
                     "Date": s.get("date", datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
                     "Portfolio": s.get("portfolio", DEFAULT_PORTFOLIO_NAME),
                     "Symbol": s.get("symbol", ""),
-                    "Shares Sold": f"{float(s.get('shares_to_sell', s.get('shares', 0.0))):.4f}",
-                    "Buy Price ($)": f"{float(s.get('buy_price', 0.0)):.2f}",
-                    "Sell Price ($)": f"{float(s.get('sell_price', s.get('price', 0.0))):.2f}",
-                    "Gross Proceeds ($)": f"{float(s.get('gross_proceeds', s.get('total_amount', 0.0))):.2f}",
-                    "Cost Basis ($)": f"{float(s.get('cost_basis', 0.0)):.2f}",
-                    "Commission ($)": f"{float(s.get('commission_fee', 0.0)):.2f}",
-                    "Gross Gain ($)": f"{float(s.get('gross_gain', 0.0)):+.2f}",
-                    "Tax Rate (%)": f"{float(s.get('tax_rate_pct', 0.0)):.2f}%",
-                    "Estimated Tax ($)": f"{float(s.get('estimated_tax', 0.0)):.2f}",
-                    "Net Proceeds ($)": f"{float(s.get('net_proceeds', s.get('net_amount', 0.0))):.2f}",
-                    "Net Profit ($)": f"{float(s.get('net_profit', 0.0)):+.2f}",
-                    "Net ROI (%)": f"{float(s.get('net_roi_pct', 0.0)):+.2f}%",
+                    "Shares Sold": f"{_safe_float(s.get('shares_to_sell', s.get('shares', 0.0))):.4f}",
+                    "Buy Price ($)": f"{_safe_float(s.get('buy_price', 0.0)):.2f}",
+                    "Sell Price ($)": f"{_safe_float(s.get('sell_price', s.get('price', 0.0))):.2f}",
+                    "Gross Proceeds ($)": f"{_safe_float(s.get('gross_proceeds', s.get('total_amount', 0.0))):.2f}",
+                    "Cost Basis ($)": f"{_safe_float(s.get('cost_basis', 0.0)):.2f}",
+                    "Commission ($)": f"{_safe_float(s.get('commission_fee', 0.0)):.2f}",
+                    "Gross Gain ($)": f"{_safe_float(s.get('gross_gain', 0.0)):+.2f}",
+                    "Tax Rate (%)": f"{_safe_float(s.get('tax_rate_pct', 0.0)):.2f}%",
+                    "Estimated Tax ($)": f"{_safe_float(s.get('estimated_tax', 0.0)):.2f}",
+                    "Net Proceeds ($)": f"{_safe_float(s.get('net_proceeds', s.get('net_amount', 0.0))):.2f}",
+                    "Net Profit ($)": f"{_safe_float(s.get('net_profit', 0.0)):+.2f}",
+                    "Net ROI (%)": f"{_safe_float(s.get('net_roi_pct', 0.0)):+.2f}%",
                     "Currency": s.get("currency", "USD").strip().upper() or "USD",
                 })
+        trigger_cloud_sync_on_edit("sales")
         return True
     except Exception as e:
         print(f"Error saving sales history CSV: {e}")
@@ -945,7 +1543,7 @@ def export_period_report_to_csv(report_data: Dict[str, Any], filepath: str) -> b
         period_label = report_data.get("period_label", report_data.get("period_mode", "All Time"))
         port_name = report_data.get("portfolio_name", "All Portfolios")
 
-        with open(filepath, mode="w", newline="", encoding="utf-8") as f:
+        with atomic_write(filepath, mode="w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             # 1. Report Metadata
             writer.writerow(["# PERIOD EARNINGS REPORT"])
@@ -1053,22 +1651,24 @@ def save_watchlist(watchlist: List[Dict[str, Any]], filepath: str = WATCHLIST_CS
     rotate_file_backups(filepath, max_backups=DEFAULT_MAX_BACKUPS)
     fieldnames = ["Symbol", "Name", "Target Price", "Currency", "Notes", "Tags", "Added Date"]
     try:
-        with open(filepath, mode="w", newline="", encoding="utf-8") as f:
+        with atomic_write(filepath, mode="w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             for w in watchlist:
                 sym = (w.get("symbol") or "").strip().upper()
                 if not sym:
                     continue
+                tp_val = _safe_float(w.get('target_price') or w.get('target_buy_price') or 0.0)
                 writer.writerow({
                     "Symbol": sym,
                     "Name": w.get("name", sym),
-                    "Target Price": f"{float(w.get('target_price') or w.get('target_buy_price') or 0.0):.2f}",
+                    "Target Price": f"{tp_val:.2f}",
                     "Currency": (w.get("currency") or "USD").strip().upper(),
                     "Notes": w.get("notes", ""),
                     "Tags": w.get("tags", ""),
                     "Added Date": w.get("added_date", datetime.now().strftime("%Y-%m-%d")),
                 })
+        trigger_cloud_sync_on_edit("watchlist")
         return True
     except Exception as e:
         print(f"Error saving watchlist CSV: {e}")
@@ -1095,7 +1695,7 @@ def load_watchlist_quotes_cache(filepath: str = WATCHLIST_QUOTES_JSON) -> Dict[s
 def save_watchlist_quotes_cache(cache: Dict[str, Any], filepath: str = WATCHLIST_QUOTES_JSON) -> bool:
     """Saves cached quotes for watchlist stocks to disk JSON."""
     try:
-        with open(filepath, "w", encoding="utf-8") as f:
+        with atomic_write(filepath, mode="w", encoding="utf-8") as f:
             json.dump(cache, f, indent=2, ensure_ascii=False)
         return True
     except Exception as e:
@@ -1427,6 +2027,11 @@ def repair_data_integrity(
             else:
                 fixes.append(f"Deduplicated watchlist symbol '{sym}'.")
         save_watchlist(list(unique_watch.values()), filepath=watchlist_filepath)
+
+    # 3. Reconcile Holdings with Transaction History
+    rec_res = reconcile_portfolio_holdings_with_transactions(portfolio_filepath=portfolio_filepath)
+    if rec_res.get("reconciled"):
+        fixes.extend(rec_res["reconciled"])
 
     return {
         "success": True,
@@ -1797,3 +2402,432 @@ def book_drip_transaction(
         save_portfolio(all_holdings, portfolio_filepath)
 
     return True, f"Successfully booked {new_shares:.4f} DRIP shares for {symbol}.", round(new_shares, 4)
+
+
+def export_portfolio_to_json(
+    output_filepath: str,
+    portfolio_filepath: str = PORTFOLIO_CSV,
+    transaction_filepath: str = TRANSACTION_HISTORY_CSV,
+    watchlist_filepath: str = WATCHLIST_CSV,
+) -> bool:
+    """
+    Exports full portfolio state as JSON for backup/cross-device sync.
+    Includes holdings, transactions, and watchlist data.
+    """
+    try:
+        holdings = load_portfolio(portfolio_filepath)
+        transactions = load_transactions(transaction_filepath)
+        watchlist = load_watchlist(watchlist_filepath)
+
+        payload = {
+            "version": "1.0",
+            "exported_at": datetime.now().isoformat(),
+            "holdings": holdings,
+            "transactions": transactions,
+            "watchlist": watchlist,
+        }
+
+        out_dir = os.path.dirname(os.path.abspath(output_filepath))
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+
+        with atomic_write(output_filepath, mode="w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, default=str)
+
+        return True
+    except Exception as e:
+        print(f"Error exporting portfolio to JSON ({output_filepath}): {e}")
+        return False
+
+
+def import_portfolio_from_json(
+    input_filepath: str,
+    portfolio_filepath: str = PORTFOLIO_CSV,
+    transaction_filepath: str = TRANSACTION_HISTORY_CSV,
+    watchlist_filepath: str = WATCHLIST_CSV,
+    merge: bool = False,
+) -> Dict[str, Any]:
+    """
+    Imports portfolio holdings, transactions, and watchlist from a JSON export file.
+    If merge=False, replaces existing data entirely after creating backups.
+    If merge=True, merges holdings using add_holding logic, appends transactions,
+    and merges watchlist items while skipping duplicates.
+    """
+    result: Dict[str, Any] = {
+        "success": False,
+        "holdings_imported": 0,
+        "transactions_imported": 0,
+        "watchlist_imported": 0,
+        "errors": [],
+    }
+
+    if not os.path.exists(input_filepath):
+        result["errors"].append(f"Input file not found: {input_filepath}")
+        return result
+
+    try:
+        with open(input_filepath, mode="r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        result["errors"].append(f"Failed to read or parse JSON file: {e}")
+        return result
+
+    if not isinstance(data, dict):
+        result["errors"].append("Invalid JSON format: root element must be an object.")
+        return result
+
+    if "version" not in data:
+        result["errors"].append("Missing required 'version' field in JSON.")
+        return result
+
+    has_holdings = "holdings" in data and isinstance(data["holdings"], list)
+    has_transactions = "transactions" in data and isinstance(data["transactions"], list)
+    has_watchlist = "watchlist" in data and isinstance(data["watchlist"], list)
+
+    if not (has_holdings or has_transactions or has_watchlist):
+        result["errors"].append("JSON data must contain at least one list among: 'holdings', 'transactions', 'watchlist'.")
+        return result
+
+    try:
+        # Pre-backup if replacing
+        if not merge:
+            if has_holdings:
+                rotate_file_backups(portfolio_filepath)
+            if has_transactions:
+                rotate_file_backups(transaction_filepath)
+            if has_watchlist:
+                rotate_file_backups(watchlist_filepath)
+
+        # 1. Process holdings
+        if has_holdings:
+            valid_holdings: List[Dict[str, Any]] = []
+            for idx, h in enumerate(data["holdings"]):
+                if not isinstance(h, dict):
+                    result["errors"].append(f"Holding at index {idx} must be a dictionary.")
+                    continue
+                is_valid, errs = validate_holding_data(h)
+                if not is_valid:
+                    sym = h.get("symbol") or h.get("Symbol") or f"index {idx}"
+                    result["errors"].extend([f"Holding {sym}: {err}" for err in errs])
+                    continue
+
+                norm_h = dict(h)
+                if "symbol" not in norm_h and "Symbol" in norm_h:
+                    norm_h["symbol"] = norm_h["Symbol"]
+                if "shares" not in norm_h and "Shares" in norm_h:
+                    norm_h["shares"] = norm_h["Shares"]
+                if "buy_price" not in norm_h:
+                    norm_h["buy_price"] = norm_h.get("Buy Price", norm_h.get("buyPrice", 0.0))
+                if "currency" not in norm_h and "Currency" in norm_h:
+                    norm_h["currency"] = norm_h["Currency"]
+                if "portfolio" not in norm_h and "Portfolio" in norm_h:
+                    norm_h["portfolio"] = norm_h["Portfolio"]
+                valid_holdings.append(norm_h)
+
+            if not merge:
+                if save_portfolio(valid_holdings, filepath=portfolio_filepath):
+                    result["holdings_imported"] = len(valid_holdings)
+                else:
+                    result["errors"].append(f"Failed to save portfolio to {portfolio_filepath}.")
+            else:
+                for h in valid_holdings:
+                    ok = add_holding(h, filepath=portfolio_filepath)
+                    if ok:
+                        result["holdings_imported"] += 1
+                    else:
+                        sym = h.get("symbol", "unknown")
+                        result["errors"].append(f"Failed to merge holding {sym} into portfolio.")
+
+        # 2. Process transactions
+        if has_transactions:
+            valid_txs: List[Dict[str, Any]] = []
+            for idx, tx in enumerate(data["transactions"]):
+                if not isinstance(tx, dict):
+                    result["errors"].append(f"Transaction at index {idx} must be a dictionary.")
+                    continue
+                is_valid, errs = validate_transaction_data(tx)
+                if not is_valid:
+                    sym = tx.get("symbol") or tx.get("Symbol") or f"index {idx}"
+                    result["errors"].extend([f"Transaction {sym}: {err}" for err in errs])
+                    continue
+
+                norm_tx = dict(tx)
+                if "symbol" not in norm_tx and "Symbol" in norm_tx:
+                    norm_tx["symbol"] = norm_tx["Symbol"]
+                if "type" not in norm_tx and "Type" in norm_tx:
+                    norm_tx["type"] = norm_tx["Type"]
+                if "shares" not in norm_tx and "Shares" in norm_tx:
+                    norm_tx["shares"] = norm_tx["Shares"]
+                if "price" not in norm_tx:
+                    norm_tx["price"] = norm_tx.get("Price ($)", norm_tx.get("Price", 0.0))
+                if "portfolio" not in norm_tx and "Portfolio" in norm_tx:
+                    norm_tx["portfolio"] = norm_tx["Portfolio"]
+                if "currency" not in norm_tx and "Currency" in norm_tx:
+                    norm_tx["currency"] = norm_tx["Currency"]
+                if "date" not in norm_tx and "Date" in norm_tx:
+                    norm_tx["date"] = norm_tx["Date"]
+                valid_txs.append(norm_tx)
+
+            if not merge:
+                if save_transactions(valid_txs, filepath=transaction_filepath):
+                    result["transactions_imported"] = len(valid_txs)
+                else:
+                    result["errors"].append(f"Failed to save transactions to {transaction_filepath}.")
+            else:
+                existing_txs = load_transactions(transaction_filepath)
+                combined_txs = existing_txs + valid_txs
+                if save_transactions(combined_txs, filepath=transaction_filepath):
+                    result["transactions_imported"] = len(valid_txs)
+                else:
+                    result["errors"].append(f"Failed to append transactions to {transaction_filepath}.")
+
+        # 3. Process watchlist
+        if has_watchlist:
+            valid_wl: List[Dict[str, Any]] = []
+            for idx, w in enumerate(data["watchlist"]):
+                if not isinstance(w, dict):
+                    result["errors"].append(f"Watchlist item at index {idx} must be a dictionary.")
+                    continue
+                sym = str(w.get("symbol") or w.get("Symbol") or "").strip().upper()
+                if not sym:
+                    result["errors"].append(f"Watchlist item at index {idx} has missing or empty symbol.")
+                    continue
+                norm_w = dict(w)
+                norm_w["symbol"] = sym
+                valid_wl.append(norm_w)
+
+            if not merge:
+                deduped_wl: List[Dict[str, Any]] = []
+                seen_syms = set()
+                for w in valid_wl:
+                    s = w["symbol"]
+                    if s not in seen_syms:
+                        deduped_wl.append(w)
+                        seen_syms.add(s)
+                if save_watchlist(deduped_wl, filepath=watchlist_filepath):
+                    result["watchlist_imported"] = len(deduped_wl)
+                else:
+                    result["errors"].append(f"Failed to save watchlist to {watchlist_filepath}.")
+            else:
+                existing_wl = load_watchlist(watchlist_filepath)
+                existing_symbols = {str(item.get("symbol", "")).strip().upper() for item in existing_wl}
+                count_imported = 0
+                for w in valid_wl:
+                    s = w["symbol"]
+                    if s not in existing_symbols:
+                        existing_wl.append(w)
+                        existing_symbols.add(s)
+                        count_imported += 1
+                if save_watchlist(existing_wl, filepath=watchlist_filepath):
+                    result["watchlist_imported"] = count_imported
+                else:
+                    result["errors"].append(f"Failed to save merged watchlist to {watchlist_filepath}.")
+
+        result["success"] = len(result["errors"]) == 0
+        return result
+
+    except Exception as e:
+        result["errors"].append(f"Unexpected error during import: {e}")
+        result["success"] = False
+        return result
+
+
+def get_portfolio_summary_stats(
+    portfolio_filepath: str = PORTFOLIO_CSV,
+) -> Dict[str, Any]:
+    """
+    Returns aggregate portfolio statistics including total counts,
+    breakdown by currency, sums of cost basis, market value, unrealized gain,
+    annual dividend, top 5 holdings by market value, and sector breakdown.
+    """
+    holdings = load_portfolio(portfolio_filepath)
+
+    total_holdings = len(holdings)
+    distinct_portfolios = {
+        str(h.get("portfolio", "")).strip() or DEFAULT_PORTFOLIO_NAME
+        for h in holdings
+    }
+    total_portfolios = len(distinct_portfolios) if holdings else 0
+
+    by_currency: Dict[str, Dict[str, Any]] = {}
+    total_cost_basis = 0.0
+    total_market_value = 0.0
+    total_unrealized_gain = 0.0
+    total_annual_dividend = 0.0
+    sector_breakdown: Dict[str, int] = {}
+
+    for h in holdings:
+        curr = str(h.get("currency", "USD")).strip().upper() or "USD"
+        cb = float(h.get("cost_basis", 0.0) or 0.0)
+        mv = float(h.get("market_value", 0.0) or 0.0)
+        ug = float(h.get("unrealized_gain", 0.0) or 0.0)
+        ad = float(h.get("annual_dividend", 0.0) or 0.0)
+
+        total_cost_basis += cb
+        total_market_value += mv
+        total_unrealized_gain += ug
+        total_annual_dividend += ad
+
+        if curr not in by_currency:
+            by_currency[curr] = {
+                "count": 0,
+                "total_cost_basis": 0.0,
+                "total_market_value": 0.0,
+                "total_unrealized_gain": 0.0,
+                "total_annual_dividend": 0.0,
+            }
+        by_currency[curr]["count"] += 1
+        by_currency[curr]["total_cost_basis"] += cb
+        by_currency[curr]["total_market_value"] += mv
+        by_currency[curr]["total_unrealized_gain"] += ug
+        by_currency[curr]["total_annual_dividend"] += ad
+
+        sec = str(h.get("sector") or "").strip()
+        if sec:
+            sector_breakdown[sec] = sector_breakdown.get(sec, 0) + 1
+
+    # Round currency totals
+    for stats in by_currency.values():
+        stats["total_cost_basis"] = round(stats["total_cost_basis"], 2)
+        stats["total_market_value"] = round(stats["total_market_value"], 2)
+        stats["total_unrealized_gain"] = round(stats["total_unrealized_gain"], 2)
+        stats["total_annual_dividend"] = round(stats["total_annual_dividend"], 2)
+
+    total_cost_basis = round(total_cost_basis, 2)
+    total_market_value = round(total_market_value, 2)
+    total_unrealized_gain = round(total_unrealized_gain, 2)
+    total_annual_dividend = round(total_annual_dividend, 2)
+
+    # Top 5 holdings by market value
+    sorted_holdings = sorted(
+        holdings,
+        key=lambda x: float(x.get("market_value", 0.0) or 0.0),
+        reverse=True,
+    )
+    top_holdings: List[Dict[str, Any]] = []
+    for h in sorted_holdings[:5]:
+        mv = round(float(h.get("market_value", 0.0) or 0.0), 2)
+        weight_pct = round((mv / total_market_value * 100.0), 2) if total_market_value > 0 else 0.0
+        top_holdings.append({
+            "symbol": str(h.get("symbol", "")).strip().upper(),
+            "portfolio": str(h.get("portfolio", "")).strip() or DEFAULT_PORTFOLIO_NAME,
+            "market_value": mv,
+            "weight_pct": weight_pct,
+        })
+
+    return {
+        "total_holdings": total_holdings,
+        "total_portfolios": total_portfolios,
+        "by_currency": by_currency,
+        "total_cost_basis": total_cost_basis,
+        "total_market_value": total_market_value,
+        "total_unrealized_gain": total_unrealized_gain,
+        "total_annual_dividend": total_annual_dividend,
+        "top_holdings": top_holdings,
+        "sector_breakdown": sector_breakdown,
+    }
+
+
+def validate_holding_data(data: Dict[str, Any]) -> Tuple[bool, List[str]]:
+    """
+    Validates holding data before save:
+    - Symbol must be non-empty string
+    - Shares must be > 0
+    - Buy price must be >= 0
+    - Currency must be valid 3-letter code
+    Returns (is_valid, list_of_error_messages).
+    """
+    errors: List[str] = []
+    if not isinstance(data, dict):
+        return False, ["Holding data must be a dictionary."]
+
+    sym = data.get("symbol") if "symbol" in data else data.get("Symbol")
+    if not isinstance(sym, str) or not sym.strip():
+        errors.append("Holding symbol must be a non-empty string.")
+
+    shares_val = data.get("shares") if "shares" in data else data.get("Shares")
+    if shares_val is None or isinstance(shares_val, bool):
+        errors.append("Holding shares must be greater than 0.")
+    else:
+        try:
+            shares = float(shares_val)
+            if shares <= 0:
+                errors.append("Holding shares must be greater than 0.")
+        except (ValueError, TypeError):
+            errors.append("Holding shares must be a valid number greater than 0.")
+
+    buy_price_val = (
+        data.get("buy_price")
+        if "buy_price" in data
+        else data.get("Buy Price", data.get("buyPrice"))
+    )
+    if buy_price_val is None or isinstance(buy_price_val, bool):
+        errors.append("Holding buy price must be greater than or equal to 0.")
+    else:
+        try:
+            bp = float(buy_price_val)
+            if bp < 0:
+                errors.append("Holding buy price must be greater than or equal to 0.")
+        except (ValueError, TypeError):
+            errors.append("Holding buy price must be a valid number greater than or equal to 0.")
+
+    currency_val = data.get("currency") if "currency" in data else data.get("Currency")
+    if (
+        not isinstance(currency_val, str)
+        or len(currency_val.strip()) != 3
+        or not currency_val.strip().isalpha()
+    ):
+        errors.append("Holding currency must be a valid 3-letter code.")
+
+    return len(errors) == 0, errors
+
+
+def validate_transaction_data(data: Dict[str, Any]) -> Tuple[bool, List[str]]:
+    """
+    Validates transaction data:
+    - Symbol must be non-empty
+    - Type must be one of: BUY, SELL, DRIP, DIVIDEND
+    - Shares must be > 0
+    - Price must be >= 0
+    Returns (is_valid, list_of_error_messages).
+    """
+    errors: List[str] = []
+    if not isinstance(data, dict):
+        return False, ["Transaction data must be a dictionary."]
+
+    sym = data.get("symbol") if "symbol" in data else data.get("Symbol")
+    if not sym or not str(sym).strip():
+        errors.append("Transaction symbol must be non-empty.")
+
+    tx_type = data.get("type") if "type" in data else data.get("Type")
+    valid_types = {"BUY", "SELL", "DRIP", "DIVIDEND"}
+    if not isinstance(tx_type, str) or tx_type.strip().upper() not in valid_types:
+        errors.append(f"Transaction type must be one of: BUY, SELL, DRIP, DIVIDEND. Got '{tx_type}'.")
+
+    shares_val = data.get("shares") if "shares" in data else data.get("Shares")
+    if shares_val is None or isinstance(shares_val, bool):
+        errors.append("Transaction shares must be greater than 0.")
+    else:
+        try:
+            shares = float(shares_val)
+            if shares <= 0:
+                errors.append("Transaction shares must be greater than 0.")
+        except (ValueError, TypeError):
+            errors.append("Transaction shares must be a valid number greater than 0.")
+
+    price_val = (
+        data.get("price")
+        if "price" in data
+        else data.get("Price ($)", data.get("Price"))
+    )
+    if price_val is None or isinstance(price_val, bool):
+        errors.append("Transaction price must be greater than or equal to 0.")
+    else:
+        try:
+            p = float(price_val)
+            if p < 0:
+                errors.append("Transaction price must be greater than or equal to 0.")
+        except (ValueError, TypeError):
+            errors.append("Transaction price must be a valid number greater than or equal to 0.")
+
+    return len(errors) == 0, errors

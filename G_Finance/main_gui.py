@@ -7,6 +7,18 @@ division/split, and selling calculations, and saving data in CSV.
 
 import os
 import sys
+
+# Fast-path for iOS Pythonista 3:
+# Instantly launch pure native UIKit interface before loading desktop Tkinter or Matplotlib
+try:
+    import ui
+    if hasattr(ui, "View"):
+        import pythonista_native_ui
+        pythonista_native_ui.main()
+        sys.exit(0)
+except ImportError:
+    pass
+
 import re
 import time
 import threading
@@ -14,8 +26,17 @@ import queue
 import concurrent.futures
 from datetime import datetime, date, timedelta
 from typing import Dict, Any, List, Optional
-import tkinter as tk
-from tkinter import ttk, messagebox, filedialog
+try:
+    import tkinter as tk
+    from tkinter import ttk, messagebox, filedialog, simpledialog
+    TKINTER_AVAILABLE = True
+except (ImportError, ModuleNotFoundError):
+    tk = None
+    ttk = None
+    messagebox = None
+    filedialog = None
+    simpledialog = None
+    TKINTER_AVAILABLE = False
 
 import webbrowser
 from google_finance_fetcher import GoogleFinanceFetcher
@@ -23,6 +44,11 @@ from google_account_sync import (
     GoogleAccountSync,
     load_sync_config,
     save_sync_config,
+)
+from google_sheet_sync import (
+    GoogleSheetSync,
+    get_google_sheet_sync,
+    get_google_apps_script_template,
 )
 from financial_calc import (
     calc_holding_summary,
@@ -89,6 +115,9 @@ from csv_manager import (
     DEFAULT_PORTFOLIO_NAME,
     save_portfolio,
     load_portfolio,
+    add_holding,
+    update_holding,
+    delete_holding,
     get_portfolio_names,
     add_portfolio,
     delete_portfolio,
@@ -101,6 +130,8 @@ from csv_manager import (
     append_transaction,
     update_transaction,
     delete_transaction,
+    sync_transaction_change_to_portfolio,
+    reconcile_portfolio_holdings_with_transactions,
     ensure_workspace_files,
     get_backup_files,
     restore_backup,
@@ -130,7 +161,6 @@ from fee_manager import (
     calc_estimated_commission,
     log_storage_fee_transaction,
 )
-from tkinter import simpledialog
 from i18n import (
     t,
     get_current_language,
@@ -297,6 +327,10 @@ class ModernPortfolioApp:
         self.summary_currency: str = "USD"
 
         # Multi-portfolio support
+        try:
+            reconcile_portfolio_holdings_with_transactions(PORTFOLIO_CSV, TRANSACTION_HISTORY_CSV)
+        except Exception:
+            pass
         self.all_holdings: List[Dict[str, Any]] = load_portfolio(PORTFOLIO_CSV, portfolio_name=None)
         self.portfolio_names: List[str] = get_portfolio_names(PORTFOLIO_CSV)
         self.current_portfolio: str = "All Portfolios (Consolidated)"
@@ -307,6 +341,7 @@ class ModernPortfolioApp:
         self.sales_history: List[Dict[str, Any]] = self.transactions
         self.fetcher = GoogleFinanceFetcher()
         self.account_sync = GoogleAccountSync()
+        self.sheet_sync = get_google_sheet_sync()
 
         # Threading and auto-update
         self.is_running: bool = True
@@ -374,6 +409,7 @@ class ModernPortfolioApp:
             self._set_status(f"🔄 {t('msg_cached_data_notice')}")
             self.root.after(300, self.fetch_all_quotes)
         self._schedule_auto_refresh()
+        self.root.after(800, self._check_startup_sheet_sync)
 
     def _setup_style(self):
         self.style = ttk.Style()
@@ -578,6 +614,23 @@ class ModernPortfolioApp:
         # Action and control buttons on right
         ctrl_box = ttk.Frame(top_frame)
         ctrl_box.pack(side=tk.RIGHT)
+
+        # 0. Google Sheet Cloud Sync button
+        self.btn_sheet_sync = tk.Button(
+            ctrl_box,
+            text="☁️ " + t("btn_google_sheet_sync"),
+            font=("Segoe UI", 9, "bold"),
+            bg="#34a853",
+            fg="#ffffff",
+            activebackground="#2d8e47",
+            relief="flat",
+            padx=10,
+            pady=3,
+            cursor="hand2",
+            command=self._on_click_google_sheet_sync,
+        )
+        self.btn_sheet_sync.pack(side=tk.LEFT, padx=(0, 6))
+        attach_tooltip(self.btn_sheet_sync, "tip_google_sheet_sync")
 
         # 1. Google Account Sync button
         self.btn_sync = tk.Button(
@@ -914,6 +967,8 @@ class ModernPortfolioApp:
             self.lbl_title.config(text=t("app_header"))
         if hasattr(self, "lbl_engine_badge"):
             self.lbl_engine_badge.config(text=t("badge_safe_engine"))
+        if hasattr(self, "btn_sheet_sync"):
+            self.btn_sheet_sync.config(text="☁️ " + t("btn_google_sheet_sync"))
         if hasattr(self, "btn_sync"):
             self.btn_sync.config(text=t("btn_google_sync"))
         if hasattr(self, "btn_add"):
@@ -4471,7 +4526,7 @@ class ModernPortfolioApp:
 
             c = (h.get("currency") or "USD").strip().upper()
             shares = float(h.get("shares", 0.0) or 0.0)
-            price = float(h.get("current_price", h.get("price", 0.0)) or 0.0)
+            price = float(h.get("current_price") or h.get("buy_price", 0.0) or 0.0)
             mv = shares * price
             if mv <= 0.0 and h.get("market_value") is not None:
                 try:
@@ -6514,7 +6569,7 @@ class ModernPortfolioApp:
         if tot_p <= 0.0:
             for h in self.holdings:
                 c = (h.get("currency") or "USD").strip().upper()
-                mv = float(h.get("shares", 0.0)) * float(h.get("current_price", h.get("price", 0.0)))
+                mv = float(h.get("shares", 0.0)) * float(h.get("current_price") or h.get("buy_price", 0.0) or 0.0)
                 tot_p += self.converter.convert(mv, c, self.summary_currency)
 
         cur_div = float(res.get("current_annual_dividend", getattr(self, "_last_annual_dividend", 0.0)))
@@ -7623,7 +7678,20 @@ class ModernPortfolioApp:
             pady=1,
             command=self._quick_log_storage_fee,
         )
-        self.btn_tx_storage_fee.pack(side=tk.LEFT, padx=(0, 8))
+        self.btn_tx_storage_fee.pack(side=tk.LEFT, padx=(0, 6))
+
+        self.btn_reconcile = tk.Button(
+            filter_bar,
+            text="🔄 " + t("btn_reconcile_holdings"),
+            font=("Segoe UI", 8),
+            bg="#ffffff",
+            relief="solid",
+            bd=1,
+            padx=8,
+            pady=1,
+            command=self._reconcile_holdings_with_history,
+        )
+        self.btn_reconcile.pack(side=tk.LEFT, padx=(0, 8))
 
         self.lbl_hist_filter = tk.Label(
             filter_bar,
@@ -8412,6 +8480,377 @@ class ModernPortfolioApp:
             pass
 
     # -------------------------------------------------------------
+    # Google Sheet Cloud Sync & Conflict Resolution
+    # -------------------------------------------------------------
+    def _check_startup_sheet_sync(self):
+        """Runs non-blocking startup check against Google Sheet if configured."""
+        if not hasattr(self, "sheet_sync") or not self.sheet_sync.is_configured():
+            return
+
+        def _worker():
+            try:
+                res = self.sheet_sync.perform_sync()
+                status = res.get("status")
+                if status == "conflict":
+                    diff = res.get("diff_report", {})
+                    self.root.after(0, lambda: self._show_sheet_conflict_dialog(diff))
+                elif status == "success" and res.get("direction") == "download":
+                    self.root.after(0, lambda: self._reload_after_cloud_sync("Downloaded latest changes from Google Sheet."))
+            except Exception as e:
+                print(f"Startup sheet sync note: {e}")
+
+        t_sync = threading.Thread(target=_worker, daemon=True)
+        t_sync.start()
+
+    def _on_click_google_sheet_sync(self):
+        """Manual sync button clicked in desktop GUI."""
+        if not hasattr(self, "sheet_sync") or not self.sheet_sync.is_configured():
+            self._open_google_sheet_setup_dialog()
+            return
+
+        self._set_status("☁️ Syncing with Google Sheet...")
+
+        def _worker():
+            try:
+                res = self.sheet_sync.perform_sync()
+                status = res.get("status")
+                if status == "conflict":
+                    diff = res.get("diff_report", {})
+                    self.root.after(0, lambda: self._show_sheet_conflict_dialog(diff))
+                elif status == "success":
+                    msg = res.get("message", "Synced successfully with Google Sheet.")
+                    self.root.after(0, lambda: self._reload_after_cloud_sync(msg))
+                    self.root.after(0, lambda: messagebox.showinfo("Google Sheet Sync", msg, parent=self.root))
+                elif status == "up_to_date":
+                    msg = res.get("message", "Local data and Google Sheet are already in sync.")
+                    self.root.after(0, lambda: self._set_status("✅ Google Sheet up-to-date"))
+                    self.root.after(0, lambda: messagebox.showinfo("Google Sheet Sync", msg, parent=self.root))
+                elif status == "offline":
+                    msg = res.get("message", "Could not reach Google Sheet (Offline).")
+                    self.root.after(0, lambda: self._set_status("⚠️ Google Sheet Offline"))
+                    self.root.after(0, lambda: messagebox.showwarning("Google Sheet Sync", msg, parent=self.root))
+                else:
+                    msg = res.get("message", "Sync failed.")
+                    self.root.after(0, lambda: messagebox.showerror("Google Sheet Sync", msg, parent=self.root))
+            except Exception as e:
+                self.root.after(0, lambda: messagebox.showerror("Google Sheet Sync", f"Error: {e}", parent=self.root))
+
+        t_sync = threading.Thread(target=_worker, daemon=True)
+        t_sync.start()
+
+    def _reload_after_cloud_sync(self, status_msg: str = ""):
+        """Reloads holdings, portfolios, and updates UI after cloud sync."""
+        sel = self.current_portfolio
+        self.all_holdings = load_portfolio(PORTFOLIO_CSV, portfolio_name=None)
+        self.portfolio_names = get_portfolio_names(PORTFOLIO_CSV)
+        self.transactions = load_transactions(TRANSACTION_HISTORY_CSV, portfolio_name=None)
+        self.sales_history = self.transactions
+        self._on_portfolio_selected()
+        if status_msg:
+            self._set_status(f"☁️ {status_msg}")
+
+    def _open_google_sheet_setup_dialog(self):
+        """Settings and setup modal for Google Sheet Web App synchronization."""
+        dlg = tk.Toplevel(self.root)
+        dlg.title(f"☁️ {t('dlg_sheet_sync_title')}")
+        dlg.geometry("680x560")
+        dlg.minsize(620, 500)
+        dlg.transient(self.root)
+        dlg.configure(bg=self.bg_main)
+
+        # Header
+        hdr_frame = ttk.Frame(dlg, padding=(16, 12, 16, 8))
+        hdr_frame.pack(fill=tk.X)
+        tk.Label(
+            hdr_frame,
+            text=f"☁️ {t('dlg_sheet_sync_title')}",
+            font=("Segoe UI", 12, "bold"),
+            fg=self.primary_color,
+        ).pack(anchor="w")
+        tk.Label(
+            hdr_frame,
+            text="Sync your portfolio, watchlist, and transactions seamlessly across all your devices using Google Sheets as cloud storage.",
+            font=("Segoe UI", 9),
+            fg=self.text_muted,
+            wraplength=620,
+            justify="left",
+        ).pack(anchor="w", pady=(2, 6))
+
+        # Main notebook
+        nb = ttk.Notebook(dlg)
+        nb.pack(fill=tk.BOTH, expand=True, padx=16, pady=(0, 12))
+
+        # Tab 1: Connection & Status
+        tab_conn = ttk.Frame(nb, padding=14)
+        nb.add(tab_conn, text="⚙️ Connection & Status")
+
+        # Web App URL
+        tk.Label(tab_conn, text="Google Sheet Web App URL:", font=("Segoe UI", 9, "bold")).pack(anchor="w")
+        url_entry = tk.Entry(tab_conn, font=("Segoe UI", 9), bd=1, relief="solid")
+        url_entry.insert(0, self.sheet_sync.get_web_app_url())
+        url_entry.pack(fill=tk.X, pady=(2, 10))
+
+        # Status row
+        status_box = tk.LabelFrame(tab_conn, text="Cloud Sync Status", font=("Segoe UI", 8, "bold"), padx=10, pady=8)
+        status_box.pack(fill=tk.X, pady=(0, 12))
+
+        cfg = self.sheet_sync.config
+        lbl_status = tk.Label(status_box, text=f"Status: {cfg.get('last_sync_status', 'Unknown').upper()}", font=("Segoe UI", 9, "bold"), fg=self.green_color if cfg.get('last_sync_status') == 'success' else self.primary_color)
+        lbl_status.pack(anchor="w")
+        lbl_time = tk.Label(status_box, text=f"Last Sync: {cfg.get('last_sync_time') or 'Never'}", font=("Segoe UI", 8), fg=self.text_muted)
+        lbl_time.pack(anchor="w")
+        lbl_dev = tk.Label(status_box, text=f"Device: {cfg.get('device_name', '')} ({cfg.get('device_id', '')[:12]}...)", font=("Segoe UI", 8), fg=self.text_muted)
+        lbl_dev.pack(anchor="w")
+        lbl_result = tk.Label(status_box, text="", font=("Segoe UI", 8, "bold"), wraplength=580)
+        lbl_result.pack(anchor="w", pady=(4, 0))
+
+        def test_conn():
+            url = url_entry.get().strip()
+            lbl_result.config(text="Testing connection...", fg=self.primary_color)
+            dlg.update()
+            ok, msg, details = self.sheet_sync.test_connection(url)
+            color = self.green_color if ok else self.red_color
+            lbl_result.config(text=msg, fg=color)
+
+        def save_and_sync():
+            url = url_entry.get().strip()
+            if not url:
+                messagebox.showwarning("Warning", "Please enter a valid Google Apps Script Web App URL.", parent=dlg)
+                return
+            self.sheet_sync.set_web_app_url(url)
+            lbl_result.config(text="Connecting and syncing...", fg=self.primary_color)
+            dlg.update()
+            res = self.sheet_sync.perform_sync()
+            status = res.get("status")
+            if status == "conflict":
+                dlg.destroy()
+                self._show_sheet_conflict_dialog(res.get("diff_report", {}))
+            elif status == "success":
+                lbl_result.config(text="✅ " + res.get("message", "Synced!"), fg=self.green_color)
+                self._reload_after_cloud_sync()
+                messagebox.showinfo("Success", res.get("message", "Synced successfully!"), parent=dlg)
+            elif status == "up_to_date":
+                lbl_result.config(text="✅ Up to date!", fg=self.green_color)
+                messagebox.showinfo("Success", res.get("message", "Already up to date."), parent=dlg)
+            else:
+                lbl_result.config(text="⚠️ " + res.get("message", "Failed"), fg=self.red_color)
+
+        btn_row = ttk.Frame(tab_conn)
+        btn_row.pack(anchor="w", pady=(4, 0))
+        tk.Button(
+            btn_row,
+            text=f"🔌 {t('btn_test_connection')}",
+            font=("Segoe UI", 9, "bold"),
+            bg="#ffffff",
+            relief="solid",
+            bd=1,
+            padx=10,
+            pady=4,
+            command=test_conn,
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        tk.Button(
+            btn_row,
+            text="💾 Save & Sync Now",
+            font=("Segoe UI", 9, "bold"),
+            bg=self.primary_color,
+            fg="#ffffff",
+            relief="flat",
+            padx=12,
+            pady=4,
+            command=save_and_sync,
+        ).pack(side=tk.LEFT, padx=(0, 8))
+
+        # Tab 2: Apps Script Code & Setup Guide
+        tab_script = ttk.Frame(nb, padding=14)
+        nb.add(tab_script, text="📋 Google Apps Script Setup")
+
+        guide_txt = (
+            "How to set up your Google Sheet in 30 seconds:\n"
+            "1. Create a Google Sheet at sheets.new\n"
+            "2. Click Extensions -> Apps Script\n"
+            "3. Paste the code below and click Deploy -> New deployment -> Web app\n"
+            "4. Execute as: 'Me', Who has access: 'Anyone'\n"
+            "5. Copy the generated Web App URL and paste it in the Connection tab above!"
+        )
+        tk.Label(tab_script, text=guide_txt, font=("Segoe UI", 8), justify="left", fg=self.text_muted).pack(anchor="w", pady=(0, 6))
+
+        code_box = tk.Text(tab_script, height=12, font=("Courier", 8), bd=1, relief="solid")
+        code_box.insert("1.0", get_google_apps_script_template())
+        code_box.configure(state="disabled")
+        code_box.pack(fill=tk.BOTH, expand=True, pady=(0, 8))
+
+        def copy_script():
+            self.root.clipboard_clear()
+            self.root.clipboard_append(get_google_apps_script_template())
+            messagebox.showinfo("Copied", "Google Apps Script code copied to clipboard!", parent=dlg)
+
+        tk.Button(
+            tab_script,
+            text=f"📋 {t('btn_copy_script')}",
+            font=("Segoe UI", 9, "bold"),
+            bg="#ffffff",
+            relief="solid",
+            bd=1,
+            padx=10,
+            pady=4,
+            command=copy_script,
+        ).pack(anchor="w")
+
+        dlg.bind("<Escape>", lambda e: dlg.destroy())
+        dlg.update_idletasks()
+        try:
+            rw, rh = self.root.winfo_width(), self.root.winfo_height()
+            rx, ry = self.root.winfo_rootx(), self.root.winfo_rooty()
+            dw, dh = 680, 560
+            dlg.geometry(f"{dw}x{dh}+{max(0, rx + (rw - dw) // 2)}+{max(0, ry + (rh - dh) // 2)}")
+        except Exception:
+            pass
+        dlg.grab_set()
+
+    def _show_sheet_conflict_dialog(self, diff_report: Dict[str, Any]):
+        """Visual modal dialog for resolving cloud sync conflicts with detailed diff."""
+        dlg = tk.Toplevel(self.root)
+        dlg.title(f"⚠️ {t('dlg_conflict_title')}")
+        dlg.geometry("820x600")
+        dlg.minsize(720, 520)
+        dlg.transient(self.root)
+        dlg.configure(bg=self.bg_main)
+
+        # Header banner
+        hdr = ttk.Frame(dlg, padding=(16, 12, 16, 6))
+        hdr.pack(fill=tk.X)
+        tk.Label(
+            hdr,
+            text=f"⚠️ {t('dlg_conflict_title')}",
+            font=("Segoe UI", 12, "bold"),
+            fg="#d93025",
+        ).pack(anchor="w")
+        tk.Label(
+            hdr,
+            text="Differences were detected between this device and Google Sheet. Please review the items below and select which version you want to keep.",
+            font=("Segoe UI", 9),
+            fg=self.text_muted,
+            wraplength=760,
+            justify="left",
+        ).pack(anchor="w", pady=(2, 6))
+
+        # Treeview diff table
+        tree_frame = ttk.Frame(dlg, padding=(16, 0, 16, 8))
+        tree_frame.pack(fill=tk.BOTH, expand=True)
+
+        cols = ("Table", "Item / Key", "Change Type", "Local Device Value", "Google Sheet Value")
+        tree = ttk.Treeview(tree_frame, columns=cols, show="headings", height=12)
+        tree.heading("Table", text="Table")
+        tree.heading("Item / Key", text="Item / Key")
+        tree.heading("Change Type", text="Change Type")
+        tree.heading("Local Device Value", text="Local Device Value")
+        tree.heading("Google Sheet Value", text="Google Sheet Value")
+
+        tree.column("Table", width=95, anchor="center")
+        tree.column("Item / Key", width=140, anchor="w")
+        tree.column("Change Type", width=110, anchor="center")
+        tree.column("Local Device Value", width=200, anchor="w")
+        tree.column("Google Sheet Value", width=200, anchor="w")
+
+        tree.tag_configure("MODIFIED", background="#fff3cd")
+        tree.tag_configure("LOCAL_ONLY", background="#d1e7dd")
+        tree.tag_configure("REMOTE_ONLY", background="#cff4fc")
+
+        for d in diff_report.get("differences", []):
+            tree.insert(
+                "",
+                tk.END,
+                values=(
+                    d.get("tab", ""),
+                    d.get("key", ""),
+                    d.get("type", ""),
+                    d.get("local_val", ""),
+                    d.get("remote_val", ""),
+                ),
+                tags=(d.get("type", ""),),
+            )
+
+        sb = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=tree.yview)
+        tree.configure(yscrollcommand=sb.set)
+        tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # Resolution Action Buttons
+        btn_box = ttk.Frame(dlg, padding=(16, 8, 16, 16))
+        btn_box.pack(fill=tk.X)
+
+        def resolve(choice: str):
+            res = self.sheet_sync.perform_sync(force_direction=choice)
+            dlg.destroy()
+            if choice in ("keep_remote", "merge"):
+                self._reload_after_cloud_sync(res.get("message", "Resolved!"))
+            messagebox.showinfo("Conflict Resolved", res.get("message", "Conflict resolved successfully."), parent=self.root)
+
+        tk.Label(btn_box, text="Choose resolution action:", font=("Segoe UI", 9, "bold")).pack(anchor="w", pady=(0, 6))
+
+        action_row = ttk.Frame(btn_box)
+        action_row.pack(fill=tk.X)
+
+        tk.Button(
+            action_row,
+            text=f"📱 {t('btn_keep_local')}",
+            font=("Segoe UI", 9, "bold"),
+            bg=self.primary_color,
+            fg="#ffffff",
+            relief="flat",
+            padx=12,
+            pady=6,
+            command=lambda: resolve("keep_local"),
+        ).pack(side=tk.LEFT, padx=(0, 8))
+
+        tk.Button(
+            action_row,
+            text=f"☁️ {t('btn_keep_remote')}",
+            font=("Segoe UI", 9, "bold"),
+            bg="#34a853",
+            fg="#ffffff",
+            relief="flat",
+            padx=12,
+            pady=6,
+            command=lambda: resolve("keep_remote"),
+        ).pack(side=tk.LEFT, padx=(0, 8))
+
+        tk.Button(
+            action_row,
+            text=f"🔀 {t('btn_smart_merge')}",
+            font=("Segoe UI", 9, "bold"),
+            bg="#ffffff",
+            relief="solid",
+            bd=1,
+            padx=10,
+            pady=6,
+            command=lambda: resolve("merge"),
+        ).pack(side=tk.LEFT, padx=(0, 8))
+
+        tk.Button(
+            action_row,
+            text="❌ Cancel",
+            font=("Segoe UI", 9),
+            bg="#ffffff",
+            relief="solid",
+            bd=1,
+            padx=10,
+            pady=6,
+            command=dlg.destroy,
+        ).pack(side=tk.RIGHT)
+
+        dlg.bind("<Escape>", lambda e: dlg.destroy())
+        dlg.update_idletasks()
+        try:
+            rw, rh = self.root.winfo_width(), self.root.winfo_height()
+            rx, ry = self.root.winfo_rootx(), self.root.winfo_rooty()
+            dw, dh = 820, 600
+            dlg.geometry(f"{dw}x{dh}+{max(0, rx + (rw - dw) // 2)}+{max(0, ry + (rh - dh) // 2)}")
+        except Exception:
+            pass
+        dlg.grab_set()
+
+    # -------------------------------------------------------------
     # Enhanced Add Stock / Asset Dialog
     # -------------------------------------------------------------
     def _open_add_dialog(self, initial_symbol="", initial_name="", initial_price=None, initial_currency=None):
@@ -8863,13 +9302,16 @@ class ModernPortfolioApp:
         frame = ttk.Frame(dlg, padding=16)
         frame.pack(fill=tk.BOTH, expand=True)
 
-        tk.Label(
-            frame,
-            text=f"{t('col_symbol')}: {sym} ({holding.get('name', '')})",
-            font=("Segoe UI", 10, "bold"),
-            fg=self.primary_color,
-            bg=self.bg_main,
-        ).pack(anchor="w", pady=(0, 8))
+        # Symbol and Name row
+        sym_row = ttk.Frame(frame)
+        sym_row.pack(fill=tk.X, pady=(0, 8))
+        tk.Label(sym_row, text=t("col_symbol") + ":", font=("Segoe UI", 9, "bold"), bg=self.bg_main, fg=self.text_dark).pack(side=tk.LEFT, padx=(0, 6))
+        sym_entry = tk.Entry(sym_row, font=("Segoe UI", 10), bd=1, relief="solid", bg=self.card_bg, fg=self.text_dark, width=12)
+        sym_entry.insert(0, sym)
+        sym_entry.pack(side=tk.LEFT, padx=(0, 8))
+        holding_name_text = str(holding.get("name", "")).strip()
+        if holding_name_text and holding_name_text != sym:
+            tk.Label(sym_row, text=f"({holding_name_text})", font=("Segoe UI", 9), fg=self.text_muted, bg=self.bg_main).pack(side=tk.LEFT)
 
         # Portfolio selection
         port_row = ttk.Frame(frame)
@@ -8918,6 +9360,11 @@ class ModernPortfolioApp:
         stop_entry.pack(fill=tk.X, pady=(2, 0))
 
         def on_save_edit():
+            new_sym = sym_entry.get().strip().upper()
+            if not new_sym:
+                messagebox.showerror(t("dlg_error"), t("msg_enter_valid_symbol"), parent=dlg)
+                return
+
             try:
                 shares = float(shares_entry.get().strip())
                 buy_price = float(price_entry.get().strip())
@@ -8961,18 +9408,65 @@ class ModernPortfolioApp:
                 matched = holding
                 self.all_holdings.append(matched)
 
-            matched["portfolio"] = new_port
-            matched["currency"] = new_curr
-            matched["shares"] = shares
-            matched["buy_price"] = buy_price
-            matched["target_sell_price"] = target_p
-            matched["stop_loss_price"] = stop_p
+            # Check if moving or renaming causes collision with an existing holding in new_port
+            existing_target = next(
+                (h for h in self.all_holdings if h is not matched and str(h.get("symbol", "")).strip().upper() == new_sym and (h.get("portfolio") or DEFAULT_PORTFOLIO_NAME).strip() == new_port),
+                None
+            )
+            if existing_target:
+                ex_sh = float(existing_target.get("shares", 0.0) or 0.0)
+                ex_bp = float(existing_target.get("buy_price", 0.0) or 0.0)
+                tot_sh = round(ex_sh + shares, 4)
+                tot_cb = round((ex_sh * ex_bp) + (shares * buy_price), 2)
+                avg_bp = round(tot_cb / tot_sh, 4) if tot_sh > 0 else buy_price
+                existing_target["shares"] = tot_sh
+                existing_target["buy_price"] = avg_bp
+                existing_target["cost_basis"] = tot_cb
+                existing_target["currency"] = new_curr
+                cur_p = float(existing_target.get("current_price", avg_bp) or avg_bp)
+                dy = float(existing_target.get("dividend_yield", 0.0) or 0.0)
+                ad = float(existing_target.get("annual_div_per_share", 0.0) or 0.0)
+                existing_target.update(calc_holding_summary(tot_sh, avg_bp, cur_p, dy, ad))
+                if matched in self.all_holdings:
+                    self.all_holdings.remove(matched)
+                matched = existing_target
+            else:
+                matched["portfolio"] = new_port
+                matched["symbol"] = new_sym
+                matched["currency"] = new_curr
+                matched["shares"] = shares
+                matched["buy_price"] = buy_price
+                matched["target_sell_price"] = target_p
+                matched["stop_loss_price"] = stop_p
+                if matched.get("name") in (sym, f"{sym}:CDN", f"{sym}:CA", ""):
+                    matched["name"] = new_sym
 
-            cur_p = float(matched.get("current_price", buy_price))
-            div_y = float(matched.get("dividend_yield", 0.0))
-            ann_d = float(matched.get("annual_div_per_share", 0.0))
-            summary = calc_holding_summary(shares, buy_price, cur_p, div_y, ann_d)
-            matched.update(summary)
+                cur_p = float(matched.get("current_price", buy_price))
+                div_y = float(matched.get("dividend_yield", 0.0))
+                ann_d = float(matched.get("annual_div_per_share", 0.0))
+                summary = calc_holding_summary(shares, buy_price, cur_p, div_y, ann_d)
+                matched.update(summary)
+
+            if new_sym != sym or new_curr != cur_curr or new_port != cur_port:
+                try:
+                    txs = load_transactions(TRANSACTION_HISTORY_CSV, portfolio_name=None, tx_type=None)
+                    changed = False
+                    for tx in txs:
+                        tx_sym = str(tx.get("symbol", "")).strip().upper()
+                        sym_match = (tx_sym == sym or tx_sym.split(":")[0] == sym.split(":")[0] or tx_sym == f"{sym}:CDN" or tx_sym == f"{sym}:CA")
+                        if str(tx.get("portfolio", "")).strip() == cur_port and sym_match:
+                            if new_sym != sym:
+                                tx["symbol"] = new_sym
+                            if new_curr != cur_curr:
+                                tx["currency"] = new_curr
+                            if new_port != cur_port:
+                                tx["portfolio"] = new_port
+                            changed = True
+                    if changed:
+                        save_transactions(txs, TRANSACTION_HISTORY_CSV)
+                        self._refresh_sales_table()
+                except Exception as e:
+                    print(f"Error syncing transaction records on holding edit: {e}")
 
             if holding is not matched:
                 holding.update(matched)
@@ -8986,7 +9480,7 @@ class ModernPortfolioApp:
             if hasattr(self, "chart_view"):
                 self.chart_view.update_portfolio(self.current_portfolio, self.summary_currency)
             dlg.destroy()
-            self._set_status(f"Updated holding {sym} ({new_port}, {new_curr}).")
+            self._set_status(f"Updated holding {new_sym} ({new_port}, {new_curr}).")
 
         btn_row = ttk.Frame(frame)
         btn_row.pack(fill=tk.X, pady=(10, 0))
@@ -9752,7 +10246,7 @@ class ModernPortfolioApp:
         if getattr(self, "is_fetching", False):
             return
 
-        hold_symbols = {h["symbol"].strip().upper() for h in self.all_holdings if h.get("symbol")}
+        hold_symbols = {h["symbol"].strip().upper() for h in list(self.all_holdings) if h.get("symbol")}
         watch_symbols = {w.get("symbol", "").strip().upper() for w in load_watchlist() if w.get("symbol")}
         symbols = sorted(list(hold_symbols | watch_symbols))
         if not symbols:
@@ -9990,6 +10484,8 @@ class ModernPortfolioApp:
             else:
                 chg_str = "-"
 
+            vals[3] = curr
+            vals[5] = f"{sym_char}{buy_price:.2f}"
             vals[6] = f"{sym_char}{price:.2f}"
             vals[7] = chg_str
             vals[8] = f"{sym_char}{market_value:,.2f}"
@@ -10114,6 +10610,8 @@ class ModernPortfolioApp:
                     "error": quote.get("error", "No data returned"),
                     "type": "Quote Fetch",
                 })
+                if len(self._network_errors) > 100:
+                    self._network_errors = self._network_errors[-100:]
 
         save_portfolio(self.all_holdings, PORTFOLIO_CSV)
         save_watchlist_quotes_cache(self._watchlist_quotes_cache)
@@ -10884,6 +11382,18 @@ class ModernPortfolioApp:
         except Exception:
             pass
 
+    def _reconcile_holdings_with_history(self):
+        res = reconcile_portfolio_holdings_with_transactions(PORTFOLIO_CSV, TRANSACTION_HISTORY_CSV)
+        count = res.get("reconciled_count", 0)
+        if count > 0:
+            self.all_holdings = load_portfolio(PORTFOLIO_CSV, portfolio_name=None)
+            self._on_portfolio_selected()
+            self._refresh_sales_table()
+            self._set_status(f"Reconciled {count} holding(s) with transaction history.")
+            messagebox.showinfo(t("msg_success"), t("msg_reconcile_success", count=count), parent=self.root)
+        else:
+            messagebox.showinfo(t("msg_info"), t("msg_reconcile_none"), parent=self.root)
+
     def _open_edit_transaction_dialog(self):
         sel = self.history_tree.selection()
         if not sel:
@@ -11003,6 +11513,18 @@ class ModernPortfolioApp:
         notes_entry.insert(0, tx.get("notes", ""))
         notes_entry.pack(fill=tk.X, pady=(2, 12))
 
+        # Checkbox: Update portfolio holdings
+        update_holdings_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(
+            frame,
+            text=t("chk_update_holdings"),
+            variable=update_holdings_var,
+            bg=self.bg_main,
+            fg=self.text_dark,
+            font=("Segoe UI", 8),
+            activebackground=self.bg_main,
+        ).pack(anchor="w", pady=(0, 12))
+
         def on_save_edit():
             t_type = type_cb.get().strip().upper()
             target_port = port_cb.get().strip() or DEFAULT_PORTFOLIO_NAME
@@ -11059,6 +11581,13 @@ class ModernPortfolioApp:
 
             ok = update_transaction(raw_idx, updated_record, TRANSACTION_HISTORY_CSV)
             if ok:
+                if update_holdings_var.get():
+                    try:
+                        sync_transaction_change_to_portfolio(tx, updated_record, PORTFOLIO_CSV)
+                        self.all_holdings = load_portfolio(PORTFOLIO_CSV, portfolio_name=None)
+                        self._on_portfolio_selected()
+                    except Exception as e:
+                        print(f"Error syncing transaction edit to portfolio: {e}")
                 self._refresh_sales_table()
                 dlg.destroy()
                 self._set_status(f"Updated transaction #{raw_idx + 1} ({sym}).")
@@ -11070,6 +11599,13 @@ class ModernPortfolioApp:
             if messagebox.askyesno(t("msg_warning"), t("confirm_delete_tx"), parent=dlg):
                 ok = delete_transaction(raw_idx, TRANSACTION_HISTORY_CSV)
                 if ok:
+                    if update_holdings_var.get():
+                        try:
+                            sync_transaction_change_to_portfolio(tx, None, PORTFOLIO_CSV)
+                            self.all_holdings = load_portfolio(PORTFOLIO_CSV, portfolio_name=None)
+                            self._on_portfolio_selected()
+                        except Exception as e:
+                            print(f"Error syncing transaction deletion to portfolio: {e}")
                     self._refresh_sales_table()
                     dlg.destroy()
                     self._set_status(f"Deleted transaction #{raw_idx + 1}.")
@@ -11562,7 +12098,7 @@ class ModernPortfolioApp:
             curr_totals = {}
             for h in self.holdings:
                 c = (h.get("currency") or "USD").strip().upper()
-                mv = float(h.get("shares", 0.0)) * float(h.get("current_price", h.get("price", 0.0)))
+                mv = float(h.get("shares", 0.0)) * float(h.get("current_price") or h.get("buy_price", 0.0) or 0.0)
                 mv_conv = self.converter.convert(mv, c, target_curr) if target_curr != "Native" else mv
                 curr_totals[c] = curr_totals.get(c, 0.0) + mv_conv
             tot_exp = sum(curr_totals.values())
@@ -14375,7 +14911,7 @@ class ModernPortfolioApp:
         cur_total_val = 0.0
         for h in self.holdings:
             c = (h.get("currency") or "USD").strip().upper()
-            mv = float(h.get("shares", 0.0)) * float(h.get("current_price", h.get("price", 0.0)))
+            mv = float(h.get("shares", 0.0)) * float(h.get("current_price") or h.get("buy_price", 0.0) or 0.0)
             ad = float(h.get("annual_dividend", 0.0))
             cur_ann_div += self.converter.convert(ad, c, target_curr)
             cur_total_val += self.converter.convert(mv, c, target_curr)
@@ -15433,7 +15969,7 @@ class ModernPortfolioApp:
 
             for h in self.holdings:
                 c = (h.get("currency") or "USD").strip().upper()
-                mv = float(h.get("shares", 0.0)) * float(h.get("current_price", h.get("price", 0.0)))
+                mv = float(h.get("shares", 0.0)) * float(h.get("current_price") or h.get("buy_price", 0.0) or 0.0)
                 ad = float(h.get("annual_dividend", 0.0))
                 cur_tot_val += self.converter.convert(mv, c, target_curr)
                 cur_ann_div += self.converter.convert(ad, c, target_curr)
@@ -15615,6 +16151,27 @@ class ModernPortfolioApp:
 
 
 def launch_app():
+    if not TKINTER_AVAILABLE:
+        try:
+            import ui
+            if hasattr(ui, "View"):
+                print("=" * 64)
+                print("📱 Detected Pythonista 3 on iOS. Launching native UIKit ui module interface...")
+                print("=" * 64)
+                import pythonista_native_ui
+                pythonista_native_ui.main()
+                return
+        except ImportError:
+            pass
+
+        print("=" * 64)
+        print("ℹ️  Tkinter desktop GUI is not available on this platform (iOS / headless).")
+        print("📱 Automatically launching G_Finance Mobile Webview interface...")
+        print("=" * 64)
+        import webview
+        webview.main()
+        return
+
     root = tk.Tk()
     app = ModernPortfolioApp(root)
     try:

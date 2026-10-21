@@ -196,6 +196,15 @@ The enhanced engine (`TraceINT.py` / `TraceINTv3.11.py`) resolves and displays *
 | `test_gui_transit_subnets_field` | Verifies GUI Transit Subnets setting display and real-time reconfigurability |
 | `test_two_line_hop_rendering_in_table` | Verifies 2-line hop rows (IN and OUT) rendered into GUI Treeview with tags |
 | `test_path_flow_rendering_in_gui` | Verifies PATH FLOW diagram rendered in GUI Text view |
+| `test_gui_streaming_hop_updates_table_and_flow_immediately` | Verifies real-time live table & PATH FLOW updates as each hop arrives without waiting till the end |
+| `test_default_launches_gui` | Verifies `python TraceINT.py` attempts GUI launch by default when run without arguments |
+| `test_default_falls_back_to_cli_on_gui_failure` | Verifies graceful fallback to interactive CLI if GUI is unavailable (headless / no display) |
+| `test_explicit_cli_flag_bypasses_gui` | Verifies `--cli` flag forces CLI mode directly without attempting GUI |
+| `test_explicit_gui_flag_exits_on_failure` | Verifies explicit `--gui` flag reports error and exits on display failure |
+| `test_wan_stitching_three_sites_ignores_probing_site` | Verifies probing host at Site A ignores Site A hops and stitches Site B to Site C via remote WAN routers |
+| `test_wan_stitching_same_remote_site` | Verifies probing host at Site A traces endpoints both at remote Site B pivoting on the common Site B WAN router |
+| `test_wan_stitching_source_in_local_site` | Verifies local source at Site A stitches correctly to remote Site C destination across WAN |
+| `test_wan_stitching_both_in_local_site` | Verifies both endpoints at local Site A stitch correctly without crossing WAN |
 
 Run via:
 ```bash
@@ -207,30 +216,69 @@ python3 -m unittest "cisco interface ip extract and use it traceroute/test_trace
 ## 5. Requirements & Specifications: Graphical User Interface (`TraceINTGUI`)
 
 ### Overview
-A native desktop GUI is provided directly in `TraceINT.py` (and `TraceINTv3.11.py`), requiring **zero external dependencies** (built strictly on Python standard library `tkinter` and `ttk`).
+A native desktop GUI is provided directly in `TraceINT.py` (and `TraceINTv3.13.py`), requiring **zero external dependencies** (built strictly on Python standard library `tkinter` and `ttk`).
 
 ### Core Features & Rules
-1. **Zero External Dependencies**:
+1. **Real-Time Live Table & PATH FLOW Updates (No Waiting Till End)**:
+   - As each hop responds during a traceroute, the engine immediately performs lookahead subnet correlation and updates **both the Full Path Table and the Path Flow Diagram in real time**.
+   - The user does **not** have to wait until the traceroute completes; they see the table rows (Inbound & Outbound) and the ASCII flow diagram links appear and grow hop-by-hop.
+   - Automatically auto-fits column widths and auto-scrolls both the table and the diagram to keep the latest hop in view.
+2. **Default GUI with Graceful CLI Fallback**:
+   - Running `python3 TraceINT.py` without arguments defaults to launching the GUI directly.
+   - If GUI cannot launch (e.g., headless Linux server, missing `$DISPLAY`, or missing Tkinter), it catches the display/initialization error and **automatically falls back to interactive CLI mode** with a clear notification.
+   - Use `--cli` to explicitly force CLI mode without attempting GUI.
+   - Use `-g` or `--gui` to explicitly demand GUI mode (will exit with error if GUI fails).
+3. **Zero External Dependencies**:
    - Uses exclusively `tkinter`, `tkinter.ttk`, `queue`, `threading`, and standard library utilities.
    - Runs cleanly on any Python 3.8+ system without `pip install` prerequisites.
-2. **Adjustable Column Widths**:
+4. **Adjustable Column Widths**:
    - Built on `ttk.Treeview`. Users can click and drag the divider between any column headers to adjust column widths freely.
    - Includes an **`↔ Auto-fit Column Widths`** button that dynamically measures text width and resizes all columns to fit their content perfectly.
    - Includes a **`↺ Reset Column Widths`** button to restore preset defaults.
    - Double-clicking any column header auto-fits that specific column.
    - Right-click context menu provides quick auto-fit, reset, row copying, and export options.
-3. **2-Line Hop Path Table**:
+5. **2-Line Hop Path Table**:
    - Renders both Inbound (`IN`) and Outbound (`OUT`) interfaces on adjacent rows for every hop with clear alternating visual tags.
    - Displays all 10 columns: `#`, `IP Address`, `Device Name`, `Dir`, `Interface`, `Next Hop (In Int)`, `Zone`, `VRF`, `Description`, `Extra Info`.
    - Distinguishes timeout hops and destination reached endpoints with dedicated styling.
-4. **Interactive PATH FLOW Diagram**:
+6. **Interactive PATH FLOW Diagram**:
    - A dedicated tab displays the formatted ASCII link flow diagram connecting each device and link.
    - Quick **`📋 Copy PATH FLOW`** and **`💾 Save Flow as Text`** buttons.
-5. **Non-Blocking Background Tracing & Cancellation**:
+7. **Non-Blocking Background Tracing & Cancellation**:
    - Traces execute in a background thread with real-time thread-safe queue updates so the interface remains responsive.
    - A **`⏹ Stop`** button allows instant termination of active traceroute subprocesses.
-6. **Launch Options**:
-   - CLI flag: `python3 TraceINT.py --gui` or `python3 TraceINT.py -g`
+8. **Launch Options**:
+   - Default: `python3 TraceINT.py` (opens GUI, falls back to CLI if headless)
+   - Force CLI: `python3 TraceINT.py --cli`
+   - Explicit GUI: `python3 TraceINT.py --gui` or `python3 TraceINT.py -g`
    - Interactive console menu: Option `8. Launch GUI Interface`
    - Programmatic: `from TraceINT import launch_gui; launch_gui()`
+
+---
+
+## 6. Requirements & Specifications: 3-Site Source ↔ Destination WAN Path Stitching
+
+### Overview
+When diagnosing connectivity across enterprise WAN networks, the diagnostic host running the traceroute script may be located at a third site (**Site A**) while evaluating traffic from **Site B (Source)** to **Site C (Destination)**. WAN routers are designated by device hostname containing a keyword (default `'wanr'`).
+
+### Core Stitching Rules
+1. **Three-Site Topology (Site A -> Site B and Site A -> Site C)**:
+   - When the traceroute to Source crosses into Site B via remote WAN router `SiteB-wanr` and the traceroute to Destination crosses into Site C via remote WAN router `SiteC-wanr`:
+   - **Site A Device & WAN Router Exclusion**: Neither Site A's local LAN devices nor Site A's exit WAN router (`SiteA-wanr`) are involved in the path. All hops prior to `SiteB-wanr` in trace 1 and prior to `SiteC-wanr` in trace 2 are completely pruned.
+   - **Remote WAN Interconnect**: Only `SiteB-wanr` and `SiteC-wanr` are involved in the WAN bridge: `SiteB-wanr ⇄ SiteC-wanr`.
+   - **Reverse Source-Side Path**: The hops inside Site B (from `SiteB-wanr` to `source_ip`) are reversed, orienting flow outward from `source_ip` up to `SiteB-wanr`.
+   - **Forward Destination-Side Path**: The hops inside Site C are forwarded from `SiteC-wanr` down to `destination_ip`.
+   - **Resulting Path**: `Source Host (Site B) -> ... -> SiteB-wanr ⇄ SiteC-wanr -> ... -> Destination Host (Site C)`.
+2. **Endpoints Not Traversing WANR (Local Probing Site Endpoints)**:
+   - If Source or Destination does NOT traverse a remote WAN router, it resides in the **same site as the current PC (Site A)**.
+   - **Source in Local Site (Site A), Destination Remote (Site C)**: Traverses local LAN to Site A's exit WAN router (`SiteA-wanr`), bridges `SiteA-wanr ⇄ SiteC-wanr`, and proceeds down Site C.
+   - **Destination in Local Site (Site A), Source Remote (Site B)**: Traverses from Source in Site B up to `SiteB-wanr`, bridges `SiteB-wanr ⇄ SiteA-wanr`, and proceeds down Site A LAN to Destination.
+   - **Both Endpoints in Local Site (Site A)**: Pure LAN trace within Site A pivoting on local switch without any WAN routers in the path.
+3. **Same Remote Site**:
+   - When Source and Destination are both at remote Site B (reaching the same remote WAN router `SiteB-wanr`), discard Site A hops and `SiteA-wanr`, reverse Site B source segment to the common pivot device, and forward down to destination without crossing an external WAN link.
+4. **Consistency Across Modes**:
+   - Unified engine `stitch_wan_path()` is utilized identically by CLI (`trace_source_destination`, `_print_combined_path`) and GUI (`_worker_wan_trace`) across `TraceINT.py` and `TraceINTv3.8.py`.
+
+
+
 

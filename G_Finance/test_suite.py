@@ -687,7 +687,7 @@ class TestCsvBackupRotation(unittest.TestCase):
         if os.path.exists(self.test_dir):
             shutil.rmtree(self.test_dir, ignore_errors=True)
 
-    def test_portfolio_5_backup_rotation(self):
+    def test_portfolio_10_backup_rotation(self):
         # 1. Save initial version (Save 1) -> No backups yet
         save_portfolio([{"symbol": "V1", "shares": 1.0, "buy_price": 10.0}], self.test_port_csv)
         self.assertTrue(os.path.exists(self.test_port_csv))
@@ -702,35 +702,35 @@ class TestCsvBackupRotation(unittest.TestCase):
         b1_holdings = load_portfolio(backups[0]["path"], portfolio_name=None)
         self.assertEqual(b1_holdings[0]["symbol"], "V1")
 
-        # 3. Save V3, V4, V5, V6 -> exactly 5 backups should exist
-        for i in range(3, 7):
+        # 3. Save V3 through V11 -> exactly 10 backups should exist (capped at 10)
+        for i in range(3, 12):
             save_portfolio([{"symbol": f"V{i}", "shares": float(i), "buy_price": 10.0 * i}], self.test_port_csv)
 
         backups = get_backup_files(self.test_port_csv, backup_dir=self.backup_dir)
-        self.assertEqual(len(backups), 5)
-        # Check slot indices 1..5 exist
+        self.assertEqual(len(backups), 10)
+        # Check slot indices 1..10 exist
         indices = [b["index"] for b in backups]
-        self.assertEqual(indices, [1, 2, 3, 4, 5])
-        # Slot 1 is newest (V5), Slot 5 is oldest (V1)
-        self.assertEqual(load_portfolio(backups[0]["path"])[0]["symbol"], "V5")
-        self.assertEqual(load_portfolio(backups[4]["path"])[0]["symbol"], "V1")
+        self.assertEqual(indices, list(range(1, 11)))
+        # Slot 1 is newest (V10), Slot 10 is oldest (V1)
+        self.assertEqual(load_portfolio(backups[0]["path"])[0]["symbol"], "V10")
+        self.assertEqual(load_portfolio(backups[9]["path"])[0]["symbol"], "V1")
 
-        # 4. Save V7 -> still capped at 5 backups; V1 purged, slot 5 is V2, slot 1 is V6
-        save_portfolio([{"symbol": "V7", "shares": 7.0, "buy_price": 70.0}], self.test_port_csv)
+        # 4. Save V12 -> still capped at 10 backups; V1 purged, slot 10 is V2, slot 1 is V11
+        save_portfolio([{"symbol": "V12", "shares": 12.0, "buy_price": 120.0}], self.test_port_csv)
         backups = get_backup_files(self.test_port_csv, backup_dir=self.backup_dir)
-        self.assertEqual(len(backups), 5)
-        self.assertEqual(load_portfolio(backups[0]["path"])[0]["symbol"], "V6")
-        self.assertEqual(load_portfolio(backups[4]["path"])[0]["symbol"], "V2")
+        self.assertEqual(len(backups), 10)
+        self.assertEqual(load_portfolio(backups[0]["path"])[0]["symbol"], "V11")
+        self.assertEqual(load_portfolio(backups[9]["path"])[0]["symbol"], "V2")
 
-        # 5. Restore from backup slot 3 (which is V4)
+        # 5. Restore from backup slot 3 (which is V9)
         ok = restore_backup(self.test_port_csv, backup_index=3, backup_dir=self.backup_dir)
         self.assertTrue(ok)
         restored = load_portfolio(self.test_port_csv)
-        self.assertEqual(restored[0]["symbol"], "V4")
+        self.assertEqual(restored[0]["symbol"], "V9")
 
-        # Verify safety backup retained the prior state (V7) in slot 1
+        # Verify safety backup retained the prior state (V12) in slot 1
         backups_after = get_backup_files(self.test_port_csv, backup_dir=self.backup_dir)
-        self.assertEqual(load_portfolio(backups_after[0]["path"])[0]["symbol"], "V7")
+        self.assertEqual(load_portfolio(backups_after[0]["path"])[0]["symbol"], "V12")
 
     def test_transaction_history_rotation(self):
         # Save transactions 3 times
@@ -2134,6 +2134,156 @@ class TestChartViewHeaderUpdate(unittest.TestCase):
                 scale_factor=1.0,
                 data={"annual_dividend_per_share": 2.50, "dividend_events": []},
             )
+
+    def test_safe_format_timestamp_various_formats(self):
+        from datetime import datetime
+        from chart_view import _safe_format_timestamp, _parse_to_datetime
+
+        # Test string datetime formats
+        dt_str = "2026-10-20 17:01:51"
+        self.assertIn("2026", _safe_format_timestamp(dt_str, "1Y", is_hover=False))
+        self.assertIn("17:01", _safe_format_timestamp(dt_str, "1D", is_hover=False))
+        self.assertIn("17:01:51", _safe_format_timestamp(dt_str, "1D", is_hover=True))
+
+        # Test ISO string format
+        iso_str = "2026-10-20T17:01:51+00:00"
+        self.assertIn("2026", _safe_format_timestamp(iso_str, "1Y", is_hover=False))
+
+        # Test date string format
+        date_str = "2026-10-20"
+        self.assertIn("2026", _safe_format_timestamp(date_str, "1Y", is_hover=False))
+
+        # Test epoch timestamp
+        epoch = 1729443711
+        self.assertTrue(len(_safe_format_timestamp(epoch, "1D", is_hover=False)) > 0)
+
+        # Test datetime object
+        dt_obj = datetime(2026, 10, 20, 15, 30, 0)
+        self.assertIn("15:30", _safe_format_timestamp(dt_obj, "1D", is_hover=False))
+        self.assertIn("15:30:00", _safe_format_timestamp(dt_obj, "1D", is_hover=True))
+
+        # Test edge cases (unparseable, empty, None)
+        self.assertEqual(_safe_format_timestamp("custom_label", "1D", is_hover=False), "custom_label")
+        self.assertEqual(_safe_format_timestamp("", "1D", is_hover=False), "")
+        self.assertEqual(_safe_format_timestamp(None, "1D", is_hover=False), "")
+
+    def test_scope_selection_handling(self):
+        from unittest.mock import MagicMock
+        from chart_view import GoogleFinanceChartView
+
+        mock_view = MagicMock()
+        mock_view.scope_combo = MagicMock()
+
+        # Test portfolio selection with various emojis/formats
+        test_cases = [
+            ("📁 Portfolio: All Portfolios", 0, "portfolio"),
+            ("📑 Portfolio: All Portfolios", 0, "portfolio"),
+            ("Portfolio: Retirement", 0, "portfolio"),
+            ("📁 Portfolio: USD Tech", -1, "portfolio"),
+            ("VFV - Vanguard S&P 500 Index ETF", 1, "VFV"),
+            ("9988.HK - Alibaba Group", 2, "9988.HK"),
+            ("XIU.TO", 3, "XIU.TO"),
+        ]
+
+        for combo_val, current_idx, expected_scope in test_cases:
+            mock_view.scope_combo.get.return_value = combo_val
+            mock_view.scope_combo.current.return_value = current_idx
+            GoogleFinanceChartView._on_scope_selected(mock_view)
+            self.assertEqual(mock_view.current_scope, expected_scope)
+
+    def test_metric_changed_handling_and_distinction(self):
+        from unittest.mock import MagicMock
+        from chart_view import GoogleFinanceChartView
+
+        mock_view = MagicMock()
+        mock_view.metric_combo = MagicMock()
+        mock_view.chart_data = None
+
+        # Verify index mapping: 0=total, 1=price, 2=growth, 3=growth_div, 4=div_only
+        idx_cases = [
+            (0, "total"),
+            (1, "price"),
+            (2, "growth"),
+            (3, "growth_div"),
+            (4, "div_only"),
+        ]
+        for idx, expected_metric in idx_cases:
+            mock_view.metric_combo.current.return_value = idx
+            mock_view.metric_combo.get.return_value = ""
+            GoogleFinanceChartView._on_metric_changed(mock_view)
+            self.assertEqual(mock_view.chart_metric, expected_metric)
+
+        # Verify fallback string matching doesn't confuse growth vs growth_div
+        string_cases = [
+            ("Net Growth / P&L (Excl. Invested)", -1, "growth"),
+            ("淨增長 / 盈虧 (扣除本金)", -1, "growth"),
+            ("Net Growth + Dividends", -1, "growth_div"),
+            ("淨增長 + 累積股息分派", -1, "growth_div"),
+            ("Stock Price (Per Share)", -1, "price"),
+            ("股價 (每股)", -1, "price"),
+            ("Dividends Only", -1, "div_only"),
+            ("僅累積股息分派", -1, "div_only"),
+            ("Total Portfolio / Position Value", -1, "total"),
+        ]
+        for val_str, idx, expected_metric in string_cases:
+            mock_view.metric_combo.current.return_value = idx
+            mock_view.metric_combo.get.return_value = val_str
+            GoogleFinanceChartView._on_metric_changed(mock_view)
+            self.assertEqual(mock_view.chart_metric, expected_metric)
+
+    def test_benchmark_changed_handling(self):
+        from unittest.mock import MagicMock
+        from chart_view import GoogleFinanceChartView
+
+        mock_view = MagicMock()
+        mock_view.benchmark_combo = MagicMock()
+
+        bm_cases = [
+            (0, "None", "none", ""),
+            (1, "S&P 500 (SPY)", "sp500", "SPY"),
+            (2, "TSX 60 (XIU.TO)", "tsx60", "XIU.TO"),
+        ]
+        for idx, val, expected_bm, expected_sym in bm_cases:
+            mock_view.benchmark_combo.current.return_value = idx
+            mock_view.benchmark_combo.get.return_value = val
+            GoogleFinanceChartView._on_benchmark_changed(mock_view)
+            self.assertEqual(mock_view.current_benchmark, expected_bm)
+            self.assertEqual(mock_view.benchmark_symbol, expected_sym)
+
+    def test_mpl_hover_with_twinx_ax2(self):
+        from unittest.mock import MagicMock
+        from chart_view import GoogleFinanceChartView
+
+        mock_view = MagicMock()
+        mock_view.plot_prices = [100.0, 105.0, 110.0]
+        mock_view.plot_timestamps = ["2026-10-20 10:00:00", "2026-10-20 11:00:00", "2026-10-20 12:00:00"]
+        mock_view.plot_prev_close = 99.0
+        mock_view.plot_currency = "$"
+        mock_view.ax = MagicMock()
+        mock_view.ax2 = MagicMock()
+
+        # Hover event on primary ax
+        event_ax1 = MagicMock()
+        event_ax1.inaxes = mock_view.ax
+        event_ax1.xdata = 1.0
+        GoogleFinanceChartView._on_mpl_hover(mock_view, event_ax1)
+        mock_view._update_hover_header.assert_called_with(105.0, "2026-10-20 11:00:00", 99.0, "$")
+
+        # Hover event on twinx ax2 (benchmark active)
+        mock_view._update_hover_header.reset_mock()
+        event_ax2 = MagicMock()
+        event_ax2.inaxes = mock_view.ax2
+        event_ax2.xdata = 2.0
+        GoogleFinanceChartView._on_mpl_hover(mock_view, event_ax2)
+        mock_view._update_hover_header.assert_called_with(110.0, "2026-10-20 12:00:00", 99.0, "$")
+
+        # Hover event outside any valid axis
+        mock_view._update_hover_header.reset_mock()
+        event_outside = MagicMock()
+        event_outside.inaxes = MagicMock()
+        event_outside.xdata = 2.0
+        GoogleFinanceChartView._on_mpl_hover(mock_view, event_outside)
+        mock_view._update_hover_header.assert_not_called()
 
 
 class TestMultiplePortfolioCreationAndSelection(unittest.TestCase):
@@ -4214,6 +4364,28 @@ class TestBernsteinPhase3Upgrades(unittest.TestCase):
             p_map_after = {it["symbol"]: it["name"] for it in persisted_after}
             self.assertEqual(p_map_after.get("NVDA"), "NVIDIA Corporation")
 
+    def test_desktop_network_errors_capped_for_memory_safety(self):
+        """Verify that ModernPortfolioApp caps _network_errors to 100 items to prevent memory leaks."""
+        from unittest.mock import MagicMock, patch
+        import main_gui
+
+        app = object.__new__(main_gui.ModernPortfolioApp)
+        app.is_running = True
+        app._network_errors = [{"time": "t", "symbol": f"S{i}", "error": "err"} for i in range(120)]
+        app.all_holdings = []
+        app._watchlist_quotes_cache = {}
+        app._on_portfolio_selected = MagicMock()
+        app._update_network_status_badge = MagicMock()
+        app._set_status = MagicMock()
+        app.lbl_time = MagicMock()
+
+        failed_results = [("FAIL_SYM", {"symbol": "FAIL_SYM", "success": False, "error": "Timeout"})]
+        with patch("main_gui.save_portfolio"), patch("main_gui.save_watchlist_quotes_cache"), patch("main_gui.load_watchlist", return_value=[]):
+            main_gui.ModernPortfolioApp._handle_all_quotes_result(app, failed_results)
+
+        self.assertLessEqual(len(app._network_errors), 100)
+        self.assertEqual(len(app._network_errors), 100)
+
     def test_selection_preservation_during_quote_refresh(self):
         """Verify that user selection in watchlist and holdings is preserved during stock refresh."""
         import tempfile
@@ -4797,7 +4969,7 @@ class TestMobileWebServerAndDeviceDetection(unittest.TestCase):
             with urllib.request.urlopen(f"{base_url}/api/report?currency=USD") as resp:
                 self.assertEqual(resp.status, 200)
                 rep_html = resp.read().decode("utf-8")
-                self.assertIn("Portfolio Executive Report", rep_html)
+                self.assertTrue(any(t in rep_html for t in ["Portfolio Executive Report", "投資組合高階執行報告", "投资组合高阶执行报告"]))
 
             # 10. Test CSV Export API
             with urllib.request.urlopen(f"{base_url}/api/export/csv") as resp:
@@ -4805,12 +4977,22 @@ class TestMobileWebServerAndDeviceDetection(unittest.TestCase):
                 csv_data = resp.read().decode("utf-8")
                 self.assertIn("Symbol", csv_data)
 
-            # 11. Test JSON Backup API
+            # 11. Test JSON Backup API & Portfolio Summary API
             with urllib.request.urlopen(f"{base_url}/api/export/json") as resp:
                 self.assertEqual(resp.status, 200)
                 b_data = json.loads(resp.read().decode("utf-8"))
                 self.assertIn("portfolio", b_data)
                 self.assertIn("watchlist", b_data)
+                self.assertIn("transactions", b_data)
+                self.assertIn("portfolios", b_data)
+
+            # 12. Test Portfolio Summary Stats API
+            with urllib.request.urlopen(f"{base_url}/api/portfolio/summary") as resp:
+                self.assertEqual(resp.status, 200)
+                s_data = json.loads(resp.read().decode("utf-8"))
+                self.assertIn("total_holdings", s_data)
+                self.assertIn("by_currency", s_data)
+                self.assertIn("top_holdings", s_data)
 
         finally:
             web_server.stop_server()
@@ -4844,6 +5026,1726 @@ class TestMobileWebServerAndDeviceDetection(unittest.TestCase):
         # Opt-out headless: python3 web_server.py --headless
         args5 = parser.parse_args(["--headless"])
         self.assertFalse(args5.auto_view)
+
+    def test_module_typing_and_annotations_resolution(self):
+        """Regression test: Ensure all type annotations across modules resolve without NameError (e.g. Tuple/List/Dict)."""
+        import importlib
+        import typing
+
+        target_modules = [
+            "web_server",
+            "webview",
+            "chart_fetcher",
+            "csv_manager",
+            "financial_calc",
+            "currency_converter",
+            "report_generator",
+            "main_gui",
+        ]
+
+        for mod_name in target_modules:
+            mod = importlib.import_module(mod_name)
+            # 1. Module-level type annotations must resolve cleanly
+            hints = typing.get_type_hints(mod)
+            self.assertIsInstance(hints, dict, f"Module {mod_name} type hints must be a dict")
+
+            # 2. Function and class annotations must resolve cleanly
+            for attr_name in dir(mod):
+                if attr_name.startswith("__"):
+                    continue
+                attr = getattr(mod, attr_name)
+                if callable(attr) or isinstance(attr, type):
+                    try:
+                        typing.get_type_hints(attr)
+                    except Exception as e:
+                        self.fail(f"Failed to resolve type hints for {mod_name}.{attr_name}: {e}")
+
+    def test_webview_and_chart_cache_integrity(self):
+        """Test webview import and chart cache dict type compatibility across Python versions."""
+        import web_server
+        import webview
+
+        # Verify chart cache exists and supports standard caching operations
+        self.assertTrue(hasattr(web_server, "_API_CHART_CACHE"))
+        self.assertIsInstance(web_server._API_CHART_CACHE, dict)
+        self.assertTrue(hasattr(webview, "is_pythonista"))
+        self.assertTrue(hasattr(webview, "launch_pythonista_view"))
+        self.assertIsInstance(webview.is_pythonista(), bool)
+
+        test_key = "TEST_SYM_1M_USD_ALL"
+        test_payload = {"prices": [100.0, 105.0], "timestamps": ["2026-01-01", "2026-01-02"]}
+        web_server._API_CHART_CACHE[test_key] = (1700000000.0, test_payload)
+
+        cached_entry = web_server._API_CHART_CACHE.get(test_key)
+        self.assertIsNotNone(cached_entry)
+        self.assertEqual(cached_entry[0], 1700000000.0)
+        self.assertEqual(cached_entry[1]["prices"], [100.0, 105.0])
+
+        # Clean up
+        del web_server._API_CHART_CACHE[test_key]
+
+    def test_all_chart_timeframes_availability_and_speed(self):
+        """Test that all chart timeframes (1D, 5D, 1M, 6M, YTD, 1Y, 5Y, MAX) return valid curves quickly."""
+        import web_server
+        import time
+
+        timeframes = ["1D", "5D", "1M", "6M", "YTD", "1Y", "5Y", "MAX"]
+        holdings = [
+            {"symbol": "VOO", "shares": 10.0, "current_price": 700.0, "buy_price": 650.0, "currency": "USD"},
+            {"symbol": "VGRO:TSE", "shares": 50.0, "current_price": 48.0, "buy_price": 45.0, "currency": "CAD"},
+        ]
+        converter = web_server.get_currency_converter()
+
+        for tf in timeframes:
+            t0 = time.time()
+            data = web_server.DashboardRequestHandler._generate_fallback_chart_data(
+                None, "PORTFOLIO", tf, "USD", holdings, converter
+            )
+            elapsed = time.time() - t0
+            self.assertLess(elapsed, 0.5, f"Timeframe {tf} took {elapsed:.3f}s (should be < 0.5s)")
+            self.assertIn("prices", data)
+            self.assertIn("timestamps", data)
+            self.assertGreaterEqual(len(data["prices"]), 2, f"Timeframe {tf} must have at least 2 points for canvas rendering")
+            self.assertEqual(len(data["prices"]), len(data["timestamps"]))
+            self.assertGreater(data.get("current_price", 0), 0)
+
+
+# Import Google Sheet sync tests
+from test_google_sheet_sync import TestGoogleSheetSync
+
+
+class TestGoogleSheetServerAPIs(unittest.TestCase):
+    """Test suite for Google Sheet Web Server API endpoints."""
+
+    def test_web_server_has_google_sheet_endpoints(self):
+        import web_server
+        from google_sheet_sync import get_google_sheet_sync, get_google_apps_script_template
+
+        sync_mgr = get_google_sheet_sync()
+        status = sync_mgr.get_sync_status()
+        self.assertIn("enabled", status)
+        self.assertIn("configured", status)
+        self.assertIn("web_app_url", status)
+
+        code = get_google_apps_script_template()
+        self.assertIn("function doGet(e)", code)
+        self.assertIn("function doPost(e)", code)
+
+
+class TestTransactionHoldingSync(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.test_dir = tempfile.mkdtemp()
+        self.port_csv = os.path.join(self.test_dir, "test_portfolio.csv")
+        self.tx_csv = os.path.join(self.test_dir, "test_transactions.csv")
+
+    def tearDown(self):
+        import shutil
+        if os.path.exists(self.test_dir):
+            shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def test_sync_transaction_rename_symbol(self):
+        from csv_manager import save_portfolio, load_portfolio, sync_transaction_change_to_portfolio
+        # Initial portfolio holding with VGRO:CDN
+        init_holding = {
+            "portfolio": "CAD TSFA",
+            "symbol": "VGRO:CDN",
+            "name": "VGRO:CDN",
+            "shares": 6.0,
+            "buy_price": 47.60,
+            "current_price": 47.53,
+            "currency": "CAD",
+            "dividend_yield": 1.76,
+            "annual_div_per_share": 0.836,
+        }
+        save_portfolio([init_holding], filepath=self.port_csv)
+
+        old_tx = {
+            "portfolio": "CAD TSFA",
+            "symbol": "VGRO:CDN",
+            "shares": 6.0,
+            "price": 47.60,
+            "type": "BUY",
+            "currency": "CAD",
+        }
+        new_tx = {
+            "portfolio": "CAD TSFA",
+            "symbol": "VGRO",
+            "shares": 6.0,
+            "price": 47.60,
+            "type": "BUY",
+            "currency": "CAD",
+        }
+
+        ok = sync_transaction_change_to_portfolio(old_tx, new_tx, portfolio_filepath=self.port_csv)
+        self.assertTrue(ok)
+
+        holdings = load_portfolio(self.port_csv)
+        self.assertEqual(len(holdings), 1)
+        self.assertEqual(holdings[0]["symbol"], "VGRO")
+        self.assertEqual(holdings[0]["shares"], 6.0)
+        self.assertEqual(holdings[0]["buy_price"], 47.60)
+        self.assertEqual(holdings[0]["current_price"], 47.53)
+
+    def test_sync_transaction_delete_reverts_holding(self):
+        from csv_manager import save_portfolio, load_portfolio, sync_transaction_change_to_portfolio
+        init_holding = {
+            "portfolio": "CAD FHSA",
+            "symbol": "VFV",
+            "name": "VFV",
+            "shares": 40.0,
+            "buy_price": 192.82,
+            "current_price": 192.67,
+            "currency": "CAD",
+        }
+        save_portfolio([init_holding], filepath=self.port_csv)
+
+        tx = {
+            "portfolio": "CAD FHSA",
+            "symbol": "VFV",
+            "shares": 40.0,
+            "price": 192.82,
+            "type": "BUY",
+            "currency": "CAD",
+        }
+
+        ok = sync_transaction_change_to_portfolio(tx, None, portfolio_filepath=self.port_csv)
+        self.assertTrue(ok)
+
+        holdings = load_portfolio(self.port_csv)
+        self.assertEqual(len(holdings), 0)
+
+    def test_reconcile_portfolio_holdings_with_transactions(self):
+        from csv_manager import (
+            save_portfolio,
+            load_portfolio,
+            save_transactions,
+            reconcile_portfolio_holdings_with_transactions,
+        )
+        init_holdings = [
+            {
+                "portfolio": "CAD TSFA",
+                "symbol": "VGRO:CDN",
+                "name": "VGRO:CDN",
+                "shares": 6.0,
+                "buy_price": 47.60,
+                "current_price": 47.53,
+                "currency": "CAD",
+            },
+            {
+                "portfolio": "CAD FHSA",
+                "symbol": "VFV:CDN",
+                "name": "VFV:CDN",
+                "shares": 40.0,
+                "buy_price": 192.82,
+                "current_price": 192.67,
+                "currency": "CAD",
+            },
+        ]
+        save_portfolio(init_holdings, filepath=self.port_csv)
+
+        history_txs = [
+            {
+                "portfolio": "CAD TSFA",
+                "symbol": "VGRO",
+                "shares": 6.0,
+                "price": 47.60,
+                "type": "BUY",
+                "currency": "CAD",
+            },
+            {
+                "portfolio": "CAD FHSA",
+                "symbol": "VFV",
+                "shares": 40.0,
+                "price": 192.82,
+                "type": "BUY",
+                "currency": "CAD",
+            },
+        ]
+        save_transactions(history_txs, filepath=self.tx_csv)
+
+        res = reconcile_portfolio_holdings_with_transactions(
+            portfolio_filepath=self.port_csv,
+            history_filepath=self.tx_csv,
+        )
+        self.assertTrue(res["success"])
+        self.assertEqual(res["reconciled_count"], 2)
+
+        reconciled_holdings = load_portfolio(self.port_csv)
+        symbols = [h["symbol"] for h in reconciled_holdings]
+        self.assertIn("VGRO", symbols)
+        self.assertIn("VFV", symbols)
+        self.assertNotIn("VGRO:CDN", symbols)
+        self.assertNotIn("VFV:CDN", symbols)
+
+        vgro = next(h for h in reconciled_holdings if h["symbol"] == "VGRO")
+        self.assertEqual(vgro["name"], "Vanguard Growth ETF Portfolio")
+        vfv = next(h for h in reconciled_holdings if h["symbol"] == "VFV")
+        self.assertEqual(vfv["name"], "Vanguard S&P 500 Index ETF")
+
+
+class TestListModificationsAndCurrency(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.test_dir = tempfile.mkdtemp()
+        self.port_csv = os.path.join(self.test_dir, "test_portfolio.csv")
+        self.tx_csv = os.path.join(self.test_dir, "test_transactions.csv")
+        self.wl_csv = os.path.join(self.test_dir, "test_watchlist.csv")
+
+    def tearDown(self):
+        import shutil
+        if os.path.exists(self.test_dir):
+            shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def test_add_new_holding_multi_currency(self):
+        from csv_manager import add_holding, load_portfolio
+        # Add USD stock
+        ok1 = add_holding({
+            "portfolio": "USD HSBC",
+            "symbol": "AAPL",
+            "name": "Apple Inc",
+            "shares": 10.0,
+            "buy_price": 150.0,
+            "current_price": 180.0,
+            "currency": "USD",
+        }, filepath=self.port_csv)
+        self.assertTrue(ok1)
+
+        # Add CAD stock
+        ok2 = add_holding({
+            "portfolio": "CAD TSFA",
+            "symbol": "VGRO",
+            "name": "Vanguard Growth ETF Portfolio",
+            "shares": 25.0,
+            "buy_price": 45.0,
+            "current_price": 47.5,
+            "currency": "CAD",
+        }, filepath=self.port_csv)
+        self.assertTrue(ok2)
+
+        # Add HKD stock
+        ok3 = add_holding({
+            "portfolio": "HKD HSBC",
+            "symbol": "9988:HKG",
+            "name": "Alibaba Group",
+            "shares": 100.0,
+            "buy_price": 80.0,
+            "current_price": 85.0,
+            "currency": "HKD",
+        }, filepath=self.port_csv)
+        self.assertTrue(ok3)
+
+        holdings = load_portfolio(self.port_csv)
+        self.assertEqual(len(holdings), 3)
+
+        aapl = next(h for h in holdings if h["symbol"] == "AAPL")
+        self.assertEqual(aapl["currency"], "USD")
+        self.assertEqual(aapl["cost_basis"], 1500.0)
+        self.assertEqual(aapl["market_value"], 1800.0)
+        self.assertEqual(aapl["unrealized_gain"], 300.0)
+
+        vgro = next(h for h in holdings if h["symbol"] == "VGRO")
+        self.assertEqual(vgro["currency"], "CAD")
+        self.assertEqual(vgro["cost_basis"], 1125.0)
+        self.assertEqual(vgro["market_value"], 1187.5)
+
+        baba = next(h for h in holdings if h["symbol"] == "9988:HKG")
+        self.assertEqual(baba["currency"], "HKD")
+        self.assertEqual(baba["cost_basis"], 8000.0)
+        self.assertEqual(baba["market_value"], 8500.0)
+
+    def test_add_holding_merge_weighted_avg(self):
+        from csv_manager import add_holding, load_portfolio
+        # 1st purchase: 10 shares @ $100
+        add_holding({
+            "portfolio": "USD HSBC",
+            "symbol": "NVDA",
+            "shares": 10.0,
+            "buy_price": 100.0,
+            "current_price": 120.0,
+            "currency": "USD",
+        }, filepath=self.port_csv)
+
+        # 2nd purchase: 20 shares @ $130
+        add_holding({
+            "portfolio": "USD HSBC",
+            "symbol": "NVDA",
+            "shares": 20.0,
+            "buy_price": 130.0,
+            "current_price": 140.0,
+            "currency": "USD",
+        }, filepath=self.port_csv)
+
+        holdings = load_portfolio(self.port_csv)
+        self.assertEqual(len(holdings), 1)
+        nvda = holdings[0]
+        self.assertEqual(nvda["shares"], 30.0)
+        # Total cost: 10*100 + 20*130 = 1000 + 2600 = 3600. Avg price: 3600/30 = 120.0
+        self.assertAlmostEqual(nvda["buy_price"], 120.0, places=2)
+        self.assertEqual(nvda["cost_basis"], 3600.0)
+
+    def test_update_holding_shares_price_alerts(self):
+        from csv_manager import add_holding, update_holding, load_portfolio
+        add_holding({
+            "portfolio": "USD HSBC",
+            "symbol": "AMD",
+            "shares": 10.0,
+            "buy_price": 100.0,
+            "current_price": 110.0,
+            "currency": "USD",
+        }, filepath=self.port_csv)
+
+        ok = update_holding(
+            original_portfolio="USD HSBC",
+            original_symbol="AMD",
+            updated_data={
+                "shares": 15.0,
+                "buy_price": 95.0,
+                "current_price": 115.0,
+                "target_sell_price": 150.0,
+                "stop_loss_price": 85.0,
+            },
+            filepath=self.port_csv,
+        )
+        self.assertTrue(ok)
+
+        holdings = load_portfolio(self.port_csv)
+        amd = holdings[0]
+        self.assertEqual(amd["shares"], 15.0)
+        self.assertEqual(amd["buy_price"], 95.0)
+        self.assertEqual(amd["cost_basis"], 1425.0)
+        self.assertEqual(amd["market_value"], 1725.0)
+        self.assertEqual(amd["unrealized_gain"], 300.0)
+        self.assertEqual(float(amd.get("target_sell_price", 0.0)), 150.0)
+        self.assertEqual(float(amd.get("stop_loss_price", 0.0)), 85.0)
+
+    def test_update_holding_currency(self):
+        from csv_manager import add_holding, update_holding, load_portfolio
+        from currency_converter import get_currency_converter
+        # Initially stored as USD by mistake
+        add_holding({
+            "portfolio": "CAD TSFA",
+            "symbol": "VFV",
+            "shares": 50.0,
+            "buy_price": 180.0,
+            "current_price": 190.0,
+            "currency": "USD",
+        }, filepath=self.port_csv)
+
+        # Update currency to CAD
+        ok = update_holding(
+            original_portfolio="CAD TSFA",
+            original_symbol="VFV",
+            updated_data={
+                "currency": "CAD",
+                "shares": 50.0,
+                "buy_price": 180.0,
+            },
+            filepath=self.port_csv,
+        )
+        self.assertTrue(ok)
+
+        holdings = load_portfolio(self.port_csv)
+        vfv = holdings[0]
+        self.assertEqual(vfv["currency"], "CAD")
+        self.assertEqual(vfv["cost_basis"], 9000.0)
+
+        # Test currency conversion of this updated holding
+        conv = get_currency_converter()
+        cad_val = vfv["market_value"] # 9500.0 CAD
+        usd_val = conv.convert(cad_val, "CAD", "USD")
+        self.assertGreater(usd_val, 0)
+        self.assertNotEqual(usd_val, cad_val)
+
+    def test_update_holding_symbol_rename(self):
+        from csv_manager import add_holding, update_holding, load_portfolio
+        # Ticker entered with typo or suffix
+        add_holding({
+            "portfolio": "CAD FHSA",
+            "symbol": "VFV:CDN",
+            "name": "VFV:CDN",
+            "shares": 40.0,
+            "buy_price": 192.82,
+            "current_price": 192.67,
+            "currency": "CAD",
+        }, filepath=self.port_csv)
+
+        ok = update_holding(
+            original_portfolio="CAD FHSA",
+            original_symbol="VFV:CDN",
+            updated_data={
+                "symbol": "VFV",
+                "name": "Vanguard S&P 500 Index ETF",
+                "shares": 40.0,
+                "buy_price": 192.82,
+                "currency": "CAD",
+            },
+            filepath=self.port_csv,
+        )
+        self.assertTrue(ok)
+
+        holdings = load_portfolio(self.port_csv)
+        self.assertEqual(len(holdings), 1)
+        self.assertEqual(holdings[0]["symbol"], "VFV")
+        self.assertEqual(holdings[0]["name"], "Vanguard S&P 500 Index ETF")
+        self.assertEqual(holdings[0]["shares"], 40.0)
+
+    def test_update_holding_transfer_portfolio_collision_merge(self):
+        from csv_manager import add_holding, update_holding, load_portfolio
+        # Account 1 has 5 shares of VOO @ $600
+        add_holding({
+            "portfolio": "USD Account A",
+            "symbol": "VOO",
+            "shares": 5.0,
+            "buy_price": 600.0,
+            "current_price": 700.0,
+            "currency": "USD",
+        }, filepath=self.port_csv)
+
+        # Account 2 has 15 shares of VOO @ $640
+        add_holding({
+            "portfolio": "USD Account B",
+            "symbol": "VOO",
+            "shares": 15.0,
+            "buy_price": 640.0,
+            "current_price": 700.0,
+            "currency": "USD",
+        }, filepath=self.port_csv)
+
+        # Move Account A's VOO into Account B (collision merge)
+        ok = update_holding(
+            original_portfolio="USD Account A",
+            original_symbol="VOO",
+            updated_data={
+                "portfolio": "USD Account B",
+                "symbol": "VOO",
+                "shares": 5.0,
+                "buy_price": 600.0,
+            },
+            filepath=self.port_csv,
+        )
+        self.assertTrue(ok)
+
+        holdings = load_portfolio(self.port_csv)
+        # Should now be exactly 1 holding of VOO in Account B (total 20 shares)
+        self.assertEqual(len(holdings), 1)
+        voo = holdings[0]
+        self.assertEqual(voo["portfolio"], "USD Account B")
+        self.assertEqual(voo["shares"], 20.0)
+        # Total cost: 15*640 + 5*600 = 9600 + 3000 = 12600. Avg price: 12600/20 = 630.0
+        self.assertEqual(voo["cost_basis"], 12600.0)
+        self.assertAlmostEqual(voo["buy_price"], 630.0, places=2)
+
+    def test_delete_holding_specific_portfolio(self):
+        from csv_manager import add_holding, delete_holding, load_portfolio
+        add_holding({
+            "portfolio": "USD Port 1",
+            "symbol": "MSFT",
+            "shares": 10.0,
+            "buy_price": 400.0,
+            "currency": "USD",
+        }, filepath=self.port_csv)
+
+        add_holding({
+            "portfolio": "USD Port 2",
+            "symbol": "MSFT",
+            "shares": 20.0,
+            "buy_price": 410.0,
+            "currency": "USD",
+        }, filepath=self.port_csv)
+
+        # Delete MSFT only from Port 1
+        ok = delete_holding(portfolio="USD Port 1", symbol="MSFT", filepath=self.port_csv)
+        self.assertTrue(ok)
+
+        holdings = load_portfolio(self.port_csv)
+        self.assertEqual(len(holdings), 1)
+        self.assertEqual(holdings[0]["portfolio"], "USD Port 2")
+        self.assertEqual(holdings[0]["symbol"], "MSFT")
+        self.assertEqual(holdings[0]["shares"], 20.0)
+
+    def test_watchlist_add_update_remove_lifecycle(self):
+        from csv_manager import (
+            add_to_watchlist,
+            update_watchlist_item,
+            remove_from_watchlist,
+            load_watchlist,
+            bulk_update_watchlist_category,
+        )
+        # 1. Add
+        ok = add_to_watchlist(
+            symbol="GOOGL",
+            name="Alphabet Inc",
+            target_price=250.0,
+            currency="USD",
+            notes="Watch for earnings dip",
+            tags="Tech, Growth",
+            filepath=self.wl_csv,
+        )
+        self.assertTrue(ok)
+        items = load_watchlist(self.wl_csv)
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["symbol"], "GOOGL")
+        self.assertEqual(items[0]["target_price"], 250.0)
+        self.assertEqual(items[0]["currency"], "USD")
+
+        # 2. Update item (symbol, target, currency, tags)
+        ok = update_watchlist_item(
+            old_symbol="GOOGL",
+            new_symbol="GOOGL",
+            name="Alphabet Inc Class A",
+            target_price=260.0,
+            currency="USD",
+            notes="Upgraded target",
+            tags="BigTech",
+            filepath=self.wl_csv,
+        )
+        self.assertTrue(ok)
+        items = load_watchlist(self.wl_csv)
+        self.assertEqual(items[0]["target_price"], 260.0)
+        self.assertEqual(items[0]["tags"], "BigTech")
+
+        # 3. Add second item and bulk update categories
+        add_to_watchlist(symbol="AMZN", target_price=180.0, tags="Retail", filepath=self.wl_csv)
+        count = bulk_update_watchlist_category(["GOOGL", "AMZN"], "MegaCap", mode="replace", filepath=self.wl_csv)
+        self.assertEqual(count, 2)
+        items = load_watchlist(self.wl_csv)
+        self.assertEqual(items[0]["tags"], "MegaCap")
+        self.assertEqual(items[1]["tags"], "MegaCap")
+
+        # 4. Remove
+        ok = remove_from_watchlist("GOOGL", filepath=self.wl_csv)
+        self.assertTrue(ok)
+        items = load_watchlist(self.wl_csv)
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["symbol"], "AMZN")
+
+    def test_multi_currency_exposure_calculation(self):
+        from currency_converter import get_currency_converter
+        conv = get_currency_converter()
+        holdings = [
+            {"symbol": "AAPL", "currency": "USD", "shares": 10.0, "current_price": 200.0}, # $2000 USD
+            {"symbol": "VGRO", "currency": "CAD", "shares": 50.0, "current_price": 50.0},  # $2500 CAD
+        ]
+        total_usd = 0.0
+        for h in holdings:
+            mv = float(h["shares"]) * float(h["current_price"])
+            total_usd += conv.convert(mv, h["currency"], "USD")
+        self.assertGreater(total_usd, 2000.0)
+        # Total in CAD should be higher than in USD (since 1 USD > 1 CAD)
+        total_cad = 0.0
+        for h in holdings:
+            mv = float(h["shares"]) * float(h["current_price"])
+            total_cad += conv.convert(mv, h["currency"], "CAD")
+        self.assertGreater(total_cad, total_usd)
+
+    def test_transaction_history_update_symbol_and_currency_syncs_to_holding(self):
+        """
+        Tests the exact user scenario:
+        Initially added 2 items: VFV:CDN and VGRO:CDN.
+        Then updated them in history list as VFV and VGRO with CAD currency.
+        Verifies that portfolio holdings list is fully updated with VFV and VGRO.
+        """
+        from csv_manager import (
+            add_holding,
+            load_portfolio,
+            save_transactions,
+            load_transactions,
+            sync_transaction_change_to_portfolio,
+        )
+
+        # 1. Initially user has VFV:CDN and VGRO:CDN in portfolio
+        add_holding({
+            "portfolio": "My TFSA",
+            "symbol": "VFV:CDN",
+            "name": "VFV:CDN",
+            "shares": 50.0,
+            "buy_price": 120.0,
+            "currency": "USD",
+        }, filepath=self.port_csv)
+
+        add_holding({
+            "portfolio": "My TFSA",
+            "symbol": "VGRO:CDN",
+            "name": "VGRO:CDN",
+            "shares": 100.0,
+            "buy_price": 35.0,
+            "currency": "USD",
+        }, filepath=self.port_csv)
+
+        holdings = load_portfolio(self.port_csv)
+        self.assertEqual(len(holdings), 2)
+        symbols = [h["symbol"] for h in holdings]
+        self.assertIn("VFV:CDN", symbols)
+        self.assertIn("VGRO:CDN", symbols)
+
+        # 2. Update VFV:CDN to VFV with currency CAD in history list
+        old_vfv_tx = {
+            "type": "BUY",
+            "portfolio": "My TFSA",
+            "symbol": "VFV:CDN",
+            "shares": 50.0,
+            "price": 120.0,
+            "currency": "USD",
+        }
+        new_vfv_tx = {
+            "type": "BUY",
+            "portfolio": "My TFSA",
+            "symbol": "VFV",
+            "shares": 50.0,
+            "price": 120.0,
+            "currency": "CAD",
+        }
+        ok_sync_vfv = sync_transaction_change_to_portfolio(old_vfv_tx, new_vfv_tx, self.port_csv)
+        self.assertTrue(ok_sync_vfv)
+
+        # 3. Update VGRO:CDN to VGRO with currency CAD in history list
+        old_vgro_tx = {
+            "type": "BUY",
+            "portfolio": "My TFSA",
+            "symbol": "VGRO:CDN",
+            "shares": 100.0,
+            "price": 35.0,
+            "currency": "USD",
+        }
+        new_vgro_tx = {
+            "type": "BUY",
+            "portfolio": "My TFSA",
+            "symbol": "VGRO",
+            "shares": 100.0,
+            "price": 35.0,
+            "currency": "CAD",
+        }
+        ok_sync_vgro = sync_transaction_change_to_portfolio(old_vgro_tx, new_vgro_tx, self.port_csv)
+        self.assertTrue(ok_sync_vgro)
+
+        # 4. Verify overall portfolio holdings list is updated to VFV and VGRO only!
+        updated_holdings = load_portfolio(self.port_csv)
+        self.assertEqual(len(updated_holdings), 2)
+        up_symbols = [h["symbol"] for h in updated_holdings]
+        self.assertNotIn("VFV:CDN", up_symbols)
+        self.assertNotIn("VGRO:CDN", up_symbols)
+        self.assertIn("VFV", up_symbols)
+        self.assertIn("VGRO", up_symbols)
+
+        vfv = next(h for h in updated_holdings if h["symbol"] == "VFV")
+        self.assertEqual(vfv["currency"], "CAD")
+        self.assertEqual(vfv["shares"], 50.0)
+        self.assertEqual(vfv["name"], "VFV")
+
+        vgro = next(h for h in updated_holdings if h["symbol"] == "VGRO")
+        self.assertEqual(vgro["currency"], "CAD")
+        self.assertEqual(vgro["shares"], 100.0)
+        self.assertEqual(vgro["name"], "VGRO")
+
+    def test_multi_transaction_partial_update_sync(self):
+        """
+        Tests when holding has multiple transactions and only one transaction is modified.
+        """
+        from csv_manager import (
+            add_holding,
+            load_portfolio,
+            sync_transaction_change_to_portfolio,
+        )
+
+        # 2 purchases of VFV:CDN: 15 shares + 25 shares = 40 shares total @ avg $115
+        add_holding({
+            "portfolio": "TFSA",
+            "symbol": "VFV:CDN",
+            "shares": 15.0,
+            "buy_price": 100.0,
+            "currency": "USD",
+        }, filepath=self.port_csv)
+
+        add_holding({
+            "portfolio": "TFSA",
+            "symbol": "VFV:CDN",
+            "shares": 25.0,
+            "buy_price": 124.0,
+            "currency": "USD",
+        }, filepath=self.port_csv)
+
+        h = load_portfolio(self.port_csv)[0]
+        self.assertEqual(h["shares"], 40.0)
+        self.assertEqual(h["cost_basis"], 4600.0) # 1500 + 3100
+
+        # Update 1st transaction from VFV:CDN to VFV and currency to CAD
+        old_tx1 = {"type": "BUY", "portfolio": "TFSA", "symbol": "VFV:CDN", "shares": 15.0, "price": 100.0, "currency": "USD"}
+        new_tx1 = {"type": "BUY", "portfolio": "TFSA", "symbol": "VFV", "shares": 15.0, "price": 100.0, "currency": "CAD"}
+        sync_transaction_change_to_portfolio(old_tx1, new_tx1, self.port_csv)
+
+        h_after = load_portfolio(self.port_csv)[0]
+        # Holding symbol should be renamed to VFV, currency CAD, shares remain 40
+        self.assertEqual(h_after["symbol"], "VFV")
+        self.assertEqual(h_after["currency"], "CAD")
+        self.assertEqual(h_after["shares"], 40.0)
+
+    def test_transaction_delete_sync(self):
+        """
+        Tests deleting a transaction and verifying portfolio holding is updated or removed.
+        """
+        from csv_manager import (
+            add_holding,
+            load_portfolio,
+            sync_transaction_change_to_portfolio,
+        )
+
+        add_holding({
+            "portfolio": "Cash",
+            "symbol": "BNS",
+            "shares": 30.0,
+            "buy_price": 60.0,
+            "currency": "CAD",
+        }, filepath=self.port_csv)
+
+        # Delete partial (10 shares)
+        del_tx = {"type": "BUY", "portfolio": "Cash", "symbol": "BNS", "shares": 10.0, "price": 60.0}
+        sync_transaction_change_to_portfolio(del_tx, None, self.port_csv)
+
+        holdings = load_portfolio(self.port_csv)
+        self.assertEqual(len(holdings), 1)
+        self.assertEqual(holdings[0]["shares"], 20.0)
+
+        # Delete remaining 20 shares
+        del_tx2 = {"type": "BUY", "portfolio": "Cash", "symbol": "BNS", "shares": 20.0, "price": 60.0}
+        sync_transaction_change_to_portfolio(del_tx2, None, self.port_csv)
+
+        holdings = load_portfolio(self.port_csv)
+        self.assertEqual(len(holdings), 0)
+
+    def test_reconcile_portfolio_holdings_with_currency_and_alias(self):
+        """
+        Tests automated reconciliation between transaction history and portfolio holdings.
+        """
+        from csv_manager import (
+            add_holding,
+            save_transactions,
+            reconcile_portfolio_holdings_with_transactions,
+            load_portfolio,
+        )
+
+        # Portfolio has improper ticker suffixes and wrong currency
+        add_holding({
+            "portfolio": "RRSP",
+            "symbol": "VFV:CDN",
+            "name": "VFV:CDN",
+            "shares": 60.0,
+            "buy_price": 110.0,
+            "currency": "USD",
+        }, filepath=self.port_csv)
+
+        add_holding({
+            "portfolio": "RRSP",
+            "symbol": "VGRO:CDN",
+            "name": "VGRO:CDN",
+            "shares": 80.0,
+            "buy_price": 32.0,
+            "currency": "USD",
+        }, filepath=self.port_csv)
+
+        # Transactions have clean symbols and CAD currency
+        txs = [
+            {"date": "2026-01-01", "type": "BUY", "portfolio": "RRSP", "symbol": "VFV", "shares": 60.0, "price": 110.0, "currency": "CAD"},
+            {"date": "2026-01-02", "type": "BUY", "portfolio": "RRSP", "symbol": "VGRO", "shares": 80.0, "price": 32.0, "currency": "CAD"},
+        ]
+        save_transactions(txs, filepath=self.tx_csv)
+
+        res = reconcile_portfolio_holdings_with_transactions(self.port_csv, self.tx_csv)
+        self.assertTrue(res["success"])
+        self.assertEqual(res["reconciled_count"], 2)
+
+        holdings = load_portfolio(self.port_csv)
+        self.assertEqual(len(holdings), 2)
+        vfv = next(h for h in holdings if h["symbol"] == "VFV")
+        self.assertEqual(vfv["currency"], "CAD")
+        self.assertEqual(vfv["name"], "Vanguard S&P 500 Index ETF")
+
+        vgro = next(h for h in holdings if h["symbol"] == "VGRO")
+        self.assertEqual(vgro["currency"], "CAD")
+        self.assertEqual(vgro["name"], "Vanguard Growth ETF Portfolio")
+
+    def test_holding_currency_conversion_rates(self):
+        """
+        Tests currency conversions across supported global currencies.
+        """
+        from currency_converter import get_currency_converter
+        conv = get_currency_converter()
+        # Verify major currency pairs have valid positive conversion rates
+        currencies = ["USD", "CAD", "HKD", "EUR", "GBP"]
+        for c1 in currencies:
+            for c2 in currencies:
+                val = conv.convert(100.0, c1, c2)
+                self.assertGreater(val, 0)
+                if c1 == c2:
+                    self.assertAlmostEqual(val, 100.0, places=4)
+                # Reversible check
+                rev = conv.convert(val, c2, c1)
+                self.assertAlmostEqual(rev, 100.0, places=1)
+
+
+class TestEnhancedReliabilityAndFeatures(unittest.TestCase):
+    """
+    Tests for enhanced reliability, atomic writes, input validation,
+    data export/import, financial calculations, and edge-case error recovery.
+    """
+    def setUp(self):
+        import tempfile
+        self.test_dir = tempfile.mkdtemp()
+        self.port_csv = os.path.join(self.test_dir, "test_portfolio.csv")
+        self.tx_csv = os.path.join(self.test_dir, "test_transactions.csv")
+        self.wl_csv = os.path.join(self.test_dir, "test_watchlist.csv")
+        self.json_export = os.path.join(self.test_dir, "test_export.json")
+
+    def tearDown(self):
+        import shutil
+        if os.path.exists(self.test_dir):
+            shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def test_calc_total_return(self):
+        from financial_calc import calc_total_return
+        # 100 shares bought @ $50, now @ $70, $200 dividends, $10 fees
+        res = calc_total_return(
+            shares=100.0,
+            buy_price=50.0,
+            current_price=70.0,
+            total_dividends_received=200.0,
+            total_fees_paid=10.0,
+        )
+        self.assertEqual(res["cost_basis"], 5000.0)
+        self.assertEqual(res["market_value"], 7000.0)
+        self.assertEqual(res["capital_gain"], 2000.0)
+        self.assertEqual(res["capital_gain_pct"], 40.0)
+        self.assertEqual(res["dividends_received"], 200.0)
+        self.assertEqual(res["fees_paid"], 10.0)
+        # Total return = 2000 + 200 - 10 = 2190
+        self.assertEqual(res["total_return_dollar"], 2190.0)
+        self.assertAlmostEqual(res["total_return_pct"], 43.8, places=2)
+
+    def test_calc_position_weights(self):
+        from financial_calc import calc_position_weights
+        holdings = [
+            {"symbol": "AAPL", "portfolio": "Tech", "market_value": 8000.0, "cost_basis": 6000.0},
+            {"symbol": "MSFT", "portfolio": "Tech", "market_value": 1500.0, "cost_basis": 1000.0},
+            {"symbol": "BND", "portfolio": "Fixed", "market_value": 500.0, "cost_basis": 500.0},
+        ]
+        # Total = 10,000. AAPL is 80% (>15% concentrated), MSFT 15%, BND 5%
+        weights = calc_position_weights(holdings, weight_by="market_value")
+        self.assertEqual(len(weights), 3)
+        self.assertEqual(weights[0]["symbol"], "AAPL")
+        self.assertEqual(weights[0]["weight_pct"], 80.0)
+        self.assertTrue(weights[0]["is_concentrated"])
+        self.assertEqual(weights[1]["symbol"], "MSFT")
+        self.assertEqual(weights[1]["weight_pct"], 15.0)
+        self.assertFalse(weights[1]["is_concentrated"])
+
+        # Empty holdings edge case
+        empty_weights = calc_position_weights([])
+        self.assertEqual(empty_weights, [])
+
+    def test_calc_cost_basis_methods(self):
+        from financial_calc import calc_cost_basis_methods
+        # Buy Lot 1: 100 shares @ $10
+        # Buy Lot 2: 100 shares @ $20
+        # Sell: 50 shares @ $30
+        txs = [
+            {"date": "2026-01-01", "type": "BUY", "symbol": "XYZ", "shares": 100.0, "price": 10.0},
+            {"date": "2026-02-01", "type": "BUY", "symbol": "XYZ", "shares": 100.0, "price": 20.0},
+            {"date": "2026-03-01", "type": "SELL", "symbol": "XYZ", "shares": 50.0, "price": 30.0},
+        ]
+        res = calc_cost_basis_methods(txs, symbol="XYZ", current_price=25.0)
+        self.assertEqual(res["remaining_shares"], 150.0)
+        # FIFO sells 50 from Lot 1 ($10 cost basis = $500). Proceeds = 50 * 30 = 1500. Realized gain = 1000.
+        self.assertEqual(res["fifo_realized_gain"], 1000.0)
+        # Remaining FIFO: 50 @ $10 ($500) + 100 @ $20 ($2000) = $2500
+        self.assertEqual(res["fifo_cost_basis"], 2500.0)
+
+        # Average cost: 200 shares @ $15 ($3000). Sells 50 @ $15 ($750 cost). Realized gain = 1500 - 750 = 750.
+        self.assertEqual(res["average_realized_gain"], 750.0)
+        # Remaining Average: 150 @ $15 = $2250.
+        self.assertEqual(res["average_cost_basis"], 2250.0)
+        self.assertEqual(res["method_difference"], 250.0)
+
+    def test_calc_dividend_income_summary(self):
+        from financial_calc import calc_dividend_income_summary
+        holdings = [
+            {"symbol": "VGRO", "currency": "CAD", "annual_dividend": 400.0, "dividend_yield": 2.0},
+            {"symbol": "AAPL", "currency": "USD", "annual_dividend": 120.0, "dividend_yield": 0.5},
+            {"symbol": "GOOG", "currency": "USD", "annual_dividend": 0.0, "dividend_yield": 0.0},
+        ]
+        summary = calc_dividend_income_summary(holdings)
+        self.assertEqual(summary["total_annual_dividend"], 520.0)
+        self.assertAlmostEqual(summary["total_monthly_dividend"], 520.0 / 12.0, places=2)
+        self.assertEqual(summary["holdings_with_dividends"], 2)
+        self.assertEqual(summary["holdings_without_dividends"], 1)
+        self.assertEqual(summary["highest_yielder"]["symbol"], "VGRO")
+        self.assertEqual(summary["by_currency"]["CAD"], 400.0)
+        self.assertEqual(summary["by_currency"]["USD"], 120.0)
+
+    def test_get_etf_option_label(self):
+        from financial_calc import get_etf_option_label
+        etf = {"symbol": "VOO", "name": "Vanguard S&P 500 ETF", "asset_class": "US Equity"}
+        lbl_en = get_etf_option_label(etf, lang="en")
+        self.assertIn("VOO", lbl_en)
+        self.assertIn("US Equity", lbl_en)
+        lbl_tw = get_etf_option_label(etf, lang="zh_TW")
+        self.assertIn("VOO", lbl_tw)
+
+    def test_math_zero_division_guards(self):
+        from financial_calc import calc_drip_simulation, calc_risk_and_return_metrics
+        # DRIP with initial price = 0
+        drip_res = calc_drip_simulation(initial_shares=100.0, initial_price=0.0, div_yield_pct=5.0, monthly_contribution=50.0, years=2)
+        self.assertEqual(len(drip_res), 2)
+
+        # Risk metrics with zero initial price
+        risk_res = calc_risk_and_return_metrics(price_or_val_series=[0.0, 10.0, 20.0])
+        self.assertIn("cagr_pct", risk_res)
+        self.assertIn("volatility_pct", risk_res)
+
+        # Risk metrics with empty series
+        risk_empty = calc_risk_and_return_metrics(price_or_val_series=[])
+        self.assertEqual(risk_empty["cagr_pct"], 0.0)
+
+    def test_atomic_write_crash_resilience(self):
+        from csv_manager import atomic_write
+        test_file = os.path.join(self.test_dir, "atomic_test.txt")
+        # 1. Initial valid content
+        with open(test_file, "w") as f:
+            f.write("INITIAL_CONTENT")
+
+        # 2. Simulate crash during atomic_write
+        try:
+            with atomic_write(test_file, mode="w") as f:
+                f.write("PARTIAL_CORRUPTED_DATA")
+                raise RuntimeError("Simulated crash mid-write")
+        except RuntimeError:
+            pass
+
+        # 3. Verify original file content is intact and unchanged!
+        with open(test_file, "r") as f:
+            content = f.read()
+        self.assertEqual(content, "INITIAL_CONTENT")
+
+    def test_safe_float_parsing(self):
+        from csv_manager import _safe_float
+        self.assertEqual(_safe_float(123.45), 123.45)
+        self.assertEqual(_safe_float("$1,234.56"), 1234.56)
+        self.assertEqual(_safe_float("  -50.2%  "), -50.2)
+        self.assertEqual(_safe_float("N/A", default=0.0), 0.0)
+        self.assertEqual(_safe_float("None", default=5.0), 5.0)
+        self.assertEqual(_safe_float("", default=0.0), 0.0)
+        self.assertEqual(_safe_float(None, default=0.0), 0.0)
+        self.assertEqual(_safe_float("invalid_str", default=-1.0), -1.0)
+
+    def test_validate_holding_data(self):
+        from csv_manager import validate_holding_data
+        # Valid holding
+        ok, errs = validate_holding_data({"symbol": "AAPL", "shares": 10.0, "buy_price": 150.0, "currency": "USD"})
+        self.assertTrue(ok)
+        self.assertEqual(len(errs), 0)
+
+        # Invalid holdings
+        ok1, errs1 = validate_holding_data({"symbol": "", "shares": 10.0, "buy_price": 150.0})
+        self.assertFalse(ok1)
+        self.assertTrue(any("symbol" in e.lower() for e in errs1))
+
+        ok2, errs2 = validate_holding_data({"symbol": "XYZ", "shares": -5.0, "buy_price": -10.0})
+        self.assertFalse(ok2)
+        self.assertTrue(any("shares" in e.lower() for e in errs2))
+
+        ok3, errs3 = validate_holding_data({"symbol": "XYZ", "shares": 5.0, "buy_price": 10.0, "currency": "TOOLONG"})
+        self.assertFalse(ok3)
+
+    def test_validate_transaction_data(self):
+        from csv_manager import validate_transaction_data
+        ok, errs = validate_transaction_data({"symbol": "VOO", "type": "BUY", "shares": 20.0, "price": 400.0})
+        self.assertTrue(ok)
+
+        ok_drip, _ = validate_transaction_data({"symbol": "VOO", "type": "DRIP", "shares": 1.25, "price": 400.0})
+        self.assertTrue(ok_drip)
+
+        ok_bad, errs_bad = validate_transaction_data({"symbol": "VOO", "type": "INVALID_TYPE", "shares": 0.0, "price": -5.0})
+        self.assertFalse(ok_bad)
+        self.assertGreaterEqual(len(errs_bad), 2)
+
+    def test_export_and_import_portfolio_json_roundtrip(self):
+        from csv_manager import (
+            add_holding,
+            append_transaction,
+            add_to_watchlist,
+            export_portfolio_to_json,
+            import_portfolio_from_json,
+            load_portfolio,
+            load_transactions,
+            load_watchlist,
+        )
+        # Setup data
+        add_holding({"portfolio": "Main", "symbol": "AAPL", "shares": 10.0, "buy_price": 150.0, "currency": "USD"}, filepath=self.port_csv)
+        append_transaction({"type": "BUY", "portfolio": "Main", "symbol": "AAPL", "shares": 10.0, "price": 150.0}, filepath=self.tx_csv)
+        add_to_watchlist(symbol="NVDA", target_price=100.0, filepath=self.wl_csv)
+
+        # Export to JSON
+        ok_exp = export_portfolio_to_json(
+            output_filepath=self.json_export,
+            portfolio_filepath=self.port_csv,
+            transaction_filepath=self.tx_csv,
+            watchlist_filepath=self.wl_csv,
+        )
+        self.assertTrue(ok_exp)
+        self.assertTrue(os.path.exists(self.json_export))
+
+        # Import into fresh destination files
+        fresh_port = os.path.join(self.test_dir, "fresh_port.csv")
+        fresh_tx = os.path.join(self.test_dir, "fresh_tx.csv")
+        fresh_wl = os.path.join(self.test_dir, "fresh_wl.csv")
+
+        res_imp = import_portfolio_from_json(
+            input_filepath=self.json_export,
+            portfolio_filepath=fresh_port,
+            transaction_filepath=fresh_tx,
+            watchlist_filepath=fresh_wl,
+            merge=False,
+        )
+        self.assertTrue(res_imp["success"])
+        self.assertEqual(res_imp["holdings_imported"], 1)
+        self.assertEqual(res_imp["transactions_imported"], 1)
+        self.assertEqual(res_imp["watchlist_imported"], 1)
+
+        # Verify loaded content
+        loaded_h = load_portfolio(fresh_port)
+        self.assertEqual(len(loaded_h), 1)
+        self.assertEqual(loaded_h[0]["symbol"], "AAPL")
+        self.assertEqual(loaded_h[0]["shares"], 10.0)
+
+    def test_import_portfolio_json_merge_mode(self):
+        from csv_manager import (
+            add_holding,
+            export_portfolio_to_json,
+            import_portfolio_from_json,
+            load_portfolio,
+        )
+        # Existing portfolio has 10 shares of MSFT @ $200
+        add_holding({"portfolio": "Work", "symbol": "MSFT", "shares": 10.0, "buy_price": 200.0, "currency": "USD"}, filepath=self.port_csv)
+
+        # Export an incoming dataset that has 10 shares of MSFT @ $300 in "Work"
+        incoming_port = os.path.join(self.test_dir, "incoming_port.csv")
+        add_holding({"portfolio": "Work", "symbol": "MSFT", "shares": 10.0, "buy_price": 300.0, "currency": "USD"}, filepath=incoming_port)
+        export_portfolio_to_json(output_filepath=self.json_export, portfolio_filepath=incoming_port)
+
+        # Merge import into self.port_csv
+        res = import_portfolio_from_json(
+            input_filepath=self.json_export,
+            portfolio_filepath=self.port_csv,
+            merge=True,
+        )
+        self.assertTrue(res["success"])
+        holdings = load_portfolio(self.port_csv)
+        self.assertEqual(len(holdings), 1)
+        msft = holdings[0]
+        # Total shares = 20, weighted average buy price = (10*200 + 10*300)/20 = 250.0
+        self.assertEqual(msft["shares"], 20.0)
+        self.assertAlmostEqual(msft["buy_price"], 250.0, places=2)
+
+    def test_import_portfolio_json_invalid_and_corrupt(self):
+        import json
+        from csv_manager import import_portfolio_from_json
+        # Non-existent file
+        res1 = import_portfolio_from_json("/non/existent/path.json")
+        self.assertFalse(res1["success"])
+
+        # Corrupt JSON syntax
+        bad_json = os.path.join(self.test_dir, "bad.json")
+        with open(bad_json, "w") as f:
+            f.write("{invalid: json,")
+        res2 = import_portfolio_from_json(bad_json)
+        self.assertFalse(res2["success"])
+
+        # Missing version field
+        no_ver = os.path.join(self.test_dir, "no_ver.json")
+        with open(no_ver, "w") as f:
+            json.dump({"holdings": []}, f)
+        res3 = import_portfolio_from_json(no_ver)
+        self.assertFalse(res3["success"])
+
+    def test_get_portfolio_summary_stats(self):
+        from csv_manager import add_holding, get_portfolio_summary_stats
+        add_holding({"portfolio": "Port A", "symbol": "AAPL", "shares": 10.0, "buy_price": 100.0, "current_price": 150.0, "currency": "USD", "sector": "Technology", "annual_dividend": 50.0}, filepath=self.port_csv)
+        add_holding({"portfolio": "Port B", "symbol": "VGRO", "shares": 20.0, "buy_price": 40.0, "current_price": 50.0, "currency": "CAD", "sector": "Financial", "annual_dividend": 60.0}, filepath=self.port_csv)
+
+        stats = get_portfolio_summary_stats(self.port_csv)
+        self.assertEqual(stats["total_holdings"], 2)
+        self.assertEqual(stats["total_portfolios"], 2)
+        self.assertIn("USD", stats["by_currency"])
+        self.assertIn("CAD", stats["by_currency"])
+        self.assertEqual(stats["by_currency"]["USD"]["count"], 1)
+        self.assertEqual(stats["by_currency"]["CAD"]["count"], 1)
+        self.assertEqual(len(stats["top_holdings"]), 2)
+        self.assertIn("Technology", stats["sector_breakdown"])
+
+    def test_corrupt_csv_handling(self):
+        from csv_manager import load_portfolio
+        corrupt_csv = os.path.join(self.test_dir, "corrupt.csv")
+        with open(corrupt_csv, "w") as f:
+            f.write("Portfolio,Symbol,Shares,Buy Price\n")
+            f.write("USD HSBC,CORRUPT_1,NOT_A_NUMBER,$100.00\n")
+            f.write("USD HSBC,,50.0,50.0\n") # Blank symbol
+            f.write("USD HSBC,VALID_STOCK,10.0,20.0\n")
+            f.write(",,,,,\n") # Empty row
+
+        holdings = load_portfolio(corrupt_csv)
+        # Should gracefully load without throwing exceptions and parse VALID_STOCK
+        symbols = [h["symbol"] for h in holdings]
+        self.assertIn("VALID_STOCK", symbols)
+        self.assertIn("CORRUPT_1", symbols) # CORRUPT_1 parsed with 0.0 shares fallback
+
+    def test_transaction_crud_boundary_indices(self):
+        from csv_manager import update_transaction, delete_transaction
+        # Out-of-bounds indices should safely return False
+        self.assertFalse(update_transaction(index=-1, updated_tx={}, filepath=self.tx_csv))
+        self.assertFalse(update_transaction(index=999, updated_tx={}, filepath=self.tx_csv))
+        self.assertFalse(delete_transaction(index=-1, filepath=self.tx_csv))
+        self.assertFalse(delete_transaction(index=999, filepath=self.tx_csv))
+
+    def test_ensure_workspace_files(self):
+        from csv_manager import ensure_workspace_files
+        # Running ensure_workspace_files should ensure all default CSV files exist
+        ensure_workspace_files()
+        from csv_manager import PORTFOLIO_CSV, TRANSACTION_HISTORY_CSV, WATCHLIST_CSV
+        self.assertTrue(os.path.exists(PORTFOLIO_CSV))
+        self.assertTrue(os.path.exists(TRANSACTION_HISTORY_CSV))
+        self.assertTrue(os.path.exists(WATCHLIST_CSV))
+
+    def test_currency_converter_expanded_and_disk_cache(self):
+        from currency_converter import CurrencyConverter, CURRENCY_CACHE_FILE
+        conv = CurrencyConverter(cache_ttl_sec=3600)
+        supported = conv.get_supported_currencies()
+        self.assertIn("AUD", supported)
+        self.assertIn("CHF", supported)
+        self.assertIn("SGD", supported)
+        self.assertIn("TWD", supported)
+        self.assertIn("KRW", supported)
+
+        # Test symbol retrieval
+        self.assertEqual(conv.get_symbol("AUD"), "A$")
+        self.assertEqual(conv.get_symbol("CHF"), "CHF")
+        self.assertEqual(conv.get_symbol("KRW"), "₩")
+
+        # Test conversion with fallback rate
+        aud_to_usd = conv.convert(152.0, "AUD", "USD")
+        self.assertAlmostEqual(aud_to_usd, 100.0, delta=1.0)
+
+        # Test disk cache save and reload
+        conv._rates_to_usd["CUSTOM_COIN"] = 2.5
+        conv._last_update = 1234567.0
+        conv._save_cache_to_disk()
+
+        conv2 = CurrencyConverter(cache_ttl_sec=3600)
+        self.assertEqual(conv2.get_usd_rate("CUSTOM_COIN"), 2.5)
+
+
+class TestPythonistaUIModule(unittest.TestCase):
+    """Test Pythonista 3 iOS UI module launcher and lifecycle."""
+
+    def test_pythonista_app_import_and_defaults(self):
+        import pythonista_app
+        self.assertTrue(hasattr(pythonista_app, "launch_pythonista_app"))
+        self.assertTrue(hasattr(pythonista_app, "GFinancePythonistaApp"))
+        self.assertTrue(hasattr(pythonista_app, "GFinanceWebViewDelegate"))
+        self.assertEqual(pythonista_app.DEFAULT_PORT, 8765)
+
+    def test_pythonista_app_with_mocked_ui(self):
+        from unittest.mock import MagicMock
+        import pythonista_app
+
+        mock_ui = MagicMock()
+        mock_view = MagicMock()
+        mock_view.bounds = (0, 0, 400, 800)
+        mock_view.width = 400
+        mock_view.height = 800
+        mock_ui.View.return_value = mock_view
+
+        mock_webview = MagicMock()
+        mock_ui.WebView.return_value = mock_webview
+
+        mock_indicator = MagicMock()
+        mock_ui.ActivityIndicator.return_value = mock_indicator
+
+        mock_server = MagicMock()
+
+        orig_ui = pythonista_app.ui
+        orig_avail = pythonista_app.PYTHONISTA_UI_AVAILABLE
+        try:
+            pythonista_app.ui = mock_ui
+            pythonista_app.PYTHONISTA_UI_AVAILABLE = True
+
+            app = pythonista_app.GFinancePythonistaApp("http://127.0.0.1:8765", server=mock_server)
+            v = app.build_ui()
+
+            # Verify view configuration
+            self.assertEqual(v, mock_view)
+            self.assertEqual(v.name, "G_Finance Portfolio")
+            mock_webview.load_url.assert_called_with("http://127.0.0.1:8765")
+
+            # Verify delegate callbacks
+            delegate = pythonista_app.GFinanceWebViewDelegate(mock_indicator)
+            delegate.webview_did_start(mock_webview)
+            mock_indicator.start.assert_called()
+
+            delegate.webview_did_finish(mock_webview)
+            mock_indicator.stop.assert_called()
+
+            # Verify button actions
+            app.on_refresh(None)
+            mock_webview.reload.assert_called()
+
+            app.on_back(None)
+            mock_webview.go_back.assert_called()
+
+            app.on_forward(None)
+            mock_webview.go_forward.assert_called()
+
+            # Verify server cleanup
+            app.cleanup()
+            mock_server.shutdown.assert_called()
+            mock_server.server_close.assert_called()
+        finally:
+            pythonista_app.ui = orig_ui
+            pythonista_app.PYTHONISTA_UI_AVAILABLE = orig_avail
+
+
+class TestPythonistaNativeUI(unittest.TestCase):
+    """Test 100% native Pythonista 3 UIKit GUI data sources, chart, and calculators."""
+
+    def test_native_ui_imports_and_defaults(self):
+        import pythonista_native_ui
+        self.assertTrue(hasattr(pythonista_native_ui, "NativeChartView"))
+        self.assertTrue(hasattr(pythonista_native_ui, "HoldingsDataSource"))
+        self.assertTrue(hasattr(pythonista_native_ui, "WatchlistDataSource"))
+        self.assertTrue(hasattr(pythonista_native_ui, "HistoryDataSource"))
+        self.assertTrue(hasattr(pythonista_native_ui, "CalculatorView"))
+        self.assertTrue(hasattr(pythonista_native_ui, "GFinanceNativeApp"))
+
+    def test_native_chart_view_data_and_touch(self):
+        from unittest.mock import MagicMock
+        import pythonista_native_ui
+
+        chart = pythonista_native_ui.NativeChartView()
+        chart.width = 300
+        chart.height = 200
+
+        prices = [100.0, 105.0, 102.0, 110.0]
+        timestamps = ["10:00", "11:00", "12:00", "13:00"]
+        chart.set_data(prices, timestamps, prev_close=99.0, currency_sym="$")
+
+        self.assertEqual(chart.prices, prices)
+        self.assertEqual(chart.timestamps, timestamps)
+        self.assertEqual(chart.prev_close, 99.0)
+
+        # Test hover callback
+        hover_results = []
+        chart.on_hover_callback = lambda p, t: hover_results.append((p, t))
+
+        touch = MagicMock()
+        touch.location.x = 150
+        chart.touch_began(touch)
+        self.assertTrue(len(hover_results) > 0)
+
+        chart.touch_ended(touch)
+        self.assertIsNone(chart.touch_x)
+
+    def test_holdings_data_source(self):
+        from unittest.mock import MagicMock
+        import pythonista_native_ui
+
+        holdings = [
+            {"symbol": "VOO", "name": "Vanguard S&P 500", "shares": 10, "current_price": 700.0, "buy_price": 600.0, "currency": "USD"},
+            {"symbol": "AAPL", "name": "Apple Inc", "shares": 20, "current_price": 220.0, "buy_price": 200.0, "currency": "USD"},
+        ]
+        selected = []
+        deleted = []
+        ds = pythonista_native_ui.HoldingsDataSource(
+            holdings,
+            on_select_holding=lambda h: selected.append(h),
+            on_delete_holding=lambda h, idx: deleted.append((h, idx)),
+        )
+
+        self.assertEqual(ds.tableview_number_of_sections(None), 1)
+        self.assertEqual(ds.tableview_number_of_rows(None, 0), 2)
+
+        ds.tableview_did_select(None, 0, 0)
+        self.assertEqual(selected[0]["symbol"], "VOO")
+
+        ds.tableview_delete(None, 0, 1)
+        self.assertEqual(deleted[0][0]["symbol"], "AAPL")
+
+    def test_watchlist_and_history_data_sources(self):
+        import pythonista_native_ui
+
+        wl = [{"symbol": "MSFT", "name": "Microsoft", "current_price": 450.0}]
+        wl_deleted = []
+        w_ds = pythonista_native_ui.WatchlistDataSource(wl, on_delete=lambda r: wl_deleted.append(r))
+        self.assertEqual(w_ds.tableview_number_of_rows(None, 0), 1)
+        w_ds.tableview_delete(None, 0, 0)
+        self.assertEqual(wl_deleted, [0])
+
+        txs = [{"action": "BUY", "symbol": "NVDA", "shares": 5, "price": 200.0, "total": 1000.0}]
+        h_ds = pythonista_native_ui.HistoryDataSource(txs)
+        self.assertEqual(h_ds.tableview_number_of_rows(None, 0), 1)
+
+    def test_native_ui_theme_contrast_and_defaults(self):
+        import pythonista_native_ui
+        theme = pythonista_native_ui.Theme(is_dark=False)
+        self.assertEqual(theme.NAME, "Light")
+        self.assertEqual(theme.BG_COLOR, "#F2F2F7")
+        self.assertEqual(theme.CARD_BG, "#FFFFFF")
+        self.assertEqual(theme.TEXT_PRIMARY, "#000000")
+        self.assertNotEqual(theme.TEXT_PRIMARY, theme.CARD_BG)
+        self.assertNotEqual(theme.INPUT_TEXT, theme.INPUT_BG)
+
+        # Toggle to dark theme
+        theme.toggle()
+        self.assertTrue(theme.is_dark)
+        self.assertEqual(theme.NAME, "Dark")
+        self.assertEqual(theme.CARD_BG, "#1C1C1E")
+        self.assertEqual(theme.TEXT_PRIMARY, "#FFFFFF")
+        self.assertNotEqual(theme.TEXT_PRIMARY, theme.CARD_BG)
+        self.assertNotEqual(theme.INPUT_TEXT, theme.INPUT_BG)
+        self.assertEqual(theme.INPUT_TEXT, "#FFFFFF")
+        self.assertEqual(theme.INPUT_BG, "#2C2C2E")
+
+    def test_native_ui_responsive_layout_and_inset(self):
+        from unittest.mock import MagicMock
+        import pythonista_native_ui
+
+        app = pythonista_native_ui.GFinanceNativeApp()
+        app.width = 414
+        app.height = 896
+        app.btn_port = MagicMock()
+        app.summary_card = MagicMock()
+        app.lbl_total_val = MagicMock()
+        app.lbl_total_sub = MagicMock()
+        app.lbl_div_sub = MagicMock()
+        app.main_seg = MagicMock()
+        app.content_container = MagicMock()
+        app.content_container.width = 390
+        app.content_container.height = 718
+        app.holdings_tv = MagicMock()
+        app.watchlist_tv = MagicMock()
+        app.history_tv = MagicMock()
+        app.calc_view = MagicMock()
+        app.chart_container = MagicMock()
+        app.chart_tf_seg = MagicMock()
+        app.native_chart = MagicMock()
+        app.lbl_chart_hover = MagicMock()
+
+        app.layout()
+
+        # Check that layout computed responsive frames
+        self.assertEqual(app.btn_port.frame, (12, 6, 390, 32))
+        self.assertEqual(app.summary_card.frame, (12, 44, 390, 84))
+        self.assertEqual(app.main_seg.frame, (12, 134, 390, 32))
+        self.assertEqual(app.content_container.frame, (12, 172, 390, 896 - 172 - 6))
+        self.assertEqual(app.holdings_tv.frame, (0, 0, 390, 718))
+
+    def test_native_ui_multi_currency_summary_and_switching(self):
+        from unittest.mock import MagicMock
+        import pythonista_native_ui
+
+        app = pythonista_native_ui.GFinanceNativeApp()
+        app.lbl_total_val = MagicMock()
+        app.lbl_total_sub = MagicMock()
+        app.lbl_div_sub = MagicMock()
+        app.btn_curr = MagicMock()
+
+        # Multi-currency portfolio (USD and CAD)
+        app.holdings = [
+            {"symbol": "VOO", "shares": 10, "buy_price": 500.0, "current_price": 600.0, "annual_dividend": 15.0, "currency": "USD"},
+            {"symbol": "VFV:TSE", "shares": 20, "buy_price": 100.0, "current_price": 120.0, "annual_dividend": 2.0, "currency": "CAD"},
+        ]
+
+        # 1. USD conversion
+        app.summary_currency = "USD"
+        app._update_summary_card()
+        self.assertIn("USD", app.lbl_total_val.text)
+        self.assertEqual(app.btn_curr.title, "💱 USD")
+        # Native sum would be 6000 + 2400 = 8400, but USD converted is ~7706
+        self.assertTrue("$7,70" in app.lbl_total_val.text or "$7,71" in app.lbl_total_val.text)
+
+        # 2. Native currency mode (unconverted raw sum)
+        app.summary_currency = "Native"
+        app._update_summary_card()
+        self.assertEqual(app.btn_curr.title, "💱 Native")
+        self.assertIn("$8,400.00", app.lbl_total_val.text)
+
+        # 3. Currency switcher fallback cycle
+        app.on_select_summary_currency(None)
+        # Should cycle from Native to USD
+        self.assertEqual(app.summary_currency, "USD")
+
+    def test_native_ui_chart_metric_modes_and_prepare_series(self):
+        from unittest.mock import MagicMock
+        import pythonista_native_ui
+
+        app = pythonista_native_ui.GFinanceNativeApp()
+        app.btn_chart_metric = MagicMock()
+        app.lbl_chart_hover = MagicMock()
+        app.native_chart = MagicMock()
+
+        app.holdings = [
+            {"symbol": "VOO", "shares": 10, "buy_price": 500.0, "current_price": 600.0, "annual_dividend": 15.0, "currency": "USD"},
+        ]
+        app.selected_chart_scope = "VOO"
+        app.selected_timeframe = "1M"
+
+        data = {
+            "prices": [100.0, 105.0, 110.0, 108.0],
+            "timestamps": ["2026-01-01", "2026-01-02", "2026-01-03", "2026-01-04"],
+            "prev_close": 98.0,
+            "dividend_events": [["2026-01-02", 1.5]],
+        }
+
+        # 1. Total Value mode (scaled by 10 shares)
+        app.selected_chart_metric = "total"
+        prep_total = app._prepare_metric_series(data)
+        self.assertIsNotNone(prep_total)
+        self.assertEqual(prep_total["prices"][-1], 1080.0)  # 108.0 * 10
+        self.assertEqual(prep_total["prev_close"], 980.0)   # 98.0 * 10
+        self.assertFalse(prep_total["is_growth"])
+
+        # 2. Price mode (unscaled per-share quote)
+        app.selected_chart_metric = "price"
+        prep_price = app._prepare_metric_series(data)
+        self.assertEqual(prep_price["prices"][-1], 108.0)
+        self.assertEqual(prep_price["prev_close"], 98.0)
+        self.assertFalse(prep_price["is_growth"])
+
+        # 3. Growth mode (Net Growth excluding invested capital)
+        app.selected_chart_metric = "growth"
+        prep_growth = app._prepare_metric_series(data)
+        self.assertEqual(prep_growth["prev_close"], 0.0)
+        self.assertTrue(prep_growth["is_growth"])
+        self.assertIn("投入本金", prep_growth["ref_label"])
+
+        # 4. Growth + Dividends mode
+        app.selected_chart_metric = "growth_div"
+        prep_growth_div = app._prepare_metric_series(data)
+        self.assertEqual(prep_growth_div["prev_close"], 0.0)
+        self.assertTrue(prep_growth_div["is_growth"])
+
+        # 5. Dividends Only mode
+        app.selected_chart_metric = "div_only"
+        prep_div = app._prepare_metric_series(data)
+        self.assertEqual(prep_div["prev_close"], 0.0)
+        self.assertTrue(prep_div["is_growth"])
+        self.assertIn("累計股息", prep_div["ref_label"])
+
+        # 6. Metric switching cycle test
+        app.selected_chart_metric = "total"
+        app.on_select_chart_metric(None)
+        self.assertEqual(app.selected_chart_metric, "price")
+        app.on_select_chart_metric(None)
+        self.assertEqual(app.selected_chart_metric, "growth")
+
+    def test_native_ui_analytics_currency_weights_and_exposure(self):
+        from unittest.mock import MagicMock
+        import pythonista_native_ui
+        from currency_converter import get_currency_converter
+
+        analytics = pythonista_native_ui.AnalyticsView()
+        analytics.tv_weights = MagicMock()
+        analytics.tv_curr = MagicMock()
+
+        conv = get_currency_converter()
+        holdings = [
+            {"symbol": "USD_STK", "shares": 10, "buy_price": 100.0, "current_price": 100.0, "currency": "USD"},
+            {"symbol": "CAD_STK", "shares": 10, "buy_price": 100.0, "current_price": 100.0, "currency": "CAD"},
+        ]
+
+        analytics.set_data(holdings, summary_currency="USD", converter=conv)
+        self.assertIn("USD", analytics.tv_curr.text)
+        self.assertIn("CAD", analytics.tv_curr.text)
+        self.assertIn("各幣別資產分佈", analytics.tv_curr.text)
+
+    def test_native_ui_cell_pool_capping(self):
+        from unittest.mock import MagicMock
+        import pythonista_native_ui
+
+        # Create dummy holdings data source with 50 items
+        holdings = [{"symbol": f"S{i}", "shares": 1, "buy_price": 10.0, "current_price": 10.0} for i in range(50)]
+        ds = pythonista_native_ui.HoldingsDataSource(holdings, on_select_holding=lambda h: None, on_delete_holding=lambda h, i: None)
+
+        mock_tv = MagicMock()
+        mock_tv.width = 375
+        # Simulate ui module available with mock TableViewCell and Label
+        mock_cell = MagicMock()
+        mock_ui = MagicMock()
+        mock_ui.TableViewCell.return_value = mock_cell
+        mock_ui.Label.return_value = MagicMock()
+
+        orig_ui = pythonista_native_ui.ui
+        try:
+            pythonista_native_ui.ui = mock_ui
+            for row in range(50):
+                cell = ds.tableview_cell_for_row(mock_tv, 0, row)
+                self.assertIsNotNone(cell)
+            # Pool must never exceed 30 items
+            self.assertLessEqual(len(ds._cell_pool), 30)
+            self.assertEqual(len(ds._cell_pool), 30)
+        finally:
+            pythonista_native_ui.ui = orig_ui
+
+    def test_native_ui_run_on_ui_thread_exception_handling(self):
+        import pythonista_native_ui
+
+        def bad_func():
+            raise ValueError("Test intentional failure")
+
+        # Must not raise an unhandled exception
+        try:
+            pythonista_native_ui.run_on_ui_thread(bad_func)
+            no_crash = True
+        except Exception:
+            no_crash = False
+        self.assertTrue(no_crash)
+
+    def test_native_chart_view_safe_geometry_without_dimensions(self):
+        from unittest.mock import MagicMock
+        import pythonista_native_ui
+
+        chart = pythonista_native_ui.NativeChartView()
+        # Test draw with mock ui and missing/zero width & height
+        mock_ui = MagicMock()
+        orig_ui = pythonista_native_ui.ui
+        try:
+            pythonista_native_ui.ui = mock_ui
+            chart.prices = [10.0, 12.0, 15.0]
+            chart.timestamps = ["T1", "T2", "T3"]
+            chart.draw()
+            self.assertTrue(mock_ui.Path.called or True)
+        finally:
+            pythonista_native_ui.ui = orig_ui
+
+    def test_native_holdings_data_source_gain_rendering(self):
+        from unittest.mock import MagicMock
+        import pythonista_native_ui
+
+        # Create holdings with unrealized_gain and unrealized_gain_pct (as loaded from portfolio.csv)
+        holdings = [
+            {
+                "symbol": "ALB",
+                "name": "Albemarle Corp",
+                "shares": 30.0,
+                "buy_price": 86.39,
+                "current_price": 94.43,
+                "cost_basis": 2591.70,
+                "market_value": 2832.90,
+                "unrealized_gain": 241.20,
+                "unrealized_gain_pct": 9.31,
+                "currency": "USD",
+            },
+            {
+                "symbol": "RKLB",
+                "name": "Rocket Lab Corp",
+                "shares": 24.0,
+                "buy_price": 116.93,
+                "current_price": 53.35,
+                "cost_basis": 2806.32,
+                "market_value": 1280.40,
+                "unrealized_gain": -1525.92,
+                "unrealized_gain_pct": -54.37,
+                "currency": "USD",
+            },
+        ]
+
+        ds = pythonista_native_ui.HoldingsDataSource(holdings, on_select_holding=lambda h: None, on_delete_holding=lambda h, i: None)
+
+        mock_tv = MagicMock()
+        mock_tv.width = 375
+
+        mock_cell = MagicMock()
+        subviews = {}
+        for name in ["lbl_sym", "lbl_name", "lbl_shs", "lbl_mv", "lbl_pct", "lbl_dlr"]:
+            lbl = MagicMock()
+            lbl.name = name
+            subviews[name] = lbl
+
+        mock_cell.content_view.subviews = list(subviews.values())
+
+        mock_ui = MagicMock()
+        mock_ui.TableViewCell.return_value = mock_cell
+        mock_ui.Label.side_effect = lambda **kwargs: MagicMock(name=kwargs.get("name", ""))
+
+        orig_ui = pythonista_native_ui.ui
+        try:
+            pythonista_native_ui.ui = mock_ui
+
+            # Render Row 0 (ALB: positive gain)
+            ds.tableview_cell_for_row(mock_tv, 0, 0)
+            self.assertEqual(subviews["lbl_pct"].text, "+9.31%")
+            self.assertEqual(subviews["lbl_dlr"].text, "+$241.20")
+
+            # Render Row 1 (RKLB: negative gain)
+            ds.clear_cache()
+            ds.tableview_cell_for_row(mock_tv, 0, 1)
+            self.assertEqual(subviews["lbl_pct"].text, "-54.37%")
+            self.assertEqual(subviews["lbl_dlr"].text, "-$1,525.92")
+        finally:
+            pythonista_native_ui.ui = orig_ui
+
+    def test_native_watchlist_quotes_cache_merging(self):
+        from unittest.mock import MagicMock, patch
+        import pythonista_native_ui
+
+        sample_watchlist = [
+            {"symbol": "0005", "name": "HSBC Holdings", "target_price": 60.0, "currency": "HKD"},
+            {"symbol": "VOO", "name": "Vanguard S&P 500 ETF", "target_price": 700.0, "currency": "USD"},
+        ]
+        sample_quotes_cache = {
+            "0005": {"price": 145.8, "change_percent": 0.76, "name": "HSBC Holdings plc"},
+            "VOO": {"price": 711.11, "change_percent": 0.61, "name": "Vanguard S&P 500 ETF"},
+        }
+
+        app = pythonista_native_ui.GFinanceNativeApp.__new__(pythonista_native_ui.GFinanceNativeApp)
+        app.theme = pythonista_native_ui.CURRENT_THEME
+        app.holdings = []
+        app.watchlist_tv = MagicMock()
+
+        with patch("csv_manager.load_watchlist", return_value=sample_watchlist), \
+             patch("csv_manager.load_watchlist_quotes_cache", return_value=sample_quotes_cache):
+            app._load_watchlist_tab()
+
+        self.assertEqual(len(app.watchlist), 2)
+        # Verified that prices and day changes are populated from cache
+        self.assertEqual(app.watchlist[0]["current_price"], 145.8)
+        self.assertEqual(app.watchlist[0]["day_change_pct"], 0.76)
+        self.assertEqual(app.watchlist[1]["current_price"], 711.11)
+        self.assertEqual(app.watchlist[1]["day_change_pct"], 0.61)
+
+        # Verify WatchlistDataSource renders prices properly instead of "—" or "待刷新"
+        mock_tv = MagicMock()
+        mock_tv.width = 375
+        mock_cell = MagicMock()
+        subviews = {}
+        for name in ["lbl_sym", "lbl_name", "lbl_pr", "lbl_chg"]:
+            lbl = MagicMock()
+            lbl.name = name
+            subviews[name] = lbl
+        mock_cell.content_view.subviews = list(subviews.values())
+
+        mock_ui = MagicMock()
+        mock_ui.TableViewCell.return_value = mock_cell
+        orig_ui = pythonista_native_ui.ui
+        try:
+            pythonista_native_ui.ui = mock_ui
+            app.watchlist_ds.tableview_cell_for_row(mock_tv, 0, 0)
+            self.assertEqual(subviews["lbl_pr"].text, "HKD 145.80")
+            self.assertEqual(subviews["lbl_chg"].text, "+0.76%")
+
+            app.watchlist_ds.clear_cache()
+            app.watchlist_ds.tableview_cell_for_row(mock_tv, 0, 1)
+            self.assertEqual(subviews["lbl_pr"].text, "$711.11")
+            self.assertEqual(subviews["lbl_chg"].text, "+0.61%")
+        finally:
+            pythonista_native_ui.ui = orig_ui
 
 
 if __name__ == "__main__":

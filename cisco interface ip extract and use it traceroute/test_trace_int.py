@@ -546,8 +546,330 @@ class TestTraceINTGUI(unittest.TestCase):
         self.assertEqual(self.gui.mapper.transit_subnets, {30, 31})
         self.assertEqual(self.gui.transit_subnets_var.get(), "/30, /31")
 
+    def test_gui_streaming_hop_updates_table_and_flow_immediately(self):
+        """Verify that arriving hops immediately update the table and flow diagram without waiting for trace_done."""
+        # 1. Initially table is empty
+        self.assertEqual(len(self.gui.tree.get_children()), 0)
+
+        # 2. Hop 1 arrives in queue
+        hop1_rec = {
+            "hop_no": 1,
+            "ip": "10.0.0.1",
+            "device": "Core-SW",
+            "in_iface": "Vlan100",
+            "out_iface": "Gi1/0/1",
+            "zone": "Trust",
+            "next_hop": "Towards: Target (172.16.0.50)",
+            "in_desc": "User Access",
+            "out_desc": "Uplink",
+        }
+        self.gui.target_var.set("172.16.0.50")
+        self.gui.queue.put(("hop_streaming", 1, "10.0.0.1", [hop1_rec]))
+        self.gui._process_queue()
+
+        # Table must now contain hop 1 immediately (2 rows: IN and OUT)
+        self.assertEqual(len(self.gui.tree.get_children()), 2)
+        flow_text_1 = self.gui.flow_text.get("1.0", "end")
+        self.assertIn("PATH FLOW:", flow_text_1)
+        self.assertIn("Core-SW", flow_text_1)
+
+        # 3. Hop 2 arrives in queue
+        hop2_rec = {
+            "hop_no": 2,
+            "ip": "10.0.0.2",
+            "device": "Edge-FW",
+            "in_iface": "port1",
+            "out_iface": "port2",
+            "zone": "Untrust",
+            "next_hop": "Towards: Target (172.16.0.50)",
+            "in_desc": "Ingress",
+            "out_desc": "Egress",
+        }
+        hop1_rec["next_hop"] = "Edge-FW:port1"
+        self.gui.queue.put(("hop_streaming", 2, "10.0.0.2", [hop1_rec, hop2_rec]))
+        self.gui._process_queue()
+
+        # Table must now contain both hops (4 rows: 2 IN and 2 OUT)
+        self.assertEqual(len(self.gui.tree.get_children()), 4)
+        flow_text_2 = self.gui.flow_text.get("1.0", "end")
+        self.assertIn("Core-SW:Gi1/0/1 ⇄ Edge-FW:port1", flow_text_2)
+
+
+
+class TestMainExecutionModes(unittest.TestCase):
+    """Tests for main() CLI vs GUI selection and graceful fallback."""
+
+    @patch("TraceINT.launch_gui")
+    def test_default_launches_gui(self, mock_launch_gui):
+        """When invoked with no arguments, main() should attempt to launch GUI by default."""
+        with patch.object(sys, "argv", ["TraceINT.py"]):
+            from TraceINT import main
+            main()
+            mock_launch_gui.assert_called_once()
+
+    @patch("TraceINT.launch_gui", side_effect=RuntimeError("no display name and no $DISPLAY environment variable"))
+    @patch.object(CiscoTracerouteMapper, "interactive_menu")
+    @patch.object(CiscoTracerouteMapper, "load_csv_data", return_value=True)
+    def test_default_falls_back_to_cli_on_gui_failure(
+        self, mock_load_csv, mock_interactive_menu, mock_launch_gui
+    ):
+        """When GUI launch fails (e.g., headless server), main() catches error and falls back to CLI."""
+        with patch.object(sys, "argv", ["TraceINT.py"]):
+            from TraceINT import main
+            f = io.StringIO()
+            with redirect_stdout(f):
+                main()
+            output = f.getvalue()
+            mock_launch_gui.assert_called_once()
+            mock_load_csv.assert_called_once()
+            mock_interactive_menu.assert_called_once()
+            self.assertIn("GUI unavailable", output)
+            self.assertIn("Falling back to interactive CLI mode", output)
+
+    @patch("TraceINT.launch_gui")
+    @patch.object(CiscoTracerouteMapper, "interactive_menu")
+    @patch.object(CiscoTracerouteMapper, "load_csv_data", return_value=True)
+    def test_explicit_cli_flag_bypasses_gui(
+        self, mock_load_csv, mock_interactive_menu, mock_launch_gui
+    ):
+        """When --cli flag is specified, launch_gui is never called."""
+        with patch.object(sys, "argv", ["TraceINT.py", "--cli"]):
+            from TraceINT import main
+            main()
+            mock_launch_gui.assert_not_called()
+            mock_load_csv.assert_called_once()
+            mock_interactive_menu.assert_called_once()
+
+    @patch("TraceINT.launch_gui", side_effect=RuntimeError("Tkinter not available"))
+    def test_explicit_gui_flag_exits_on_failure(self, mock_launch_gui):
+        """When --gui is explicitly passed, failure exits with error code 1 instead of silent CLI fallback."""
+        with patch.object(sys, "argv", ["TraceINT.py", "--gui"]):
+            from TraceINT import main
+            with self.assertRaises(SystemExit) as cm:
+                main()
+            self.assertEqual(cm.exception.code, 1)
+
+
+class TestWANPathStitching(unittest.TestCase):
+    """Unit tests for Source ↔ Destination WAN path stitching across arbitrary sites."""
+
+    def setUp(self):
+        self.mapper = CiscoTracerouteMapper(csv_file="nonexistent.csv")
+        self.mapper.wan_keyword = "wanr"
+
+        # Mock inventory:
+        # Site A: Gateway and WAN router
+        self.mapper.ip_to_device_map["192.168.1.1"] = ("SiteA-gw", "Gi0/1", "Trust", "default", "Site A Gateway")
+        self.mapper.ip_to_device_map["10.1.1.1"] = ("SiteA-wanr", "Gi0/1", "WAN", "default", "Site A WAN Router")
+
+        # Site B: WAN router and internal switch
+        self.mapper.ip_to_device_map["10.2.2.1"] = ("SiteB-wanr", "Gi0/1", "WAN", "default", "Site B WAN Router")
+        self.mapper.ip_to_device_map["10.2.2.10"] = ("SiteB-sw1", "Gi0/1", "Trust", "default", "Site B Switch")
+
+        # Site C: WAN router and internal switch
+        self.mapper.ip_to_device_map["10.3.3.1"] = ("SiteC-wanr", "Gi0/1", "WAN", "default", "Site C WAN Router")
+        self.mapper.ip_to_device_map["10.3.3.10"] = ("SiteC-sw1", "Gi0/1", "Trust", "default", "Site C Switch")
+
+    def test_wan_stitching_three_sites_ignores_probing_site(self):
+        """
+        Probing PC at Site A, Source at Site B, Destination at Site C.
+        Trace to Source passes: Site A -> SiteA-wanr -> SiteB-wanr -> SiteB-sw1 -> Source.
+        Trace to Dest passes:   Site A -> SiteA-wanr -> SiteC-wanr -> SiteC-sw1 -> Dest.
+        Stitched path must:
+        - Exclude Site A (SiteA-gw and SiteA-wanr).
+        - Reverse Site B (Source -> SiteB-sw1 -> SiteB-wanr).
+        - Interconnect SiteB-wanr ⇄ SiteC-wanr over WAN.
+        - Forward Site C (SiteC-wanr -> SiteC-sw1 -> Dest).
+        """
+        src_hops = [
+            (1, "192.168.1.1"),
+            (2, "10.1.1.1"),     # SiteA-wanr
+            (3, "10.2.2.1"),     # SiteB-wanr
+            (4, "10.2.2.10"),    # SiteB-sw1
+            (5, "10.2.2.50"),    # Source
+        ]
+        dst_hops = [
+            (1, "192.168.1.1"),
+            (2, "10.1.1.1"),     # SiteA-wanr
+            (3, "10.3.3.1"),     # SiteC-wanr
+            (4, "10.3.3.10"),    # SiteC-sw1
+            (5, "10.3.3.50"),    # Dest
+        ]
+
+        path, stitched_hops, status_msg = self.mapper.stitch_wan_path(
+            src_hops, dst_hops, src_ip="10.2.2.50", dst_ip="10.3.3.50"
+        )
+
+        self.assertIn("SiteB-wanr ≈≈ WAN ≈≈ SiteC-wanr", status_msg)
+        self.assertIn("Probing PC site ignored", status_msg)
+
+        # Check that Site A hops are completely absent from stitched_hops
+        stitched_ips = [ip for _, ip in stitched_hops if ip is not None]
+        self.assertNotIn("192.168.1.1", stitched_ips)
+        self.assertNotIn("10.1.1.1", stitched_ips)
+
+        # Expected end-to-end IP sequence:
+        # Source (10.2.2.50) -> SiteB-sw1 (10.2.2.10) -> SiteB-wanr (10.2.2.1) ->
+        # SiteC-wanr (10.3.3.1) -> SiteC-sw1 (10.3.3.10) -> Dest (10.3.3.50)
+        expected_sequence = [
+            "10.2.2.50",
+            "10.2.2.10",
+            "10.2.2.1",
+            "10.3.3.1",
+            "10.3.3.10",
+            "10.3.3.50",
+        ]
+        self.assertEqual(stitched_ips, expected_sequence)
+
+        # Check path segments
+        segments = [seg for seg, _, _ in path]
+        self.assertEqual(
+            segments,
+            ["SOURCE", "SRC-SITE", "SRC-WAN", "WAN", "DST-WAN", "DST-SITE", "DEST"]
+        )
+
+    def test_wan_stitching_same_remote_site(self):
+        """Both Source and Destination are at Site B; pivots inside Site B ignoring Site A."""
+        src_hops = [
+            (1, "192.168.1.1"),
+            (2, "10.1.1.1"),
+            (3, "10.2.2.1"),
+            (4, "10.2.2.10"),
+            (5, "10.2.2.50"),
+        ]
+        dst_hops = [
+            (1, "192.168.1.1"),
+            (2, "10.1.1.1"),
+            (3, "10.2.2.1"),
+            (4, "10.2.2.10"),
+            (5, "10.2.2.60"),
+        ]
+
+        path, stitched_hops, status_msg = self.mapper.stitch_wan_path(
+            src_hops, dst_hops, src_ip="10.2.2.50", dst_ip="10.2.2.60"
+        )
+
+        stitched_ips = [ip for _, ip in stitched_hops if ip is not None]
+        self.assertNotIn("192.168.1.1", stitched_ips)
+        self.assertNotIn("10.1.1.1", stitched_ips)
+
+        # Common switch 10.2.2.10 inside Site B is the pivot
+        self.assertEqual(stitched_ips, ["10.2.2.50", "10.2.2.10", "10.2.2.60"])
+
+    def test_wan_stitching_source_in_local_site(self):
+        """Source in Site A with probing PC, Destination remote in Site C."""
+        src_hops = [
+            (1, "192.168.1.1"),
+            (2, "192.168.1.50"),  # Source in Site A
+        ]
+        dst_hops = [
+            (1, "192.168.1.1"),
+            (2, "10.1.1.1"),      # SiteA-wanr
+            (3, "10.3.3.1"),      # SiteC-wanr
+            (4, "10.3.3.10"),
+            (5, "10.3.3.50"),     # Dest
+        ]
+
+        path, stitched_hops, status_msg = self.mapper.stitch_wan_path(
+            src_hops, dst_hops, src_ip="192.168.1.50", dst_ip="10.3.3.50"
+        )
+
+        self.assertIn("Source in local site", status_msg)
+        stitched_ips = [ip for _, ip in stitched_hops if ip is not None]
+        expected = [
+            "192.168.1.50",
+            "192.168.1.1",
+            "10.1.1.1",
+            "10.3.3.1",
+            "10.3.3.10",
+            "10.3.3.50",
+        ]
+        self.assertEqual(stitched_ips, expected)
+
+    def test_wan_stitching_both_in_local_site(self):
+        """Both Source and Destination in local site (no WAN routers)."""
+        src_hops = [
+            (1, "192.168.1.1"),
+            (2, "192.168.1.50"),
+        ]
+        dst_hops = [
+            (1, "192.168.1.1"),
+            (2, "192.168.1.60"),
+        ]
+
+        path, stitched_hops, status_msg = self.mapper.stitch_wan_path(
+            src_hops, dst_hops, src_ip="192.168.1.50", dst_ip="192.168.1.60"
+        )
+        self.assertIn("Both Source and Destination in local site", status_msg)
+        stitched_ips = [ip for _, ip in stitched_hops if ip is not None]
+        self.assertEqual(stitched_ips, ["192.168.1.50", "192.168.1.1", "192.168.1.60"])
+
+    def test_wan_stitching_site_a_wanr_not_involved_in_3_site_trace(self):
+        """Verify explicitly that Site A WAN router is completely excluded when both Source and Destination are remote."""
+        src_hops = [
+            (1, "192.168.1.1"),  # Site A switch
+            (2, "10.1.1.1"),      # SiteA-wanr
+            (3, "10.2.2.1"),      # SiteB-wanr
+            (4, "10.2.2.10"),     # SiteB-sw1
+            (5, "10.2.2.50"),     # Source host in Site B
+        ]
+        dst_hops = [
+            (1, "192.168.1.1"),  # Site A switch
+            (2, "10.1.1.1"),      # SiteA-wanr
+            (3, "10.3.3.1"),      # SiteC-wanr
+            (4, "10.3.3.10"),     # SiteC-sw1
+            (5, "10.3.3.50"),     # Destination host in Site C
+        ]
+
+        path, stitched_hops, status_msg = self.mapper.stitch_wan_path(
+            src_hops, dst_hops, src_ip="10.2.2.50", dst_ip="10.3.3.50"
+        )
+        stitched_ips = [ip for _, ip in stitched_hops if ip is not None]
+
+        # Site A's device (192.168.1.1) and Site A's WAN router (10.1.1.1) MUST NOT be involved
+        self.assertNotIn("192.168.1.1", stitched_ips)
+        self.assertNotIn("10.1.1.1", stitched_ips)
+
+        # Path MUST only involve Site B's WAN router (10.2.2.1) and Site C's WAN router (10.3.3.1)
+        self.assertIn("10.2.2.1", stitched_ips)
+        self.assertIn("10.3.3.1", stitched_ips)
+        self.assertEqual(
+            stitched_ips,
+            ["10.2.2.50", "10.2.2.10", "10.2.2.1", "10.3.3.1", "10.3.3.10", "10.3.3.50"]
+        )
+
+    def test_wan_stitching_destination_in_local_site(self):
+        """Source remote in Site B, Destination in local Site A with probing PC."""
+        src_hops = [
+            (1, "192.168.1.1"),  # Site A sw
+            (2, "10.1.1.1"),      # SiteA-wanr
+            (3, "10.2.2.1"),      # SiteB-wanr
+            (4, "10.2.2.10"),     # SiteB-sw1
+            (5, "10.2.2.50"),     # Source host
+        ]
+        dst_hops = [
+            (1, "192.168.1.1"),  # Site A sw
+            (2, "192.168.1.60"),  # Dest in Site A
+        ]
+
+        path, stitched_hops, status_msg = self.mapper.stitch_wan_path(
+            src_hops, dst_hops, src_ip="10.2.2.50", dst_ip="192.168.1.60"
+        )
+        self.assertIn("Destination in local site", status_msg)
+        stitched_ips = [ip for _, ip in stitched_hops if ip is not None]
+        expected = [
+            "10.2.2.50",
+            "10.2.2.10",
+            "10.2.2.1",   # SiteB-wanr
+            "10.1.1.1",   # SiteA-wanr
+            "192.168.1.1",
+            "192.168.1.60",
+        ]
+        self.assertEqual(stitched_ips, expected)
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
 

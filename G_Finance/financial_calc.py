@@ -124,7 +124,7 @@ def calc_drip_simulation(
             annual_contrib = monthly_contribution * 12.0
             total_invested += annual_contrib
             # assume purchased at average price this year
-            shares += annual_contrib / price
+            shares += (annual_contrib / price) if price > 0 else 0.0
 
         # Annual dividend generated
         annual_div = shares * div_per_share
@@ -686,7 +686,7 @@ def calc_risk_and_return_metrics(
     daily_vol = (variance ** 0.5)
     ann_vol = daily_vol * (252.0 ** 0.5)
 
-    total_ret = (prices[-1] - prices[0]) / prices[0]
+    total_ret = ((prices[-1] - prices[0]) / prices[0]) if prices[0] > 0 else 0.0
     years = (len(prices) / 252.0)
     if timestamps and len(timestamps) == len(price_or_val_series):
         try:
@@ -3847,6 +3847,393 @@ def calc_rising_equity_glidepath(
         "deviation_pct": deviation_pct,
         "phase_desc": phase_desc,
     }
+
+
+def calc_total_return(
+    shares: float,
+    buy_price: float,
+    current_price: float,
+    total_dividends_received: float = 0.0,
+    total_fees_paid: float = 0.0,
+    holding_period_years: float = 0.0,
+    **kwargs: Any,
+) -> Dict[str, Any]:
+    """
+    Calculates true total return including:
+    - Capital gain/loss (unrealized)
+    - Dividends received
+    - Fees paid
+    - Total return $ and %
+    - Annualized return if holding period > 0
+    """
+    shares = max(0.0, float(shares))
+    buy_price = max(0.0, float(buy_price))
+    current_price = max(0.0, float(current_price))
+    dividends_received = round(max(0.0, float(total_dividends_received)), 2)
+    fees_paid = round(max(0.0, float(total_fees_paid)), 2)
+
+    cost_basis = round(shares * buy_price, 2)
+    market_value = round(shares * current_price, 2)
+    capital_gain = round(market_value - cost_basis, 2)
+    capital_gain_pct = round((capital_gain / cost_basis * 100.0), 2) if cost_basis > 0.0 else 0.0
+    price_return_pct = capital_gain_pct
+
+    total_return_dollar = round(capital_gain + dividends_received - fees_paid, 2)
+    total_return_pct = round((total_return_dollar / cost_basis * 100.0), 2) if cost_basis > 0.0 else 0.0
+    income_return_pct = round((dividends_received / cost_basis * 100.0), 2) if cost_basis > 0.0 else 0.0
+
+    result: Dict[str, Any] = {
+        "cost_basis": cost_basis,
+        "market_value": market_value,
+        "capital_gain": capital_gain,
+        "capital_gain_pct": capital_gain_pct,
+        "dividends_received": dividends_received,
+        "fees_paid": fees_paid,
+        "total_return_dollar": total_return_dollar,
+        "total_return_pct": total_return_pct,
+        "income_return_pct": income_return_pct,
+        "price_return_pct": price_return_pct,
+    }
+
+    # Annualized return if holding period > 0
+    years = max(0.0, float(holding_period_years))
+    if years <= 0.0 and "holding_period" in kwargs:
+        years = max(0.0, float(kwargs["holding_period"]))
+    if years <= 0.0 and "holding_period_days" in kwargs:
+        years = max(0.0, float(kwargs["holding_period_days"])) / 365.25
+
+    if years > 0.0:
+        annualized_return_pct = 0.0
+        if cost_basis > 0.0:
+            total_ending_value = cost_basis + total_return_dollar
+            if total_ending_value > 0.0:
+                try:
+                    annualized_return_pct = round((((total_ending_value / cost_basis) ** (1.0 / years)) - 1.0) * 100.0, 2)
+                except (ValueError, OverflowError, ZeroDivisionError):
+                    annualized_return_pct = 0.0
+            elif total_ending_value == 0.0:
+                annualized_return_pct = -100.0
+        result["annualized_return_pct"] = annualized_return_pct
+
+    return result
+
+
+def calc_position_weights(
+    holdings: List[Dict[str, Any]],
+    weight_by: str = "market_value",
+) -> List[Dict[str, Any]]:
+    """
+    Calculates each position's weight as % of total portfolio.
+    weight_by can be 'market_value' or 'cost_basis'.
+    Identifies concentrated positions (>15% of portfolio).
+    """
+    if not holdings:
+        return []
+
+    mode = str(weight_by).strip().lower()
+
+    position_values: List[float] = []
+    for h in holdings:
+        shares = max(0.0, float(h.get("shares", 0.0)))
+        if mode == "cost_basis":
+            if "cost_basis" in h and h.get("cost_basis") is not None:
+                val = max(0.0, float(h["cost_basis"]))
+            else:
+                buy_p = max(0.0, float(h.get("buy_price", 0.0)))
+                val = round(shares * buy_p, 2)
+        else:
+            if "market_value" in h and h.get("market_value") is not None:
+                val = max(0.0, float(h["market_value"]))
+            else:
+                cur_p = max(0.0, float(h.get("current_price", 0.0)))
+                val = round(shares * cur_p, 2)
+        position_values.append(val)
+
+    total_portfolio_value = round(sum(position_values), 2)
+
+    results: List[Dict[str, Any]] = []
+    for h, val in zip(holdings, position_values):
+        val_rounded = round(val, 2)
+        if total_portfolio_value > 0.0:
+            weight_pct = round((val_rounded / total_portfolio_value) * 100.0, 2)
+        else:
+            weight_pct = 0.0
+
+        is_concentrated = weight_pct > 15.0
+        sym = str(h.get("symbol") or "").strip()
+        port = str(h.get("portfolio") or h.get("portfolio_name") or "").strip()
+
+        results.append({
+            "symbol": sym,
+            "portfolio": port,
+            "value": val_rounded,
+            "weight_pct": weight_pct,
+            "is_concentrated": is_concentrated,
+            "total_portfolio_value": total_portfolio_value,
+        })
+
+    return results
+
+
+def calc_cost_basis_methods(
+    transactions: List[Dict[str, Any]],
+    symbol: str,
+    current_price: float = 0.0,
+) -> Dict[str, Any]:
+    """
+    Compares FIFO vs Average Cost basis for a symbol's transactions.
+    - Filter transactions to matching symbol BUY and SELL records
+    - FIFO: sell oldest shares first, compute realized gain
+    - Average: use weighted average cost, compute realized gain
+    """
+    target_sym = str(symbol).strip().upper()
+    cur_price = max(0.0, float(current_price))
+
+    if not transactions or not target_sym:
+        return {
+            "fifo_cost_basis": 0.0,
+            "fifo_realized_gain": 0.0,
+            "fifo_unrealized_gain": 0.0,
+            "average_cost_basis": 0.0,
+            "average_realized_gain": 0.0,
+            "average_unrealized_gain": 0.0,
+            "remaining_shares": 0.0,
+            "method_difference": 0.0,
+        }
+
+    matching_txs = []
+    for tx in transactions:
+        tx_sym = str(tx.get("symbol", "")).strip().upper()
+        if tx_sym != target_sym:
+            continue
+        tx_type = str(tx.get("type", "")).strip().upper()
+        if tx_type in ("BUY", "SELL"):
+            matching_txs.append(tx)
+
+    if not matching_txs:
+        return {
+            "fifo_cost_basis": 0.0,
+            "fifo_realized_gain": 0.0,
+            "fifo_unrealized_gain": 0.0,
+            "average_cost_basis": 0.0,
+            "average_realized_gain": 0.0,
+            "average_unrealized_gain": 0.0,
+            "remaining_shares": 0.0,
+            "method_difference": 0.0,
+        }
+
+    # Stably sort by transaction date if available
+    if any(tx.get("date") for tx in matching_txs):
+        try:
+            matching_txs = sorted(matching_txs, key=lambda x: str(x.get("date", "")))
+        except Exception:
+            pass
+
+    # FIFO Simulation
+    fifo_lots: List[List[float]] = []  # [shares, price]
+    fifo_realized_gain = 0.0
+
+    for tx in matching_txs:
+        tx_type = str(tx.get("type", "")).strip().upper()
+        sh = max(0.0, float(tx.get("shares") or tx.get("quantity") or 0.0))
+        pr = max(0.0, float(tx.get("price") or tx.get("buy_price") or tx.get("sell_price") or 0.0))
+        if sh <= 0.0:
+            continue
+
+        if tx_type == "BUY":
+            fifo_lots.append([sh, pr])
+        elif tx_type == "SELL":
+            needed = sh
+            cost_sold = 0.0
+            shares_sold = 0.0
+            for lot in fifo_lots:
+                if needed <= 0.0:
+                    break
+                if lot[0] <= 0.0:
+                    continue
+                take = min(needed, lot[0])
+                cost_sold += take * lot[1]
+                lot[0] -= take
+                needed -= take
+                shares_sold += take
+
+            fifo_realized_gain += (shares_sold * pr) - cost_sold
+            fifo_lots = [lot for lot in fifo_lots if lot[0] > 0.0]
+
+    fifo_remaining_shares = sum(lot[0] for lot in fifo_lots)
+    fifo_cost_basis = sum(lot[0] * lot[1] for lot in fifo_lots)
+
+    # Average Cost Simulation
+    avg_shares = 0.0
+    avg_total_cost = 0.0
+    average_realized_gain = 0.0
+
+    for tx in matching_txs:
+        tx_type = str(tx.get("type", "")).strip().upper()
+        sh = max(0.0, float(tx.get("shares") or tx.get("quantity") or 0.0))
+        pr = max(0.0, float(tx.get("price") or tx.get("buy_price") or tx.get("sell_price") or 0.0))
+        if sh <= 0.0:
+            continue
+
+        if tx_type == "BUY":
+            avg_shares += sh
+            avg_total_cost += sh * pr
+        elif tx_type == "SELL":
+            if avg_shares > 0.0:
+                avg_price = avg_total_cost / avg_shares
+                shares_sold = min(sh, avg_shares)
+                cost_sold = shares_sold * avg_price
+                average_realized_gain += (shares_sold * pr) - cost_sold
+                avg_shares -= shares_sold
+                avg_total_cost = avg_shares * avg_price if avg_shares > 0.0 else 0.0
+
+    average_cost_basis = avg_total_cost
+    remaining_shares = round(fifo_remaining_shares, 4)
+
+    fifo_cost_basis_round = round(fifo_cost_basis, 2)
+    average_cost_basis_round = round(average_cost_basis, 2)
+    fifo_realized_round = round(fifo_realized_gain, 2)
+    average_realized_round = round(average_realized_gain, 2)
+
+    if cur_price > 0.0 and remaining_shares > 0.0:
+        market_val = remaining_shares * cur_price
+        fifo_unrealized_gain = round(market_val - fifo_cost_basis_round, 2)
+        average_unrealized_gain = round(market_val - average_cost_basis_round, 2)
+    else:
+        fifo_unrealized_gain = 0.0
+        average_unrealized_gain = 0.0
+
+    method_difference = round(fifo_realized_round - average_realized_round, 2)
+
+    return {
+        "fifo_cost_basis": fifo_cost_basis_round,
+        "fifo_realized_gain": fifo_realized_round,
+        "fifo_unrealized_gain": fifo_unrealized_gain,
+        "average_cost_basis": average_cost_basis_round,
+        "average_realized_gain": average_realized_round,
+        "average_unrealized_gain": average_unrealized_gain,
+        "remaining_shares": remaining_shares,
+        "method_difference": method_difference,
+    }
+
+
+def calc_dividend_income_summary(
+    holdings: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """
+    Aggregates dividend income across all holdings.
+    Returns total annual, monthly, quarterly dividends, portfolio yield,
+    highest yielder, count of dividend vs non-dividend holdings, and currency totals.
+    """
+    if not holdings:
+        return {
+            "total_annual_dividend": 0.0,
+            "total_monthly_dividend": 0.0,
+            "total_quarterly_dividend": 0.0,
+            "avg_portfolio_yield": 0.0,
+            "highest_yielder": None,
+            "holdings_with_dividends": 0,
+            "holdings_without_dividends": 0,
+            "by_currency": {},
+        }
+
+    total_annual_div = 0.0
+    total_market_val = 0.0
+    holdings_with_div = 0
+    holdings_without_div = 0
+    by_currency: Dict[str, float] = {}
+
+    best_sym: Optional[str] = None
+    best_yield = -1.0
+    individual_yields: List[float] = []
+
+    for h in holdings:
+        sym = str(h.get("symbol") or "").strip()
+        shares = max(0.0, float(h.get("shares", 0.0)))
+        cur_p = max(0.0, float(h.get("current_price", 0.0)))
+
+        # Determine market value
+        if "market_value" in h and h.get("market_value") is not None:
+            mkt_val = max(0.0, float(h["market_value"]))
+        else:
+            mkt_val = round(shares * cur_p, 2)
+        total_market_val += mkt_val
+
+        # Determine annual dividend
+        ann_div = 0.0
+        if "annual_dividend" in h and h.get("annual_dividend") is not None:
+            ann_div = max(0.0, float(h["annual_dividend"]))
+        elif "annual_div_per_share" in h or "dividend_per_share" in h:
+            div_per_sh = max(0.0, float(h.get("annual_div_per_share") or h.get("dividend_per_share") or 0.0))
+            ann_div = round(shares * div_per_sh, 2)
+        elif "div_yield" in h or "dividend_yield" in h or "yield" in h:
+            dy = max(0.0, float(h.get("div_yield") or h.get("dividend_yield") or h.get("yield") or 0.0))
+            if mkt_val > 0.0:
+                ann_div = round(mkt_val * (dy / 100.0), 2)
+            elif shares > 0.0 and cur_p > 0.0:
+                ann_div = round(shares * cur_p * (dy / 100.0), 2)
+
+        # Determine yield % for this holding
+        holding_yield = 0.0
+        if "div_yield" in h or "dividend_yield" in h or "yield" in h:
+            holding_yield = max(0.0, float(h.get("div_yield") or h.get("dividend_yield") or h.get("yield") or 0.0))
+        elif mkt_val > 0.0 and ann_div > 0.0:
+            holding_yield = round((ann_div / mkt_val) * 100.0, 2)
+        elif shares > 0.0 and ann_div > 0.0:
+            buy_p = max(0.0, float(h.get("buy_price", 0.0)))
+            cost = max(0.0, float(h.get("cost_basis") or (shares * buy_p)))
+            if cost > 0.0:
+                holding_yield = round((ann_div / cost) * 100.0, 2)
+
+        if holding_yield > 0.0:
+            individual_yields.append(holding_yield)
+
+        if ann_div > 0.0 or holding_yield > 0.0:
+            holdings_with_div += 1
+            if holding_yield > best_yield and sym:
+                best_yield = holding_yield
+                best_sym = sym
+            elif best_sym is None and sym:
+                best_yield = max(0.0, holding_yield)
+                best_sym = sym
+        else:
+            holdings_without_div += 1
+
+        total_annual_div += ann_div
+
+        curr = str(h.get("currency") or "USD").strip().upper()
+        by_currency[curr] = round(by_currency.get(curr, 0.0) + ann_div, 2)
+
+    total_annual_div = round(total_annual_div, 2)
+    total_monthly_div = round(total_annual_div / 12.0, 2)
+    total_quarterly_div = round(total_annual_div / 4.0, 2)
+
+    if total_market_val > 0.0:
+        avg_portfolio_yield = round((total_annual_div / total_market_val) * 100.0, 2)
+    elif individual_yields:
+        avg_portfolio_yield = round(sum(individual_yields) / len(individual_yields), 2)
+    else:
+        avg_portfolio_yield = 0.0
+
+    highest_yielder: Optional[Dict[str, Any]] = None
+    if best_sym is not None and best_yield >= 0.0:
+        highest_yielder = {
+            "symbol": best_sym,
+            "yield": round(best_yield, 2),
+            "yield_pct": round(best_yield, 2),
+        }
+
+    return {
+        "total_annual_dividend": total_annual_div,
+        "total_monthly_dividend": total_monthly_div,
+        "total_quarterly_dividend": total_quarterly_div,
+        "avg_portfolio_yield": avg_portfolio_yield,
+        "highest_yielder": highest_yielder,
+        "holdings_with_dividends": holdings_with_div,
+        "holdings_without_dividends": holdings_without_div,
+        "by_currency": by_currency,
+    }
+
 
 
 
