@@ -1113,7 +1113,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     <option value="zh_TW">🇭🇰 繁中</option>
                     <option value="zh_CN">🇨🇳 简中</option>
                 </select>
-                <button class="btn-icon" id="btn-cloud-sync" onclick="triggerGoogleSheetSync()" title="Google Sheet Sync">☁️</button>
+                <button class="btn-icon" id="btn-cloud-sync" onclick="triggerGoogleSheetSync()" title="Google Sheet Sync" data-i18n-title="btn_google_sheet_sync">☁️</button>
                 <button class="btn-icon" onclick="toggleTheme()" title="Toggle Dark/Light" data-i18n-title="theme_toggle">🌓</button>
             </div>
         </header>
@@ -1407,6 +1407,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 <button class="tool-tab-btn" id="btn-st-selling" onclick="switchToolSubTab('selling')" data-i18n="st_selling">💰 賣出損益</button>
                 <button class="tool-tab-btn" id="btn-st-health" onclick="switchToolSubTab('health')" data-i18n="st_health">🩺 健康檢查</button>
                 <button class="tool-tab-btn" id="btn-st-reports" onclick="switchToolSubTab('reports')" data-i18n="st_reports">📄 財務報表</button>
+                <button class="tool-tab-btn" id="btn-st-cloud" onclick="switchToolSubTab('cloud')" data-i18n="st_cloud">☁️ 雲端同步</button>
                 <button class="tool-tab-btn" id="btn-st-backup" onclick="switchToolSubTab('backup')" data-i18n="st_backup">💾 資料備份</button>
                 <button class="tool-tab-btn" id="btn-st-diag" onclick="switchToolSubTab('diag')" data-i18n="st_diag">📱 系統診斷</button>
             </div>
@@ -1692,6 +1693,85 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 </div>
             </div>
 
+            <!-- SUBPANE: GOOGLE SHEET CLOUD SYNC -->
+            <div id="subpane-cloud" class="tool-subpane">
+                <div class="card">
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+                        <div class="card-title" data-i18n="cloud_title" style="margin: 0;">☁️ Google 試算表雲端同步 (Cloud Sync)</div>
+                        <span id="cloud-pane-badge" class="pill" style="font-size:0.75rem; padding: 2px 8px; font-weight: 700;">檢查中...</span>
+                    </div>
+                    <div style="font-size: 0.78rem; color: var(--text-muted); margin-bottom: 14px;" data-i18n="cloud_desc">
+                        使用 Google Sheets 試算表作為跨裝置雲端資料庫，無縫同步持倉、自選清單與交易歷史記錄。
+                    </div>
+
+                    <!-- Cloud Status Card -->
+                    <div style="background: var(--bg-card-subtle); padding: 12px 14px; border-radius: 12px; margin-bottom: 14px; font-size: 0.82rem; line-height: 1.8;">
+                        <div style="display:flex; justify-content:space-between;">
+                            <span data-i18n="cloud_lbl_status">雲端連線狀態:</span>
+                            <strong id="cloud-pane-status-txt">未設定</strong>
+                        </div>
+                        <div style="display:flex; justify-content:space-between;">
+                            <span data-i18n="cloud_lbl_last_sync">上次同步時間:</span>
+                            <span id="cloud-pane-time-txt">-</span>
+                        </div>
+                        <div style="display:flex; justify-content:space-between;">
+                            <span data-i18n="cloud_lbl_device">本機裝置識別:</span>
+                            <span id="cloud-pane-dev-txt" style="color: var(--text-muted); font-family: monospace; font-size: 0.76rem;">-</span>
+                        </div>
+                        <div id="cloud-pane-msg" style="margin-top: 6px; font-weight: 600; color: var(--text-muted);"></div>
+                    </div>
+
+                    <!-- Sync Actions Row -->
+                    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 8px; margin-bottom: 14px;">
+                        <button class="btn-action-primary" style="padding: 10px; font-size: 0.85rem;" onclick="triggerGoogleSheetSync(true)">
+                            🔄 <span data-i18n="btn_sync_now">立即雙向同步</span>
+                        </button>
+                        <button class="btn-action-primary" style="background: var(--bg-card-subtle); color: var(--text-main); border: 1px solid var(--border-color); padding: 10px; font-size: 0.85rem;" onclick="triggerGoogleSheetPush()">
+                            ⬆️ <span data-i18n="btn_sync_push">上傳至 Google Sheet</span>
+                        </button>
+                        <button class="btn-action-primary" style="background: var(--bg-card-subtle); color: var(--text-main); border: 1px solid var(--border-color); padding: 10px; font-size: 0.85rem;" onclick="triggerGoogleSheetPull()">
+                            ⬇️ <span data-i18n="btn_sync_pull">自 Google Sheet 下載</span>
+                        </button>
+                    </div>
+
+                    <!-- Configuration Form -->
+                    <div class="card-title" style="margin: 16px 0 8px 0; font-size: 0.92rem;" data-i18n="cloud_cfg_title">⚙️ Google Apps Script 設定</div>
+                    <div class="form-group" style="margin-bottom: 10px;">
+                        <label class="form-label" data-i18n="cloud_lbl_url">Google Apps Script Web App URL</label>
+                        <input id="cloud-pane-url" class="form-control" placeholder="https://script.google.com/macros/s/.../exec">
+                    </div>
+
+                    <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 14px;">
+                        <input type="checkbox" id="cloud-pane-autoupload" style="width: 16px; height: 16px; cursor: pointer;">
+                        <label for="cloud-pane-autoupload" style="font-size: 0.82rem; cursor: pointer; user-select: none;" data-i18n="cloud_lbl_autoupload">編輯或交易時自動背景同步至雲端</label>
+                    </div>
+
+                    <div style="display: flex; gap: 8px; margin-bottom: 14px;">
+                        <button class="btn-action-primary" style="background: var(--bg-card-subtle); color: var(--text-main); border: 1px solid var(--border-color); padding: 8px 14px; font-size: 0.82rem;" onclick="testGoogleSheetConnectionPane()">
+                            🔌 <span data-i18n="btn_test_connection">測試連線</span>
+                        </button>
+                        <button class="btn-action-primary" style="flex: 1; padding: 8px 14px; font-size: 0.82rem;" onclick="saveGoogleSheetPaneConfig()">
+                            💾 <span data-i18n="btn_save_config">儲存設定</span>
+                        </button>
+                    </div>
+
+                    <!-- Apps Script Setup Guide -->
+                    <details style="font-size: 0.78rem; color: var(--text-muted); background: var(--bg-card-subtle); padding: 10px 14px; border-radius: 10px; margin-top: 8px;">
+                        <summary style="cursor: pointer; font-weight: 700; color: var(--accent-blue);" data-i18n="cloud_guide_summary">📖 30 秒快速安裝與部署教學 (點擊展開)</summary>
+                        <div style="margin: 10px 0 6px 0; line-height: 1.7;" data-i18n="cloud_guide_steps">
+                            1. 前往 Google 試算表建立新表格 (<a href="https://sheets.new" target="_blank" style="color:var(--accent-blue);">sheets.new</a>)<br>
+                            2. 點選頂部選單「擴充功能」 &rarr; 「Apps Script」<br>
+                            3. 貼上程式碼，點擊「部署」 &rarr; 「新增部署」 &rarr; 選擇「網頁應用程式」<br>
+                            4. 執行身分選擇「我」，存取權限選擇「任何人 (Anyone)」<br>
+                            5. 複製生成的網頁應用程式網址，貼至上方輸入框並儲存即可！
+                        </div>
+                        <button class="btn-action-primary" style="background: rgba(10,132,255,0.15); color: var(--accent-blue); padding: 8px 12px; font-size: 0.78rem; border: 1px solid var(--accent-blue); margin-top: 6px;" onclick="copyGoogleAppsScript()">
+                            📋 <span data-i18n="btn_copy_script">複製 Google Apps Script 程式碼</span>
+                        </button>
+                    </details>
+                </div>
+            </div>
+
             <!-- SUBPANE 8: DATA BACKUP & EXPORT -->
             <div id="subpane-backup" class="tool-subpane">
                 <div class="card">
@@ -1710,6 +1790,19 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                         <a href="/api/export/json" download="g_finance_backup.json" class="btn-action-primary" data-i18n="btn_dl_json">
                             📦 下載完整系統備份 (JSON Backup)
                         </a>
+                    </div>
+
+                    <div class="card-title" style="margin-top: 18px; font-size: 0.92rem;" data-i18n="cloud_backup_title">☁️ Google 試算表即時雲端同步</div>
+                    <div style="font-size: 0.78rem; color: var(--text-muted); margin-bottom: 10px;" data-i18n="cloud_backup_desc">
+                        與 Google Sheets 保持雙向同步，支援自動多版本備份與跨設備無縫接軌。
+                    </div>
+                    <div style="display: flex; gap: 8px;">
+                        <button class="btn-action-primary" style="flex: 1; padding: 10px; font-size: 0.84rem;" onclick="triggerGoogleSheetSync(true)" data-i18n="btn_sync_now">
+                            🔄 立即同步 Google 試算表
+                        </button>
+                        <button class="btn-action-primary" style="background: var(--bg-card-subtle); color: var(--text-main); border: 1px solid var(--border-color); padding: 10px 14px; font-size: 0.84rem;" onclick="switchToolSubTab('cloud')" data-i18n="btn_cloud_settings">
+                            ⚙️ 雲端設定
+                        </button>
                     </div>
                 </div>
             </div>
@@ -1733,6 +1826,9 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
                     <div class="card-title" style="margin-top: 16px; font-size: 0.92rem;" data-i18n="quick_server_actions">⚡ 快速伺服器動作</div>
                     <div style="display: flex; flex-direction: column; gap: 8px; margin-top: 8px;">
+                        <button class="btn-icon" style="padding: 12px; font-size: 0.9rem;" onclick="triggerGoogleSheetSync(true)" data-i18n="btn_google_sheet_sync">
+                            ☁️ 立即同步 Google 試算表
+                        </button>
                         <button class="btn-icon" style="padding: 12px; font-size: 0.9rem;" onclick="triggerManualRefresh()" data-i18n="btn_refresh_quotes">
                             🔄 立即刷新所有股價行情
                         </button>
@@ -2100,8 +2196,28 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 "st_selling": "💰 Sell P&L",
                 "st_health": "🩺 Health",
                 "st_reports": "📄 Reports",
+                "st_cloud": "☁️ Cloud Sync",
                 "st_backup": "💾 Backup",
                 "st_diag": "📱 System",
+                "btn_google_sheet_sync": "Google Sheet Sync",
+                "cloud_title": "☁️ Google Sheet Cloud Sync",
+                "cloud_desc": "Use Google Sheets as a free cross-device cloud database to sync holdings, watchlist, and transactions seamlessly across all your devices.",
+                "cloud_lbl_status": "Cloud Connection Status:",
+                "cloud_lbl_last_sync": "Last Synchronized:",
+                "cloud_lbl_device": "Local Device ID:",
+                "cloud_cfg_title": "⚙️ Google Apps Script Configuration",
+                "cloud_lbl_url": "Google Apps Script Web App URL",
+                "cloud_lbl_autoupload": "Automatically sync edits to cloud in background",
+                "btn_sync_now": "Sync Now",
+                "btn_sync_push": "Push to Cloud",
+                "btn_sync_pull": "Pull from Cloud",
+                "btn_test_connection": "Test Connection",
+                "btn_save_config": "Save Settings",
+                "cloud_guide_summary": "📖 30-Second Quick Setup Guide (Click to expand)",
+                "cloud_backup_title": "☁️ Google Sheets Cloud Sync",
+                "cloud_backup_desc": "Keep your financial data synchronized with Google Sheets with automatic backups and conflict safety.",
+                "btn_cloud_settings": "Cloud Settings",
+                "btn_copy_script": "Copy Google Apps Script Code",
                 "whatif_title": "💡 What-If Scenario Investment Calculator",
                 "whatif_desc": "Simulate adding capital or new positions to forecast impact on total wealth, allocations, and dividend cash flow.",
                 "whatif_sel_lbl": "Select Holding (or Enter Manually)",
@@ -2376,8 +2492,28 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 "st_selling": "💰 賣出損益",
                 "st_health": "🩺 健康檢查",
                 "st_reports": "📄 財務報表",
+                "st_cloud": "☁️ 雲端同步",
                 "st_backup": "💾 資料備份",
                 "st_diag": "📱 系統診斷",
+                "btn_google_sheet_sync": "Google 試算表同步",
+                "cloud_title": "☁️ Google 試算表雲端同步",
+                "cloud_desc": "使用 Google Sheets 試算表作為跨裝置雲端資料庫，無縫同步持倉、自選清單與交易歷史記錄。",
+                "cloud_lbl_status": "雲端連線狀態:",
+                "cloud_lbl_last_sync": "上次同步時間:",
+                "cloud_lbl_device": "本機裝置識別:",
+                "cloud_cfg_title": "⚙️ Google Apps Script 設定",
+                "cloud_lbl_url": "Google Apps Script 網頁應用程式網址 (Web App URL)",
+                "cloud_lbl_autoupload": "編輯或交易時自動背景同步至雲端",
+                "btn_sync_now": "立即雙向同步",
+                "btn_sync_push": "強制上傳至試算表",
+                "btn_sync_pull": "強制自試算表下載",
+                "btn_test_connection": "測試連線",
+                "btn_save_config": "儲存設定",
+                "cloud_guide_summary": "📖 30 秒快速安裝與部署教學 (點擊展開)",
+                "cloud_backup_title": "☁️ Google 試算表即時雲端同步",
+                "cloud_backup_desc": "與 Google Sheets 保持雙向同步，支援自動多版本備份與跨設備無縫接軌。",
+                "btn_cloud_settings": "雲端設定",
+                "btn_copy_script": "複製 Google Apps Script 程式碼",
                 "whatif_title": "💡 What-If 模擬加碼試算機",
                 "whatif_desc": "模擬加碼或買進新標的，即時預估對總資產、持有股數、配置比例與年股息的影響。",
                 "whatif_sel_lbl": "選擇持倉標的 (或手動輸入)",
@@ -2652,8 +2788,28 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 "st_selling": "💰 卖出损益",
                 "st_health": "🩺 健康检查",
                 "st_reports": "📄 财务报表",
+                "st_cloud": "☁️ 云端同步",
                 "st_backup": "💾 数据备份",
                 "st_diag": "📱 系统诊断",
+                "btn_google_sheet_sync": "Google 表格同步",
+                "cloud_title": "☁️ Google 表格云端同步",
+                "cloud_desc": "使用 Google Sheets 表格作为跨设备云端数据库，无缝同步持仓、自选清单与交易历史记录。",
+                "cloud_lbl_status": "云端连接状态:",
+                "cloud_lbl_last_sync": "上次同步时间:",
+                "cloud_lbl_device": "本机设备识别:",
+                "cloud_cfg_title": "⚙️ Google Apps Script 设置",
+                "cloud_lbl_url": "Google Apps Script 网页应用网址 (Web App URL)",
+                "cloud_lbl_autoupload": "编辑或交易时自动后台同步至云端",
+                "btn_sync_now": "立即双向同步",
+                "btn_sync_push": "强制上传至表格",
+                "btn_sync_pull": "强制自表格下载",
+                "btn_test_connection": "测试连接",
+                "btn_save_config": "保存设置",
+                "cloud_guide_summary": "📖 30 秒快速安装与部署教学 (点击展开)",
+                "cloud_backup_title": "☁️ Google 表格实时云端同步",
+                "cloud_backup_desc": "与 Google Sheets 保持双向同步，支持自动多版本备份与跨设备无缝接轨。",
+                "btn_cloud_settings": "云端设置",
+                "btn_copy_script": "复制 Google Apps Script 代码",
                 "whatif_title": "💡 What-If 模拟加码试算机",
                 "whatif_desc": "模拟加码或买进新标的，实时预估对总资产、持有股数、配置比例与年股息的影响。",
                 "whatif_sel_lbl": "选择持仓标的 (或手动输入)",
@@ -4251,6 +4407,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             else if (subId === 'whatif') runWhatIfCalc();
             else if (subId === 'split') runSplitCalc();
             else if (subId === 'selling') runSellCalc();
+            else if (subId === 'cloud') fetchGoogleSheetStatus();
         }
 
         function populateToolsDropdowns(holdings) {
@@ -4887,31 +5044,76 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             } catch (err) {
                 alert(t('err_network', { msg: err.message }));
             }
+        }
+
         // --- GOOGLE SHEETS CLOUD SYNC FUNCTIONS ---
         async function fetchGoogleSheetStatus() {
             try {
                 const res = await fetch('/api/google_sheet/status');
                 const cfg = await res.json();
+                
+                // 1. Update Header / Hero Badge
                 const badge = document.getElementById('sheet-sync-badge');
                 if (badge) {
                     if (!cfg.configured) {
-                        badge.textContent = '☁️ Setup Sync';
+                        badge.textContent = '☁️ ' + (currentLang === 'en' ? 'Setup Sync' : (currentLang === 'zh_CN' ? '未设置同步' : '未設定同步'));
                         badge.style.background = 'rgba(255, 179, 0, 0.2)';
                         badge.style.color = 'var(--accent-amber)';
                     } else if (cfg.has_conflict) {
-                        badge.textContent = '⚠️ Conflict';
+                        badge.textContent = '⚠️ ' + (currentLang === 'en' ? 'Conflict' : (currentLang === 'zh_CN' ? '发现冲突' : '發現衝突'));
                         badge.style.background = 'rgba(255, 69, 58, 0.2)';
                         badge.style.color = 'var(--accent-red)';
                     } else if (cfg.last_sync_status === 'success') {
-                        badge.textContent = '☁️ Synced';
+                        badge.textContent = '☁️ ' + (currentLang === 'en' ? 'Synced' : (currentLang === 'zh_CN' ? '已同步' : '已同步'));
                         badge.style.background = 'rgba(52, 199, 89, 0.2)';
                         badge.style.color = 'var(--accent-green)';
                     } else if (cfg.last_sync_status === 'offline') {
-                        badge.textContent = '☁️ Offline';
+                        badge.textContent = '☁️ ' + (currentLang === 'en' ? 'Offline' : (currentLang === 'zh_CN' ? '离线' : '離線'));
                         badge.style.background = 'rgba(142, 142, 147, 0.2)';
                         badge.style.color = 'var(--text-muted)';
+                    } else {
+                        badge.textContent = '☁️ ' + (cfg.last_sync_status || 'Sync');
                     }
                 }
+
+                // 2. Update Tools Subpane
+                const paneBadge = document.getElementById('cloud-pane-badge');
+                if (paneBadge) {
+                    if (!cfg.configured) {
+                        paneBadge.textContent = currentLang === 'en' ? '⚠️ Not Configured' : (currentLang === 'zh_CN' ? '⚠️ 未设置' : '⚠️ 未設定');
+                        paneBadge.style.background = 'rgba(255, 179, 0, 0.2)';
+                        paneBadge.style.color = 'var(--accent-amber)';
+                    } else if (cfg.has_conflict) {
+                        paneBadge.textContent = currentLang === 'en' ? '⚠️ Conflict' : (currentLang === 'zh_CN' ? '⚠️ 发现冲突' : '⚠️ 發現衝突');
+                        paneBadge.style.background = 'rgba(255, 69, 58, 0.2)';
+                        paneBadge.style.color = 'var(--accent-red)';
+                    } else if (cfg.last_sync_status === 'success') {
+                        paneBadge.textContent = currentLang === 'en' ? '✅ Synced' : (currentLang === 'zh_CN' ? '✅ 已同步' : '✅ 已同步');
+                        paneBadge.style.background = 'rgba(52, 199, 89, 0.2)';
+                        paneBadge.style.color = 'var(--accent-green)';
+                    } else {
+                        paneBadge.textContent = '☁️ ' + (cfg.last_sync_status || 'Unknown');
+                        paneBadge.style.background = 'rgba(142, 142, 147, 0.2)';
+                        paneBadge.style.color = 'var(--text-muted)';
+                    }
+                }
+                const paneSt = document.getElementById('cloud-pane-status-txt');
+                if (paneSt) paneSt.textContent = (cfg.last_sync_status || 'not_configured').toUpperCase();
+                const paneTm = document.getElementById('cloud-pane-time-txt');
+                if (paneTm) paneTm.textContent = cfg.last_sync_time || (currentLang === 'en' ? 'Never' : '從未同步');
+                const paneDev = document.getElementById('cloud-pane-dev-txt');
+                if (paneDev) paneDev.textContent = `${cfg.device_name || 'Device'} (${(cfg.device_id || '').substring(0, 14)}...)`;
+                const paneMsg = document.getElementById('cloud-pane-msg');
+                if (paneMsg) paneMsg.textContent = cfg.last_sync_message || '';
+                const paneUrl = document.getElementById('cloud-pane-url');
+                if (paneUrl && !paneUrl.value && cfg.web_app_url) paneUrl.value = cfg.web_app_url;
+                const paneAuto = document.getElementById('cloud-pane-autoupload');
+                if (paneAuto && typeof cfg.auto_upload_on_edit !== 'undefined') paneAuto.checked = !!cfg.auto_upload_on_edit;
+
+                // 3. Update Modal inputs if present
+                const modalUrl = document.getElementById('sheet-modal-url');
+                if (modalUrl && !modalUrl.value && cfg.web_app_url) modalUrl.value = cfg.web_app_url;
+
                 return cfg;
             } catch (e) {
                 console.error("Sheet status error:", e);
@@ -4919,14 +5121,20 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             }
         }
 
-        async function triggerGoogleSheetSync() {
+        async function triggerGoogleSheetSync(fromTools = false) {
             const badge = document.getElementById('sheet-sync-badge');
             if (badge) badge.textContent = '🔄 Syncing...';
+            const paneBadge = document.getElementById('cloud-pane-badge');
+            if (paneBadge) paneBadge.textContent = '🔄 同步中...';
             try {
                 const res = await fetch('/api/google_sheet/sync', { method: 'POST' });
                 const data = await res.json();
                 if (data.status === 'not_configured') {
-                    openGoogleSheetModal();
+                    if (fromTools) {
+                        showToast(currentLang === 'en' ? 'Please configure Google Apps Script URL below.' : '請在下方設定 Google Apps Script 網址');
+                    } else {
+                        openGoogleSheetModal();
+                    }
                     return;
                 }
                 if (data.status === 'conflict') {
@@ -4949,6 +5157,97 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 showToast('Sync network error: ' + e, 3000);
             } finally {
                 await fetchGoogleSheetStatus();
+            }
+        }
+
+        async function triggerGoogleSheetPush() {
+            const confirmMsg = currentLang === 'en'
+                ? 'Are you sure you want to push local data to Google Sheet?'
+                : (currentLang === 'zh_CN' ? '确定要将本地数据上传覆盖 Google 表格吗？' : '確定要將本機資料上傳覆蓋 Google 試算表嗎？');
+            if (!confirm(confirmMsg)) return;
+
+            const badge = document.getElementById('sheet-sync-badge');
+            if (badge) badge.textContent = '⬆️ Uploading...';
+            const paneBadge = document.getElementById('cloud-pane-badge');
+            if (paneBadge) paneBadge.textContent = '⬆️ 上傳中...';
+
+            try {
+                const res = await fetch('/api/google_sheet/push', { method: 'POST' });
+                const data = await res.json();
+                showToast(data.message || '已成功上傳至 Google 試算表！');
+                await fetchGoogleSheetStatus();
+                loadData();
+            } catch (e) {
+                showToast('上傳失敗: ' + e, 3000);
+            } finally {
+                await fetchGoogleSheetStatus();
+            }
+        }
+
+        async function triggerGoogleSheetPull() {
+            const confirmMsg = currentLang === 'en'
+                ? 'Are you sure you want to download data from Google Sheet? (Automatic local backup will be created)'
+                : (currentLang === 'zh_CN' ? '确定要自 Google 表格下载数据覆盖本地吗？（系统将自动创建备份）' : '確定要自 Google 試算表下載資料覆蓋本機嗎？（系統將自動建立備份）');
+            if (!confirm(confirmMsg)) return;
+
+            const badge = document.getElementById('sheet-sync-badge');
+            if (badge) badge.textContent = '⬇️ Downloading...';
+            const paneBadge = document.getElementById('cloud-pane-badge');
+            if (paneBadge) paneBadge.textContent = '⬇️ 下載中...';
+
+            try {
+                const res = await fetch('/api/google_sheet/pull', { method: 'POST' });
+                const data = await res.json();
+                showToast(data.message || '已成功自 Google 試算表下載！');
+                await fetchGoogleSheetStatus();
+                loadData();
+            } catch (e) {
+                showToast('下載失敗: ' + e, 3000);
+            } finally {
+                await fetchGoogleSheetStatus();
+            }
+        }
+
+        async function testGoogleSheetConnectionPane() {
+            const url = (document.getElementById('cloud-pane-url').value || '').trim();
+            const msg = document.getElementById('cloud-pane-msg');
+            if (msg) {
+                msg.textContent = currentLang === 'en' ? 'Testing connection...' : '連線測試中...';
+                msg.style.color = 'var(--accent-blue)';
+            }
+            try {
+                const res = await fetch('/api/google_sheet/test', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ web_app_url: url })
+                });
+                const d = await res.json();
+                if (msg) {
+                    msg.textContent = d.message;
+                    msg.style.color = d.success ? 'var(--accent-green)' : 'var(--accent-red)';
+                }
+                showToast(d.success ? '✅ Google Sheet 連線成功！' : '❌ 連線失敗: ' + d.message);
+            } catch (e) {
+                if (msg) {
+                    msg.textContent = '連線測試失敗: ' + e;
+                    msg.style.color = 'var(--accent-red)';
+                }
+            }
+        }
+
+        async function saveGoogleSheetPaneConfig() {
+            const url = (document.getElementById('cloud-pane-url').value || '').trim();
+            const autoupload = document.getElementById('cloud-pane-autoupload')?.checked ?? true;
+            try {
+                await fetch('/api/google_sheet/config', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ web_app_url: url, auto_upload_on_edit: autoupload })
+                });
+                showToast(currentLang === 'en' ? 'Google Sheet settings saved!' : 'Google 試算表設定已儲存！');
+                await fetchGoogleSheetStatus();
+            } catch (e) {
+                showToast('儲存失敗: ' + e);
             }
         }
 
@@ -5261,13 +5560,13 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             self.send_json(dev_info)
 
         # Google Sheet Sync Status API
-        elif path == "/api/google_sheet/status":
+        elif path in ("/api/google_sheet/status", "/api/sync/status", "/api/sync/google_sheets/status", "/api/sync/google_sheets"):
             from google_sheet_sync import get_google_sheet_sync
             sync_mgr = get_google_sheet_sync()
             self.send_json(sync_mgr.get_sync_status())
 
         # Google Sheet Apps Script Template API
-        elif path == "/api/google_sheet/apps_script":
+        elif path in ("/api/google_sheet/apps_script", "/api/sync/apps_script"):
             from google_sheet_sync import get_google_apps_script_template
             self.send_json({"code": get_google_apps_script_template()})
 
@@ -5717,13 +6016,27 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         return {}
 
     def do_POST(self):
-        if self.path == "/api/google_sheet/sync":
+        if self.path in ("/api/google_sheet/sync", "/api/sync/google_sheets", "/api/sync"):
+            data = self.read_json_body()
+            direction = data.get("direction") or data.get("force_direction")
             from google_sheet_sync import get_google_sheet_sync
             sync_mgr = get_google_sheet_sync()
-            res = sync_mgr.perform_sync()
+            res = sync_mgr.perform_sync(force_direction=direction)
             self.send_json(res)
 
-        elif self.path == "/api/google_sheet/resolve":
+        elif self.path in ("/api/google_sheet/push", "/api/sync/push", "/api/sync/google_sheets/push"):
+            from google_sheet_sync import get_google_sheet_sync
+            sync_mgr = get_google_sheet_sync()
+            res = sync_mgr.perform_sync(force_direction="keep_local")
+            self.send_json(res)
+
+        elif self.path in ("/api/google_sheet/pull", "/api/sync/pull", "/api/sync/google_sheets/pull"):
+            from google_sheet_sync import get_google_sheet_sync
+            sync_mgr = get_google_sheet_sync()
+            res = sync_mgr.perform_sync(force_direction="keep_remote")
+            self.send_json(res)
+
+        elif self.path in ("/api/google_sheet/resolve", "/api/sync/resolve"):
             data = self.read_json_body()
             choice = data.get("resolution", "keep_local")
             from google_sheet_sync import get_google_sheet_sync
@@ -5731,7 +6044,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
             res = sync_mgr.perform_sync(force_direction=choice)
             self.send_json(res)
 
-        elif self.path == "/api/google_sheet/config":
+        elif self.path in ("/api/google_sheet/config", "/api/sync/config"):
             data = self.read_json_body()
             from google_sheet_sync import get_google_sheet_sync, save_sheet_config
             sync_mgr = get_google_sheet_sync()
@@ -5743,7 +6056,7 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
                 save_sheet_config(sync_mgr.config)
             self.send_json({"status": "ok", "config": sync_mgr.get_sync_status()})
 
-        elif self.path == "/api/google_sheet/test":
+        elif self.path in ("/api/google_sheet/test", "/api/sync/test"):
             data = self.read_json_body()
             test_url = (data.get("web_app_url") or "").strip()
             from google_sheet_sync import get_google_sheet_sync

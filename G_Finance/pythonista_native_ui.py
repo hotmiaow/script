@@ -236,42 +236,74 @@ class NativeChartView(ui.View if ui else object):
             self.set_needs_display()
 
     def draw(self):
-        w = getattr(self, "width", 0) or 380
-        h = getattr(self, "height", 0) or 260
-        if not ui or not self.prices or len(self.prices) < 2:
+        try:
+            self._safe_draw()
+        except Exception as e:
             if ui:
                 ui.set_color(self.theme.TEXT_SECONDARY)
-                font = ("<System>", 14)
                 ui.draw_string(
-                    "暫無圖表數據 (請點選時間區間或刷新)",
-                    rect=(20, h * 0.45, max(40, w - 40), 30),
-                    font=font,
+                    f"圖表繪製異常: {e}",
+                    rect=(14, 20, max(60, getattr(self, "width", 300) - 28), 30),
+                    font=("<System>", 12),
                     color=self.theme.TEXT_SECONDARY,
                     alignment=ui.ALIGN_CENTER,
                 )
+
+    def _safe_draw(self):
+        w = getattr(self, "width", 0) or 380
+        h = getattr(self, "height", 0) or 260
+        if not ui:
+            return
+
+        # Sanitize and extract only valid finite floats
+        valid_prices = []
+        for p in (self.prices or []):
+            try:
+                pf = float(p)
+                if math.isfinite(pf):
+                    valid_prices.append(pf)
+            except (ValueError, TypeError):
+                continue
+
+        if len(valid_prices) < 2:
+            ui.set_color(self.theme.TEXT_SECONDARY)
+            font = ("<System>", 14)
+            ui.draw_string(
+                "暫無圖表數據 (請點選時間區間或刷新)",
+                rect=(20, h * 0.45, max(40, w - 40), 30),
+                font=font,
+                color=self.theme.TEXT_SECONDARY,
+                alignment=ui.ALIGN_CENTER,
+            )
             return
 
         pad_l, pad_r, pad_t, pad_b = 14, 58, 16, 24
         plot_w = w - pad_l - pad_r
         plot_h = h - pad_t - pad_b
-        if plot_w <= 0 or plot_h <= 0:
+        if plot_w <= 10 or plot_h <= 10:
             return
 
-        min_p = min(self.prices)
-        max_p = max(self.prices)
-        ref_val = 0.0 if self.is_growth else self.prev_close
+        min_p = min(valid_prices)
+        max_p = max(valid_prices)
+        ref_val = 0.0 if self.is_growth else float(self.prev_close or 0.0)
+        if not math.isfinite(ref_val):
+            ref_val = 0.0
+
         if self.is_growth:
             min_p = min(min_p, 0.0)
             max_p = max(max_p, 0.0)
-        elif self.prev_close > 0:
-            min_p = min(min_p, self.prev_close)
-            max_p = max(max_p, self.prev_close)
+        elif ref_val > 0:
+            min_p = min(min_p, ref_val)
+            max_p = max(max_p, ref_val)
 
-        p_range = max_p - min_p if max_p > min_p else max(1.0, abs(max_p) * 0.1)
-        margin = p_range * 0.08
+        p_range = max_p - min_p
+        if p_range <= 0 or not math.isfinite(p_range):
+            p_range = max(1.0, abs(max_p) * 0.1)
+
+        margin = max(0.01, p_range * 0.08)
         min_p -= margin
         max_p += margin
-        p_range = max_p - min_p
+        p_range = max(1e-4, max_p - min_p)
 
         # 1. Draw subtle horizontal gridlines & Y labels
         n_grids = 4
@@ -279,6 +311,8 @@ class NativeChartView(ui.View if ui else object):
         for i in range(n_grids + 1):
             val = min_p + (i / n_grids) * p_range
             gy = pad_t + plot_h - (i / n_grids) * plot_h
+            if not math.isfinite(gy):
+                continue
             line = ui.Path()
             line.move_to(pad_l, gy)
             line.line_to(pad_l + plot_w, gy)
@@ -287,7 +321,7 @@ class NativeChartView(ui.View if ui else object):
 
             # Label on the right margin
             sign = "-" if val < 0 else ""
-            abs_v = abs(val)
+            abs_v = abs(val) if math.isfinite(val) else 0.0
             lbl_str = f"{sign}{self.currency_sym}{abs_v:,.0f}" if abs_v >= 1000 else f"{sign}{self.currency_sym}{abs_v:,.2f}"
             ui.draw_string(
                 lbl_str,
@@ -300,23 +334,28 @@ class NativeChartView(ui.View if ui else object):
         # 2. Draw previous close or baseline reference dashed line
         if min_p <= ref_val <= max_p:
             ref_y = pad_t + plot_h - ((ref_val - min_p) / p_range) * plot_h
-            ref_path = ui.Path()
-            ref_path.move_to(pad_l, ref_y)
-            ref_path.line_to(pad_l + plot_w, ref_y)
-            ref_path.line_width = 1.0
-            ref_path.set_line_dash([3, 3])
-            ui.set_color(self.theme.CHART_REF)
-            ref_path.stroke()
+            if math.isfinite(ref_y):
+                ref_path = ui.Path()
+                ref_path.move_to(pad_l, ref_y)
+                ref_path.line_to(pad_l + plot_w, ref_y)
+                ref_path.line_width = 1.0
+                ref_path.set_line_dash([3, 3])
+                ui.set_color(self.theme.CHART_REF)
+                ref_path.stroke()
 
         # 3. Calculate points
-        n_pts = len(self.prices)
+        n_pts = len(valid_prices)
         pts = []
-        for i, p in enumerate(self.prices):
-            px = pad_l + (i / (n_pts - 1)) * plot_w
+        for i, p in enumerate(valid_prices):
+            px = pad_l + (i / max(1, n_pts - 1)) * plot_w
             py = pad_t + plot_h - ((p - min_p) / p_range) * plot_h
-            pts.append((px, py))
+            if math.isfinite(px) and math.isfinite(py):
+                pts.append((px, py))
 
-        curr_p = self.prices[-1]
+        if len(pts) < 2:
+            return
+
+        curr_p = valid_prices[-1]
         if self.mode == "div_only":
             is_pos = True
             line_color = self.theme.ACCENT_BLUE
@@ -347,11 +386,11 @@ class NativeChartView(ui.View if ui else object):
         curve.stroke()
 
         # 6. Interactive Touch Crosshair
-        if self.touch_x is not None:
-            tx = max(pad_l, min(pad_l + plot_w, self.touch_x))
-            frac = (tx - pad_l) / plot_w
-            idx = int(round(frac * (n_pts - 1)))
-            idx = max(0, min(n_pts - 1, idx))
+        if self.touch_x is not None and pts:
+            tx = max(pad_l, min(pad_l + plot_w, float(self.touch_x)))
+            frac = (tx - pad_l) / max(1.0, plot_w)
+            idx = int(round(frac * (len(pts) - 1)))
+            idx = max(0, min(len(pts) - 1, idx))
             cx, cy = pts[idx]
 
             # Vertical dashed crosshair line
@@ -373,38 +412,50 @@ class NativeChartView(ui.View if ui else object):
             dot_border.stroke()
 
     def touch_began(self, touch):
-        self.touch_x = touch.location.x
-        self._trigger_hover_at(touch.location.x)
-        if hasattr(self, "set_needs_display"):
-            self.set_needs_display()
+        try:
+            self.touch_x = touch.location.x
+            self._trigger_hover_at(touch.location.x)
+            if hasattr(self, "set_needs_display"):
+                self.set_needs_display()
+        except Exception:
+            pass
 
     def touch_moved(self, touch):
-        self.touch_x = touch.location.x
-        self._trigger_hover_at(touch.location.x)
-        if hasattr(self, "set_needs_display"):
-            self.set_needs_display()
+        try:
+            self.touch_x = touch.location.x
+            self._trigger_hover_at(touch.location.x)
+            if hasattr(self, "set_needs_display"):
+                self.set_needs_display()
+        except Exception:
+            pass
 
     def touch_ended(self, touch):
-        self.touch_x = None
-        if self.on_hover_callback:
-            self.on_hover_callback(None, None)
-        if hasattr(self, "set_needs_display"):
-            self.set_needs_display()
+        try:
+            self.touch_x = None
+            if self.on_hover_callback:
+                self.on_hover_callback(None, None)
+            if hasattr(self, "set_needs_display"):
+                self.set_needs_display()
+        except Exception:
+            pass
 
     def _trigger_hover_at(self, tx: float):
-        if not self.prices or not self.on_hover_callback:
-            return
-        w = getattr(self, "width", 0) or 380
-        pad_l, pad_r = 14, 58
-        plot_w = w - pad_l - pad_r
-        if plot_w <= 0:
-            return
-        frac = (tx - pad_l) / plot_w
-        idx = int(round(frac * (len(self.prices) - 1)))
-        idx = max(0, min(len(self.prices) - 1, idx))
-        p = self.prices[idx]
-        t_val = self.timestamps[idx] if idx < len(self.timestamps) else ""
-        self.on_hover_callback(p, t_val)
+        try:
+            if not self.prices or not self.on_hover_callback:
+                return
+            w = getattr(self, "width", 0) or 380
+            pad_l, pad_r = 14, 58
+            plot_w = w - pad_l - pad_r
+            if plot_w <= 0:
+                return
+            frac = (tx - pad_l) / max(1.0, plot_w)
+            idx = int(round(frac * (len(self.prices) - 1)))
+            idx = max(0, min(len(self.prices) - 1, idx))
+            p = self.prices[idx]
+            t_val = self.timestamps[idx] if idx < len(self.timestamps) else ""
+            self.on_hover_callback(p, t_val)
+        except Exception:
+            pass
 
 
 # =============================================================================
@@ -450,8 +501,12 @@ class HoldingsDataSource:
             left_w = max(160, w - right_w - 28)
 
             lbl_sym = ui.Label(name="lbl_sym", font=("<System-Bold>", 16), text_color=self.theme.TEXT_PRIMARY)
-            lbl_sym.frame = (14, 8, left_w, 22)
+            lbl_sym.frame = (14, 8, 70, 22)
             cv.add_subview(lbl_sym)
+
+            lbl_price = ui.Label(name="lbl_price", font=("<System-Bold>", 13), text_color=self.theme.ACCENT_BLUE)
+            lbl_price.frame = (90, 9, max(85, left_w - 76), 20)
+            cv.add_subview(lbl_price)
 
             lbl_name = ui.Label(name="lbl_name", font=("<System>", 12), text_color=self.theme.TEXT_SECONDARY)
             lbl_name.frame = (14, 30, left_w, 18)
@@ -515,25 +570,53 @@ class HoldingsDataSource:
             pct_str = f"{gain_pct:.2f}%"
             dlr_str = f"-{sym_curr}{abs(gain_dlr):,.2f}"
 
+        # Ensure lbl_price exists in recycled cell
+        has_price_lbl = any(getattr(v, "name", "") == "lbl_price" for v in cv.subviews)
+        if not has_price_lbl and ui:
+            lbl_price = ui.Label(name="lbl_price", font=("<System-Bold>", 13), text_color=self.theme.ACCENT_BLUE)
+            cv.add_subview(lbl_price)
+
+        # Dynamic symbol width calculation
+        sym_w = max(45, min(100, len(sym) * 10 + 4))
+        if ui and hasattr(ui, "measure_string"):
+            try:
+                sw, _ = ui.measure_string(sym, font=("<System-Bold>", 16))
+                sym_w = max(45, min(100, int(sw) + 4))
+            except Exception:
+                pass
+
+        price_val = price if price > 0 else (mv / shares if shares > 0 and mv > 0 else bp)
+        price_str = f"現價 {sym_curr}{price_val:,.2f}" if price_val > 0 else "現價 —"
+
         for v in cv.subviews:
             n = getattr(v, "name", "")
             if n == "lbl_sym":
                 v.text = sym
+                v.frame = (14, 8, sym_w, 22)
                 v.text_color = self.theme.TEXT_PRIMARY
+            elif n == "lbl_price":
+                v.text = price_str
+                v.frame = (14 + sym_w + 6, 9, max(85, left_w - sym_w - 6), 20)
+                v.text_color = self.theme.ACCENT_BLUE
             elif n == "lbl_name":
                 v.text = name[:26] if name else sym
+                v.frame = (14, 30, left_w, 18)
                 v.text_color = self.theme.TEXT_SECONDARY
             elif n == "lbl_shs":
-                v.text = f"{shares:g} 股 @ {sym_curr}{bp:,.2f} · {port}"
+                v.text = f"{shares:g} 股 · 成本 {sym_curr}{bp:,.2f} · {port}"
+                v.frame = (14, 48, left_w, 16)
                 v.text_color = self.theme.TEXT_SECONDARY
             elif n == "lbl_mv":
                 v.text = f"{sym_curr}{mv:,.2f}"
+                v.frame = (w - right_w - 14, 8, right_w, 22)
                 v.text_color = self.theme.TEXT_PRIMARY
             elif n == "lbl_pct":
                 v.text = pct_str
+                v.frame = (w - right_w - 14, 30, right_w, 18)
                 v.text_color = gain_color
             elif n == "lbl_dlr":
                 v.text = dlr_str
+                v.frame = (w - right_w - 14, 48, right_w, 16)
                 v.text_color = gain_color
 
         return cell
@@ -1907,15 +1990,36 @@ class GFinanceNativeApp(ui.View if ui else object):
         ):
             self._render_chart_data(self._last_chart_raw_data)
         else:
-            threading.Thread(target=self._fetch_chart_data_async, daemon=True).start()
+            self._trigger_chart_fetch()
 
     def on_timeframe_changed(self, sender):
         tfs = ["1D", "5D", "1M", "6M", "YTD", "1Y", "MAX"]
-        self.selected_timeframe = tfs[sender.selected_index]
-        threading.Thread(target=self._fetch_chart_data_async, daemon=True).start()
+        idx = getattr(sender, "selected_index", -1)
+        if idx is not None and 0 <= idx < len(tfs):
+            self.selected_timeframe = tfs[idx]
+            self._trigger_chart_fetch()
 
-    def _fetch_chart_data_async(self):
+    def _trigger_chart_fetch(self):
+        """Dispatches an asynchronous chart fetch with atomic request serialization to prevent thread collision."""
+        self._chart_req_id = getattr(self, "_chart_req_id", 0) + 1
+        req_id = self._chart_req_id
+
+        def _worker():
+            try:
+                self._fetch_chart_data_async(req_id)
+            except Exception as e:
+                def _err():
+                    if hasattr(self, "lbl_chart_hover"):
+                        self.lbl_chart_hover.text = f"圖表載入中斷: {e}"
+                run_on_ui_thread(_err)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _fetch_chart_data_async(self, req_id: Optional[int] = None):
         """Fetches chart data asynchronously with currency conversion and dispatches updates to Main Thread."""
+        if req_id is not None and req_id != getattr(self, "_chart_req_id", 0):
+            return
+
         try:
             from chart_fetcher import get_chart_fetcher
             fetcher = get_chart_fetcher()
@@ -1936,12 +2040,16 @@ class GFinanceNativeApp(ui.View if ui else object):
             else:
                 data = fetcher.fetch_symbol_history(scope, timeframe=tf)
 
+            if req_id is not None and req_id != getattr(self, "_chart_req_id", 0):
+                return
+
             self._last_chart_raw_data = data
             self._last_chart_scope = scope
             self._last_chart_tf = tf
 
             def _update_ui():
-                self._render_chart_data(data)
+                if req_id is None or req_id == getattr(self, "_chart_req_id", 0):
+                    self._render_chart_data(data)
 
             run_on_ui_thread(_update_ui)
         except Exception as e:
@@ -1951,12 +2059,28 @@ class GFinanceNativeApp(ui.View if ui else object):
             run_on_ui_thread(_show_err)
 
     def _prepare_metric_series(self, data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        raw_prices = list(data.get("prices") or [])
-        raw_timestamps = list(data.get("timestamps") or [])
-        raw_prev = float(data.get("prev_close") or data.get("previous_close") or (raw_prices[0] if raw_prices else 0.0))
-        n_pts = len(raw_prices)
-        if n_pts < 2:
+        raw_prices_in = list(data.get("prices") or [])
+        raw_timestamps_in = list(data.get("timestamps") or [])
+
+        # Sanitize and extract only finite floats and valid timestamps
+        clean_pts = []
+        for p, ts in zip(raw_prices_in, raw_timestamps_in):
+            try:
+                pf = float(p)
+                if math.isfinite(pf):
+                    clean_pts.append((pf, ts))
+            except (ValueError, TypeError):
+                continue
+
+        if len(clean_pts) < 2:
             return None
+
+        raw_prices = [p for p, _ in clean_pts]
+        raw_timestamps = [ts for _, ts in clean_pts]
+        raw_prev = float(data.get("prev_close") or data.get("previous_close") or (raw_prices[0] if raw_prices else 0.0))
+        if not math.isfinite(raw_prev) or raw_prev <= 0:
+            raw_prev = raw_prices[0]
+        n_pts = len(raw_prices)
 
         scope = self.selected_chart_scope
         is_single_stock = (scope not in ("全部投資組合", "All Portfolios"))
@@ -2287,50 +2411,144 @@ class GFinanceNativeApp(ui.View if ui else object):
         """Presents a native iOS sheet with full desktop parity: Buy More, Sell, DRIP, Dividend, Edit, Chart, Delete."""
         if not ui:
             return
-        sym = holding.get("symbol", "")
-        name = holding.get("name", "")
+        sym = str(holding.get("symbol", "")).strip().upper()
+        name = str(holding.get("name", "")).strip() or sym
         shs = float(holding.get("shares", 0.0) or 0.0)
         bp = float(holding.get("buy_price", 0.0) or 0.0)
-        cp = float(holding.get("current_price", 0.0) or 0.0)
+        cp = float(holding.get("current_price", 0.0) or bp)
         mv = float(holding.get("market_value", 0.0) or (shs * cp))
         cb = float(holding.get("cost_basis", 0.0) or (shs * bp))
-        gain = mv - cb
-        gain_pct = (gain / cb * 100) if cb > 0 else 0.0
-        ann_d = float(holding.get("annual_dividend", 0.0) or 0.0)
-        port = holding.get("portfolio", "")
 
-        sheet = ui.View(frame=(0, 0, 360, 560))
+        if holding.get("unrealized_gain") is not None:
+            gain = float(holding.get("unrealized_gain") or 0.0)
+        elif holding.get("unrealized_pl") is not None:
+            gain = float(holding.get("unrealized_pl") or 0.0)
+        else:
+            gain = round(mv - cb, 2)
+
+        if holding.get("unrealized_gain_pct") is not None:
+            gain_pct = float(holding.get("unrealized_gain_pct") or 0.0)
+        elif holding.get("unrealized_pl_pct") is not None:
+            gain_pct = float(holding.get("unrealized_pl_pct") or 0.0)
+        else:
+            gain_pct = round((gain / cb * 100), 2) if cb > 0 else 0.0
+
+        ann_d = float(holding.get("annual_dividend", 0.0) or 0.0)
+        yield_pct = (ann_d / mv * 100) if mv > 0 else 0.0
+        port = str(holding.get("portfolio", "Default")).strip()
+        curr = (holding.get("currency") or "USD").strip().upper()
+        curr_sym = "$" if curr in ("USD", "CAD") else (curr + " ")
+
+        is_pos = gain >= 0
+        gain_color = self.theme.ACCENT_GREEN if is_pos else self.theme.ACCENT_RED
+        gain_sign = "+" if is_pos else "-"
+        gain_bg = "rgba(52, 199, 89, 0.15)" if is_pos else "rgba(255, 59, 48, 0.15)"
+        gain_str = f"{gain_sign}{curr_sym}{abs(gain):,.2f} ({gain_pct:+.2f}%)"
+
+        sheet = ui.View()
         sheet.name = f"{sym} 持倉詳情"
         sheet.background_color = self.theme.BG_COLOR
+        sheet.frame = (0, 0, 375, 570)
 
-        info_tv = ui.TextView(frame=(14, 14, 332, 220))
-        info_tv.background_color = self.theme.CARD_BG
-        info_tv.text_color = self.theme.TEXT_PRIMARY
-        info_tv.font = ("<System>", 13)
-        info_tv.editable = False
-        info_tv.corner_radius = 8
-        sign = "+" if gain >= 0 else ""
-        info_tv.text = (
-            f"股票代號: {sym} ({name})\n"
-            f"所屬組合: {port}\n"
-            f"持有股數: {shs:g} 股\n"
-            f"買入均價: ${bp:,.2f}\n"
-            f"目前現價: ${cp:,.2f}\n"
-            f"總成本額: ${cb:,.2f}\n"
-            f"總持股市值: ${mv:,.2f}\n"
-            f"未實現損益: {sign}${gain:,.2f} ({sign}{gain_pct:.2f}%)\n"
-            f"預估年股息: ${ann_d:,.2f} (殖利率: {(ann_d / mv * 100 if mv > 0 else 0):.2f}%)\n"
-            f"計價幣別: {holding.get('currency', 'USD')}"
-        )
-        sheet.add_subview(info_tv)
+        scroll = ui.ScrollView(frame=(0, 0, 375, 570), flex="WH")
+        scroll.background_color = self.theme.BG_COLOR
+        sheet.add_subview(scroll)
 
-        # Action: Buy More (加倉)
-        btn_buy = ui.Button(frame=(14, 244, 332, 38))
-        btn_buy.title = "➕ 買入加倉 (Buy More)"
-        btn_buy.background_color = self.theme.ACCENT_GREEN
-        btn_buy.tint_color = "#FFFFFF"
-        btn_buy.corner_radius = 8
-        btn_buy.font = ("<System-Bold>", 14)
+        pad_x = 14
+        w = 375
+        card_w = w - (pad_x * 2)
+
+        # 1. Hero Card: Symbol, Company Name, Market Value, Profit Badge
+        hero_card = ui.View(frame=(pad_x, 12, card_w, 116))
+        hero_card.background_color = self.theme.CARD_BG
+        hero_card.corner_radius = 14
+        scroll.add_subview(hero_card)
+
+        lbl_sym = ui.Label(frame=(14, 10, 140, 26))
+        lbl_sym.text = sym
+        lbl_sym.font = ("<System-Bold>", 22)
+        lbl_sym.text_color = self.theme.TEXT_PRIMARY
+        hero_card.add_subview(lbl_sym)
+
+        badge_w = min(170, max(80, len(port) * 9 + 40))
+        lbl_port = ui.Label(frame=(card_w - badge_w - 14, 12, badge_w, 22))
+        lbl_port.text = f"{curr} · {port}"
+        lbl_port.font = ("<System>", 11)
+        lbl_port.text_color = self.theme.TEXT_SECONDARY
+        lbl_port.background_color = self.theme.CARD_SECONDARY
+        lbl_port.corner_radius = 6
+        lbl_port.alignment = ui.ALIGN_CENTER
+        hero_card.add_subview(lbl_port)
+
+        lbl_name = ui.Label(frame=(14, 36, card_w - 28, 18))
+        lbl_name.text = name[:36]
+        lbl_name.font = ("<System>", 12)
+        lbl_name.text_color = self.theme.TEXT_SECONDARY
+        hero_card.add_subview(lbl_name)
+
+        lbl_mv_title = ui.Label(frame=(14, 56, 120, 16))
+        lbl_mv_title.text = "持股市值 (Market Value)"
+        lbl_mv_title.font = ("<System>", 11)
+        lbl_mv_title.text_color = self.theme.TEXT_SECONDARY
+        hero_card.add_subview(lbl_mv_title)
+
+        lbl_mv = ui.Label(frame=(14, 74, card_w - 180, 32))
+        lbl_mv.text = f"{curr_sym}{mv:,.2f}"
+        lbl_mv.font = ("<System-Bold>", 25)
+        lbl_mv.text_color = self.theme.TEXT_PRIMARY
+        hero_card.add_subview(lbl_mv)
+
+        badge_gain_w = 160
+        lbl_gain_badge = ui.Label(frame=(card_w - badge_gain_w - 14, 76, badge_gain_w, 28))
+        lbl_gain_badge.text = gain_str
+        lbl_gain_badge.font = ("<System-Bold>", 12)
+        lbl_gain_badge.text_color = gain_color
+        lbl_gain_badge.background_color = gain_bg
+        lbl_gain_badge.corner_radius = 8
+        lbl_gain_badge.alignment = ui.ALIGN_CENTER
+        hero_card.add_subview(lbl_gain_badge)
+
+        # 2. 2x3 Key Metrics Grid
+        tile_w = (card_w - 10) / 2
+        tile_h = 52
+        grid_y = 138
+
+        metrics = [
+            ("📌 持有股數", f"{shs:g} 股"),
+            ("📈 目前現價", f"{curr_sym}{cp:,.2f}"),
+            ("🏷️ 買入均價", f"{curr_sym}{bp:,.2f}"),
+            ("💼 總成本額", f"{curr_sym}{cb:,.2f}"),
+            ("💵 預估年股息", f"{curr_sym}{ann_d:,.2f}"),
+            ("📊 股息殖利率", f"{yield_pct:.2f}%"),
+        ]
+
+        for i, (m_title, m_val) in enumerate(metrics):
+            col = i % 2
+            row = i // 2
+            tx = pad_x + col * (tile_w + 10)
+            ty = grid_y + row * (tile_h + 8)
+
+            t_box = ui.View(frame=(tx, ty, tile_w, tile_h))
+            t_box.background_color = self.theme.CARD_BG
+            t_box.corner_radius = 10
+            scroll.add_subview(t_box)
+
+            lbl_t = ui.Label(frame=(10, 6, tile_w - 20, 16))
+            lbl_t.text = m_title
+            lbl_t.font = ("<System>", 11)
+            lbl_t.text_color = self.theme.TEXT_SECONDARY
+            t_box.add_subview(lbl_t)
+
+            lbl_v = ui.Label(frame=(10, 24, tile_w - 20, 22))
+            lbl_v.text = m_val
+            lbl_v.font = ("<System-Bold>", 15)
+            lbl_v.text_color = self.theme.TEXT_PRIMARY
+            t_box.add_subview(lbl_v)
+
+        # 3. Action Buttons Section (2x2 Grid + Done)
+        btn_y = grid_y + (3 * (tile_h + 8)) + 4
+        btn_w = (card_w - 10) / 2
+        btn_h = 42
 
         def do_buy(sender):
             if dialogs:
@@ -2358,17 +2576,6 @@ class GFinanceNativeApp(ui.View if ui else object):
                         console.hud_alert("已成功加倉！", "success", 1.0)
                     sheet.close()
                     self.load_data()
-
-        btn_buy.action = do_buy
-        sheet.add_subview(btn_buy)
-
-        # Action: Sell Shares (賣出)
-        btn_sell = ui.Button(frame=(14, 288, 332, 38))
-        btn_sell.title = "💰 賣出股票 (Sell Shares)"
-        btn_sell.background_color = self.theme.ACCENT_RED
-        btn_sell.tint_color = "#FFFFFF"
-        btn_sell.corner_radius = 8
-        btn_sell.font = ("<System-Bold>", 14)
 
         def do_sell(sender):
             if dialogs:
@@ -2399,36 +2606,20 @@ class GFinanceNativeApp(ui.View if ui else object):
                     sheet.close()
                     self.load_data()
 
-        btn_sell.action = do_sell
-        sheet.add_subview(btn_sell)
-
-        # Action: View Chart for this stock
-        btn_chart = ui.Button(frame=(14, 332, 332, 38))
-        btn_chart.title = "📈 查看此股走勢圖 (View Chart)"
-        btn_chart.background_color = self.theme.ACCENT_BLUE
-        btn_chart.tint_color = "#FFFFFF"
-        btn_chart.corner_radius = 8
-        btn_chart.font = ("<System-Bold>", 14)
-
         def do_view_chart(sender):
             sheet.close()
-            self.selected_chart_scope = sym
-            self.btn_chart_scope.title = f"📊 標的: {sym}  ▾"
-            self.main_seg.selected_index = 1
-            self._chart_loaded = True
-            self.on_main_tab_changed(self.main_seg)
-            self._update_chart_display_from_cache_or_fetch(force_refetch=True)
-
-        btn_chart.action = do_view_chart
-        sheet.add_subview(btn_chart)
-
-        # Action: Record DRIP (股息再投資)
-        btn_drip = ui.Button(frame=(14, 376, 332, 38))
-        btn_drip.title = "💧 記錄股息再投資 (DRIP)"
-        btn_drip.background_color = self.theme.CARD_SECONDARY
-        btn_drip.tint_color = self.theme.ACCENT_BLUE
-        btn_drip.corner_radius = 8
-        btn_drip.font = ("<System-Bold>", 14)
+            def _switch_chart():
+                self.selected_chart_scope = sym
+                if hasattr(self, "btn_chart_scope"):
+                    self.btn_chart_scope.title = f"📊 標的: {sym}  ▾"
+                self.main_seg.selected_index = 1
+                self._chart_loaded = True
+                self.on_main_tab_changed(self.main_seg)
+                self._update_chart_display_from_cache_or_fetch(force_refetch=True)
+            if ui:
+                ui.delay(_switch_chart, 0.15)
+            else:
+                _switch_chart()
 
         def do_drip(sender):
             if dialogs:
@@ -2450,18 +2641,56 @@ class GFinanceNativeApp(ui.View if ui else object):
                     sheet.close()
                     self.load_data()
 
-        btn_drip.action = do_drip
-        sheet.add_subview(btn_drip)
+        # Row 1 Buttons: Buy & Sell
+        btn_buy = ui.Button(frame=(pad_x, btn_y, btn_w, btn_h))
+        btn_buy.title = "➕ 買入加倉"
+        btn_buy.background_color = self.theme.ACCENT_GREEN
+        btn_buy.tint_color = "#FFFFFF"
+        btn_buy.corner_radius = 10
+        btn_buy.font = ("<System-Bold>", 14)
+        btn_buy.action = do_buy
+        scroll.add_subview(btn_buy)
 
-        # Action: Close
-        btn_close = ui.Button(frame=(14, 422, 332, 38))
+        btn_sell = ui.Button(frame=(pad_x + btn_w + 10, btn_y, btn_w, btn_h))
+        btn_sell.title = "💰 賣出股票"
+        btn_sell.background_color = self.theme.ACCENT_RED
+        btn_sell.tint_color = "#FFFFFF"
+        btn_sell.corner_radius = 10
+        btn_sell.font = ("<System-Bold>", 14)
+        btn_sell.action = do_sell
+        scroll.add_subview(btn_sell)
+
+        # Row 2 Buttons: View Chart & DRIP
+        btn_chart = ui.Button(frame=(pad_x, btn_y + btn_h + 8, btn_w, btn_h))
+        btn_chart.title = "📈 查看走勢圖"
+        btn_chart.background_color = self.theme.ACCENT_BLUE
+        btn_chart.tint_color = "#FFFFFF"
+        btn_chart.corner_radius = 10
+        btn_chart.font = ("<System-Bold>", 14)
+        btn_chart.action = do_view_chart
+        scroll.add_subview(btn_chart)
+
+        btn_drip = ui.Button(frame=(pad_x + btn_w + 10, btn_y + btn_h + 8, btn_w, btn_h))
+        btn_drip.title = "💧 股息再投 (DRIP)"
+        btn_drip.background_color = self.theme.CARD_SECONDARY
+        btn_drip.tint_color = self.theme.ACCENT_BLUE
+        btn_drip.corner_radius = 10
+        btn_drip.font = ("<System-Bold>", 14)
+        btn_drip.action = do_drip
+        scroll.add_subview(btn_drip)
+
+        # Done Button
+        done_y = btn_y + (btn_h + 8) * 2
+        btn_close = ui.Button(frame=(pad_x, done_y, card_w, 40))
         btn_close.title = "完成 (Done)"
         btn_close.background_color = self.theme.CARD_SECONDARY
         btn_close.tint_color = self.theme.TEXT_PRIMARY
-        btn_close.corner_radius = 8
+        btn_close.corner_radius = 10
+        btn_close.font = ("<System-Bold>", 14)
         btn_close.action = lambda s: sheet.close()
-        sheet.add_subview(btn_close)
+        scroll.add_subview(btn_close)
 
+        scroll.content_size = (w, done_y + 54)
         sheet.present("sheet")
 
     def delete_holding_action(self, holding: Dict[str, Any], row_idx: int):

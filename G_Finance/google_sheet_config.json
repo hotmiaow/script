@@ -1,0 +1,16 @@
+{
+  "enabled": true,
+  "web_app_url": "https://script.google.com/macros/s/AKfycbxSSlbW65b7Tvu-T_3Tz3HvPP7eMo0UsRaM_r0KdfX-1IfZdOSH8eZaVTN-oTxZizvI/exec",
+  "sheet_id": "",
+  "api_key": "",
+  "auto_upload_on_edit": true,
+  "auto_sync_on_startup": true,
+  "device_id": "fedora_60b58ca4",
+  "device_name": "fedora",
+  "last_sync_time": "2026-10-23 00:33:21",
+  "last_sync_status": "success",
+  "last_sync_message": "Uploaded latest data to Google Sheet.",
+  "last_synced_hash": "b7c66a03dabbb1754b87bb6e8dd9eda2",
+  "has_unsynced_edits": false,
+  "pending_conflict": null
+}

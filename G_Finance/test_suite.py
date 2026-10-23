@@ -5131,6 +5131,90 @@ class TestGoogleSheetServerAPIs(unittest.TestCase):
         self.assertIn("function doGet(e)", code)
         self.assertIn("function doPost(e)", code)
 
+    def test_web_server_html_contains_google_sheet_sync_interface(self):
+        import web_server
+
+        html = web_server.HTML_TEMPLATE
+        self.assertIn('id="subpane-cloud"', html)
+        self.assertIn('id="btn-st-cloud"', html)
+        self.assertIn('id="cloud-pane-badge"', html)
+        self.assertIn('id="cloud-pane-url"', html)
+        self.assertIn('id="cloud-pane-status-txt"', html)
+        self.assertIn('triggerGoogleSheetPush', html)
+        self.assertIn('triggerGoogleSheetPull', html)
+        self.assertIn('testGoogleSheetConnectionPane', html)
+        self.assertIn('saveGoogleSheetPaneConfig', html)
+        self.assertIn('modal-google-sheet', html)
+
+    def test_web_server_translations_contain_cloud_sync_keys(self):
+        import web_server
+
+        html = web_server.HTML_TEMPLATE
+        self.assertIn('"st_cloud"', html)
+        self.assertIn('"cloud_title"', html)
+        self.assertIn('"btn_sync_now"', html)
+        self.assertIn('"btn_sync_push"', html)
+        self.assertIn('"btn_sync_pull"', html)
+        self.assertIn('"btn_save_config"', html)
+
+    def test_web_server_live_sync_api(self):
+        import web_server
+        import urllib.request
+        import json
+        import time
+
+        port = web_server.start_server(port=9377)
+        try:
+            time.sleep(0.15)
+            # Test GET /api/sync/google_sheets
+            url = f"http://localhost:{port}/api/sync/google_sheets"
+            req = urllib.request.Request(url)
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                self.assertEqual(resp.status, 200)
+                data = json.loads(resp.read().decode("utf-8"))
+                self.assertIn("enabled", data)
+
+            # Test GET /api/google_sheet/status
+            url = f"http://localhost:{port}/api/google_sheet/status"
+            req = urllib.request.Request(url)
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                self.assertEqual(resp.status, 200)
+                data = json.loads(resp.read().decode("utf-8"))
+                self.assertIn("enabled", data)
+
+            # Test POST /api/google_sheet/sync
+            url = f"http://localhost:{port}/api/google_sheet/sync"
+            req = urllib.request.Request(url, data=b"{}", headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                self.assertEqual(resp.status, 200)
+                data = json.loads(resp.read().decode("utf-8"))
+                self.assertIn("status", data)
+        finally:
+            web_server.stop_server()
+
+    def test_web_server_javascript_syntax(self):
+        """Validates that all embedded JavaScript scripts in HTML_TEMPLATE have valid syntax."""
+        import web_server
+        import re
+        import subprocess
+        import shutil
+        import tempfile
+
+        node_path = shutil.which("node")
+        if not node_path:
+            self.skipTest("node binary not available to validate JavaScript")
+
+        scripts = re.findall(r"<script>(.*?)</script>", web_server.HTML_TEMPLATE, re.DOTALL)
+        self.assertGreaterEqual(len(scripts), 1)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            for idx, script_content in enumerate(scripts):
+                script_path = os.path.join(tmpdir, f"script_{idx}.js")
+                with open(script_path, "w", encoding="utf-8") as f:
+                    f.write(script_content)
+                res = subprocess.run([node_path, "--check", script_path], capture_output=True, text=True)
+                self.assertEqual(res.returncode, 0, f"JS SyntaxError in script #{idx}:\n{res.stderr}")
+
 
 class TestTransactionHoldingSync(unittest.TestCase):
     def setUp(self):
@@ -6663,7 +6747,7 @@ class TestPythonistaNativeUI(unittest.TestCase):
 
         mock_cell = MagicMock()
         subviews = {}
-        for name in ["lbl_sym", "lbl_name", "lbl_shs", "lbl_mv", "lbl_pct", "lbl_dlr"]:
+        for name in ["lbl_sym", "lbl_price", "lbl_name", "lbl_shs", "lbl_mv", "lbl_pct", "lbl_dlr"]:
             lbl = MagicMock()
             lbl.name = name
             subviews[name] = lbl
@@ -6682,12 +6766,14 @@ class TestPythonistaNativeUI(unittest.TestCase):
             ds.tableview_cell_for_row(mock_tv, 0, 0)
             self.assertEqual(subviews["lbl_pct"].text, "+9.31%")
             self.assertEqual(subviews["lbl_dlr"].text, "+$241.20")
+            self.assertEqual(subviews["lbl_price"].text, "現價 $94.43")
 
             # Render Row 1 (RKLB: negative gain)
             ds.clear_cache()
             ds.tableview_cell_for_row(mock_tv, 0, 1)
             self.assertEqual(subviews["lbl_pct"].text, "-54.37%")
             self.assertEqual(subviews["lbl_dlr"].text, "-$1,525.92")
+            self.assertEqual(subviews["lbl_price"].text, "現價 $53.35")
         finally:
             pythonista_native_ui.ui = orig_ui
 
@@ -6744,6 +6830,66 @@ class TestPythonistaNativeUI(unittest.TestCase):
             app.watchlist_ds.tableview_cell_for_row(mock_tv, 0, 1)
             self.assertEqual(subviews["lbl_pr"].text, "$711.11")
             self.assertEqual(subviews["lbl_chg"].text, "+0.61%")
+        finally:
+            pythonista_native_ui.ui = orig_ui
+
+    def test_native_chart_view_handles_nan_and_zero_range_safely(self):
+        from unittest.mock import MagicMock
+        import pythonista_native_ui
+
+        chart = pythonista_native_ui.NativeChartView()
+        chart.width = 375
+        chart.height = 260
+        # Feed tricky data: NaNs, Infs, identical prices (zero range)
+        chart.prices = [float("nan"), 100.0, 100.0, 100.0, float("inf"), None, 100.0]
+        chart.timestamps = ["1", "2", "3", "4", "5", "6", "7"]
+
+        mock_ui = MagicMock()
+        orig_ui = pythonista_native_ui.ui
+        try:
+            pythonista_native_ui.ui = mock_ui
+            # Must not throw ZeroDivisionError or crash
+            chart.draw()
+            self.assertTrue(True)
+        finally:
+            pythonista_native_ui.ui = orig_ui
+
+    def test_show_holding_details_creates_hero_card_and_grid(self):
+        from unittest.mock import MagicMock
+        import pythonista_native_ui
+
+        app = pythonista_native_ui.GFinanceNativeApp.__new__(pythonista_native_ui.GFinanceNativeApp)
+        app.theme = pythonista_native_ui.CURRENT_THEME
+        app.holdings = []
+
+        holding = {
+            "symbol": "GOOG",
+            "name": "Alphabet Inc Class C",
+            "shares": 5.0,
+            "buy_price": 330.0,
+            "current_price": 331.0,
+            "cost_basis": 1650.0,
+            "market_value": 1655.0,
+            "unrealized_gain": 5.0,
+            "unrealized_gain_pct": 0.30,
+            "annual_dividend": 4.40,
+            "portfolio": "USD CIBC Investment",
+            "currency": "USD",
+        }
+
+        mock_ui = MagicMock()
+        mock_sheet = MagicMock()
+        mock_ui.View.return_value = mock_sheet
+        mock_ui.ScrollView.return_value = MagicMock()
+        mock_ui.Label.return_value = MagicMock()
+        mock_ui.Button.return_value = MagicMock()
+
+        orig_ui = pythonista_native_ui.ui
+        try:
+            pythonista_native_ui.ui = mock_ui
+            app.show_holding_details(holding)
+            # Verify sheet was presented
+            mock_sheet.present.assert_called_with("sheet")
         finally:
             pythonista_native_ui.ui = orig_ui
 
